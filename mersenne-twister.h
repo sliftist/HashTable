@@ -2,6 +2,12 @@
 
 #include "stdint.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+
 /*
 * The Mersenne Twister pseudo-random number generator (PRNG)
 *
@@ -29,3 +35,9 @@ uint32_t mersenne_rand_u32();
 * Initialize Mersenne Twister with given seed value.
 */
 void mersenne_seed(uint32_t seed_value);
+
+
+
+#ifdef __cplusplus
+}
+#endif

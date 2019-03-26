@@ -18,10 +18,25 @@
     <ClCompile Include="main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="mersenne-twister.cpp">
+    <ClCompile Include="simple_table.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="simple_table.cpp">
+    <ClCompile Include="TransactionQueue.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TransactionQueueHelpers.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="AtomicHelpers.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="AtomicHashTable.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ReferenceCounter.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mersenne-twister.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -29,10 +44,25 @@
     <ClInclude Include="mersenne-twister.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="simple_table_requires.h">
+    <ClInclude Include="simple_table.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="simple_table.h">
+    <ClInclude Include="TransactionQueue.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TransactionQueueHelpers.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="environment.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="AtomicHelpers.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="AtomicHashTable.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ReferenceCounter.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

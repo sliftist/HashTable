@@ -1,32 +1,8 @@
 #include "simple_table.h"
-#include "simple_table_requires.h"
+#include "environment.h"
 
 
-bool InterlockedCompareExchange128Struct(
-	void* structAddress,
-	void* structOriginal,
-	void* structNew
-) {
-	return InterlockedCompareExchange128(
-		(LONG64*)structAddress,
-		((LONG64*)structNew)[1],
-		((LONG64*)structNew)[0],
-		(LONG64*)structOriginal
-	);
-}
 
-bool EqualsStruct128(
-	void* structLhs,
-	void* structRhs
-) {
-	// If the compare succeeds, it means lhs == rhs (and the set doesn't matter, as it only sets if they are equal,
-	//	which then is a noop), and on success InterlockedCompareExchange128 returns 1, so this works.
-	return InterlockedCompareExchange128(
-		structLhs,
-		structRhs,
-		structLhs
-	);
-}
 
 
 // A ref is
@@ -54,16 +30,16 @@ bool EqualsStruct128(
 //		(whenever get isn't allowed, it just return nullptr. Others return non-zero values when not allowed).
 //		(dtor when uninitialized fails is a noop, and dtor destructing is redundant)
 //		(automatically enters destructing if any allocations fail)
-#define REF_FLAGS(x) ((x) & (3 << 26))
-#define REF_NON_FLAGS(x) ((x) & ~(3 << 26))
+#define REF_FLAGS(x) ((uint64_t)(x) & (3 << 26))
+#define REF_NON_FLAGS(x) ((uint64_t)(x) & ~(3 << 26))
 
-#define REF_DATA(x) ((x) >> 32)
-#define REF_DATA_SET(x) ((x) << 32)
+#define REF_DATA(x) ((uint64_t)(x) >> 32)
+#define REF_DATA_SET(x) ((uint64_t)(x) << 32)
 
 
 // Returns true if it can start initializing, and then call Ref_Inited
 bool Ref_Init(uint64_t* ref) {
-	return InterlockedCompareExchange(
+	return InterlockedCompareExchange64(
 		ref,
 		REF_FLAG_INITIALIZING,
 		REF_FLAG_UNINITIALIZED
@@ -73,8 +49,8 @@ bool Ref_Init(uint64_t* ref) {
 //	Returns true if the ref should be destructed, and Ref_Destructed should be called
 //	Failures during init should result in freeing all previous allocated memory, and calling Ref_Destruct, then Ref_inited.
 //		This will cause it to go back to uninitialized.
-bool Ref_Inited(uint64_t* ref, uint32 data) {
-	if (InterlockedCompareExchange(
+bool Ref_Inited(uint64_t* ref, uint32_t data) {
+	if (InterlockedCompareExchange64(
 		ref,
 		REF_FLAG_INITIALIZED | REF_DATA_SET(data),
 		REF_FLAG_INITIALIZING
@@ -91,11 +67,10 @@ bool Ref_Inited(uint64_t* ref, uint32 data) {
 bool Ref_Add(uint64_t* ref) {
 	while (true) {
 		uint64_t bits = *ref;
-		if (REF_FLAGS(bits) != REF_FLAG_INITIALIZED
-		) {
+		if (REF_FLAGS(bits) != REF_FLAG_INITIALIZED) {
 			return false;
 		}
-		if (InterlockedCompareExchange(ref, bits + 1, bits) == bits) {
+		if (InterlockedCompareExchange64(ref, bits + 1, bits) == bits) {
 			return true;
 		}
 	}
@@ -113,7 +88,7 @@ bool Ref_Remove(uint64_t* ref) {
 		}
 		// Could be initialized, or destruct requested
 		uint64_t newBits = bits - 1;
-		if (InterlockedCompareExchange(ref, newBits, bits) != bits) continue;
+		if (InterlockedCompareExchange64(ref, newBits, bits) != bits) continue;
 		if (REF_COUNT(newBits) == 0 && REF_FLAGS(newBits) == REF_FLAG_DESTRUCT_REQUEST) {
 			// We went from 1 to 0 refs, and destruct was requested (at some time). Therefore, we should destruct, as the ref
 			//	could will never increment again (until we finish destruction), and so we have to destruct now.
@@ -134,7 +109,7 @@ bool Ref_Destruct(uint64_t* ref) {
 			return false;
 		}
 		uint64_t newBits = REF_NON_FLAGS(bits) | REF_FLAG_DESTRUCT_REQUEST;
-		if (InterlockedCompareExchange(ref, newBits, bits) != bits) continue;
+		if (InterlockedCompareExchange64(ref, newBits, bits) != bits) continue;
 
 		if (REF_COUNT(newBits) == 0) {
 			// The ref count can't increment now that we set DESTRUCT_REQUEST, so we have to destruct now,
@@ -151,401 +126,24 @@ void Ref_Destructed(uint64_t* ref) {
 	uint64_t bits = *ref;
 	// Neither this if check nor the interlocked exchange should ever fail, if either does it means
 	//	Ref_Destructed isn't being called after Ref_Remove/Ref_Destruct correctly.
-	if (REF_COUNT(bits) == 0 && REF_FLAGS(bits) == REF_FLAG_DESTRUCTING) {
+	if (REF_COUNT(bits) == 0 && REF_FLAGS(bits) == REF_FLAG_DESTRUCT_REQUEST) {
 		// So... this could fail if we ever use forceful ref taking, which is possible during destruction
 		//	and required to create a sorted list implementation (as this would require swaps,
 		//	which forces us to reduce some locking requirements, as swaps interact with two refs at once).
-		InterlockedCompareExchange(ref, REF_FLAG_UNINITIALIZED, bits);
+		InterlockedCompareExchange64(ref, REF_FLAG_UNINITIALIZED, bits);
 	}
 }
 
 
 
-// Maximum (and minimum) bits for a single part of a transaction
-#define TRANSACTION_ITEM_BITS 32
 
-#define PENDING_TRANSACTION_LOG_MAX 1024
-#define PENDING_TRANSACTION_LOG_INDEX_BITS 10
-
-// Transaction guarantees
-//	- Transactions will be applied only when the writes are based on a consistent and fresh state of the data,
-//		and applyChange will be called for every part of the transaction, as many times as necessary until applyChange
-//		returns successfully for every part of the transactions.
-//	- Gets will only read consistent and fresh data states, and will try to apply writes before they run, and will rerun
-//		if more writes have been created.
-//		- The only drawback is that a write may be spurious applied multiple times, and so that will have to be prevented.
-//		We provide an always increasing transaction id which facilitates ignoring spurious writes.
-
-// NOTE: We could try to do this in 64 bits. It would require making newValue 8 bits, and then writing code to forcefully update
-//	transaction ids in all user entries every once in a while, so we can tell the different between past entries, and future entries
-//	(as if we wrap around they are indistinguishable, so the only way it to see what is more likely, and then update values enough
-//		so the case of being the farther distance away becomes impossible).
-//	- This could be done in read/write functions, which is actually safe because we can't wrap around without a lot of calls,
-//		so if every call does some work to update transactionIds then we can provable keep them all fresh. It's a waste of
-//		processing time though.
-#pragma pack(push, 1)
-typedef struct {
-	uint64_t isEnd : 1;
-
-	// 55 bits means at 2^30 per second, it would take 1 years for this to wrap around. That should be good enough...
-	uint64_t transactionId : 55;
-
-	todonext
-	// So... dataIndex... we could use 6 bits of that to choose an allocation index in an allocation table,
-	//	and then use use the remaining bits to choose an offset in that allocation.
-	// The allocation index 0 is reserved to mean an offset into the base struct
-
-	// The index in the data set this change should occur at.
-	uint64_t dataIndex : 40;
-
-	// The new value that will be set
-	uint64_t newValue: 32;
-} TransactionChange;
-#pragma pack(pop)
-
-#pragma pack(push, 1)
-typedef struct {
-	// Index of the head of the list.
-	uint64_t startTransactionIndex : 32;
-	uint64_t transactionCount : 32;
-
-	// Means the transaction we are consuming we are also applying (otherwise we are discarding it).
-	uint64_t valid : 1;
-	// Means we are consuming a transaction, vs having just advanced start, and not having started consuming,
-	//	as we don't know the transaction id of the next item, or if it is valid or not.
-	uint64_t consuming : 1;
-	// This is the id of the transaction we are consuming
-	uint64_t transactionId : 62;
-} TransactionQueueState;
-#pragma pack(pop)
-
-
-typedef __declspec(align(16)) struct {
-	todonext
-	// Initialize this to 0
-	uint64_t nextTransactionId;
-
-	TransactionQueueState state;
-	TransactionChange pendingTransactions[PENDING_TRANSACTION_LOG_MAX];
-
-	void* applyContext;
-	// If it returns 1, it means it failed, but it is probably just a contention issue, and future changes should work
-	// If it returns > 1, it means it failed, and all future changes will probably fail too
-	// If change.transactionId is < any previous changes for change.dataIndex, the change should not be applied (and 1 should be returned).
-	int(*applyChange)(void* applyContext, TransactionChange change);
-
-} TransactionQueue;
-
-
-
-todonext
-// Oh yeah... we need to support this somehow... which may have to involve calling this in every retry loop...
-//	Yeah, that's what we will need to do... call it at the start of all of our retry loops.
-// private, only needs to be called internally, otherwise initialize with = {0}
-void transactionQueue_ctor(TransactionQueue* this);
-
-// Returns true on success
-bool MutateTransactionState(
-	TransactionQueueState* address,
-	TransactionQueueState originalValue,
-	TransactionQueueState newValue
-) {
-	return InterlockedCompareExchange128Struct(
-		address,
-		&originalValue,
-		&newValue
-	);
-}
-// Returns true on success
-bool MutateChangeState(
-	TransactionChange* address,
-	TransactionChange originalValue,
-	TransactionChange newValue
-) {
-	return InterlockedCompareExchange128Struct(
-		address,
-		&originalValue,
-		&newValue
-	);
-}
-
-// 0 on done
-// 1 on retry
-// > 1 on hard fail
-int transactionQueue_applyTransactions(
-	TransactionQueue* this,
-	// The state that we use, which if we return 0 is the state we saw when we saw there was no more work left to do
-	TransactionQueuedState* stateOut
-) {
-	TransactionQueuedState state = this->state;
-	if (stateOut) {
-		*stateOut = state;
-	}
-
-	// Quickly check if there is any work to do
-	if (state.transactionCount == 0) {
-		if (state.consuming) {
-			TransactionQueuedState newState = state;
-			newState.consuming = 0;
-			MutateTransactionState(&this->state, state, newState);
-		}
-		// Empty, and we aren't consuming. So we are done.
-		return 0;
-	}
-	
-	if (!state.consuming) {
-
-		uint64_t index = state.startTransactionIndex;
-		uint64_t startTransactionId = this->pendingTransactions[index];
-
-		bool isTransactionInvalid = false;
-
-		uint64_t offset = 0;
-
-		while (true) {
-			uint64_t curIndex = (index + offset) % PENDING_TRANSACTION_LOG_MAX;
-			TransactionChange change = this->pendingTransactions[curIndex];
-			if (change.isEnd) {
-				isTransactionInvalid = false;
-				break;
-			}
-			// Hmm... this could compare across page boundaries, and as we aren't using a memory barrier, could
-			//	this somehow fail to catch a change when there is one?
-			if (change.transactionId != startTransactionId) {
-				isTransactionInvalid = true;
-				break;
-			}
-			offset++;
-			if (offset == state.transactionCount) {
-				// We have entries, but they are still being written, so we have nothing to do.
-				return 0;
-			}
-		}
-
-		// There is definitely an end (whether explicit, or because of a transactionId change), so we can enter consuming
-
-		TransactionQueuedState newState = state;
-		newState.consuming = 1;
-		newState.valid = isTransactionInvalid ? 1 : 0;
-		newState.transactionId = startTransactionId;
-		MutateTransactionState(&this->state, state, newState);
-		return 1;
-	}
-
-
-	// state.consuming is true, so we should consume something, or leave consuming state.
-
-
-	TransactionChange change = this->pendingTransactions[state.startTransactionIndex];
-	if (change.transactionId != state.transactionId) {
-		// We are done consuming the previous transaction.
-		TransactionQueuedState newState = state;
-		newState.consuming = 0;
-		// So... transitioning away from consuming on an index can only ever happen once. The transaction id
-		//	should never appear again, and a transaction never uses two of the same index, so this is a unique transition.
-		MutateTransitionState(&this->state, state, newState);
-		// Now go back again and run the non consuming code (and on failure of the above set, retry again anyway).
-		return 1;
-	}
-
-	int applyChangeResult = 0;
-	if (!change.isEnd && state.valid) {
-		applyChangeResult = this->applyChange(this->applyContext, change);
-		// Even if applyChange fails, we still need to remove it from the queue!
-		// This could happen if the applyChange applies the change, that process dies, and then another
-		//	process calls this function and tries to apply the change again. In this case removing it from the queue
-		//	is required. Also, restarting isn't necessary, but it doesn't hurt either, as it will just result in doing
-		//	a few more checks to make sure we are in the right state, and then we will continue applying the changes.
-	}
-
-	// If we got here, it means the change succeeded. So try to remove it from the queue
-	//	(if we fail to remove it from the queue someone else will apply it again, which is fine...
-	//		and if someone else removes it, then our remove will fail, which is fine too).
-
-	TransactionQueuedState newState = state;
-	newState.startTransactionIndex = (newState.startTransactionIndex + 1) % PENDING_TRANSACTION_LOG_MAX;
-
-	// So... we try to increase the position of the current transactions we are handling. As a transaction
-	//	can't fill up the whole queue, and a transaction can only be added once, so this is a unique transition.
-	MutateTransactionState(&this->state, state, newState);
-
-
-	// If applyChange had a result, prefer to return that result
-	if (applyChangeResult != 0) {
-		return applyChangeResult;
-	}
-
-	// Whether we success or fail, we either made progress, or someone else made the progress we were trying to make.
-	//	So run again, and make more progress.
-	return 1;
-}
-
-int TransactionQueue_RunGetter(
-	TransactionQueue* this,
-	void* getterContext,
-	// On non-zero returns, returns non-zero from our getter
-	int(*getter)(void* getterContext)
-) {
-	do {
-		int result = transactionQueue_applyTransactions(this, nullptr);
-
-		if (result == 1) continue;
-		if (result > 1) {
-			return result;
-		}
-		// 0 means we checked, and there is no more transactions that can be applied.
-
-		result = getter(getterContext);
-
-		// If the getter failed, it likely means there was some contention during list resizing or something like that...
-		//	so better go try to apply more transactions.
-		if (result == 1) continue;
-
-		if (result > 1) {
-			return result;
-		}
-
-		// Okay, so... I believe we don't to store state before the getter and then check it again here to verify it hasn't changed.
-		//	Because yes, our thread could block for an hour before we call getter, and then after we run it we can definitely
-		//		see that something changed and that we should rerun our getter (and reapply transactions that are pending).
-		//	HOWEVER, we could also block for an hour AFTER we check this state. And just as easily there could be all sorts of
-		//		writes, and the caller might wonder "hey, I finished many writes and this getter just now returned and didn't
-		//		say we have any of those writes", in which case our response is "well you started the get call before those
-		//		writes even started, much less finished... clearly you have to call get after you call write to witness your changes".
-	} while (false);
-
-	return 0;
-}
-
-
-
-typedef struct {
-	TransactionQueue* queue;
-	uint64_t transactionId;
-	TransactionQueuedState state;
-	bool finishCalled;
-} ApplyWriteState;
-int TransactionQueue_applyWrite_insertWriteCallbackBase(ApplyWriteState* this, TransactionChange change, bool isEnd) {
-	change.isEnd = isEnd ? 1 : 0;
-	change.transactionId = this->transactionId;
-	
-	uint64_t insertIndex = (this->state.startTransactionIndex + this->state.transactionCount) % PENDING_TRANSACTION_LOG_MAX;
-	TransactionChange pPrevChange = &this->queue->pendingTransactions[insertIndex];
-	TransactionChange prevChange = *pPrevChange;
-	if (!EqualsStruct128(this->state, this->queue->state)) {
-		// Then something else was added/removed, so we need to retry
-		return 1;
-	}
-	// Okay at this point... if any other transaction added after we checked state, then it will use a different transaction id.
-	//	(We know no other transactions were added before we checked state, as that is what checking state does!)
-	// And if it uses a different transaction id (than any used before), then it will not equal prevChange, so this will fail:
-	if (!MutateChangeState(
-		pPrevChange,
-		prevChange,
-		change
-	)) {
-		return 1;
-	}
-
-	// Now, try to confirm the change
-	TransactionQueuedState newState = this->state;
-	newState.transactionCount++;
-
-	if (!MutateTransactionState(
-		&this->queue->state,
-		this->state,
-		newState
-	)) {
-		// So... our previous write is fine. It won't be used, and then will be wiped out. And its transaction id won't collide
-		//	with anything, because we are taking that transaction id to the grave with us.
-		return 1;
-	}
-	
-	this->state = newState;
-	return 0;
-}
-int TransactionQueue_applyWrite_insertWriteCallback(ApplyWriteState* this, TransactionChange change) {
-	return TransactionQueue_applyWrite_insertWriteCallbackBase(this, change, 0);
-}
-
-int TransactionQueue_applyWrite_finish(ApplyWriteState* this) {
-	this->finishCalled = true;
-	return TransactionQueue_applyWrite_insertWriteCallbackBase(this, {}, true);
-}
-
-todonext
-// We need to add some handling for writes and gets fighting for contention so much they deadlock. This could easily happen with
-//	2 cores and threads with the highest (kernel?) priority.
-//	- Heck, even 2 writes could fight for contention.
-
-int TransactionQueue_ApplyWrite(
-	TransactionQueue* this,
-	void* writeContext,
-	int(*write)(
-		void* writeContext,
-		void* insertWriteContext,
-		// If a non-zero returns, that result should be returned from the write function immediately
-		int(*insertWrite)(
-			void* insertWriteContext,
-			// Only dataIndex and newValue are used in this.
-			TransactionChange change
-		),
-		// If this is not called before write finishes, and write returns 0, we assume it is a hard failure
-		// The result of this allows write to undo any changes if it isn't successfully applied
-		int(*finish)(void* insertWriteContext)
-	)
-) {
-	// If we ever retry in the middle of adding a transaction, that is fine. We will be adding new transaction parts when we loop
-	//	around, which will implicitly cause the old transaction parts to be removed!
-	do {
-		TransactionQueuedState state;
-		int result = transactionQueue_applyTransactions(this, &state);
-
-		if (result == 1) continue;
-		if (result > 1) {
-			return result;
-		}
-		// 0 means we checked, and there is no more transactions that can be applied.
-
-		// applyTransactions either says there is nothing queued to write, OR, every queued is still being written.
-		// We assume anything that is still being written is from a hung thread, so we just insert anyway, implicitly
-		//	causing those pending writes to be thrown out.
-
-		ApplyWriteState writeState;
-		writeState.queue = this;
-
-		// Because we do this here, it guarantees the transaction ids of any valid transactions are always increasing.
-		//	Any other transactions we are racing to add will only have one winner. Any transactions added will have gotten
-		//	a nextTransactionId BEFORE we checked state (because it will be before they wrote to state, which has to be before
-		//	us), and so BEFORE us, and so it will be below ours. So... this works!
-		writeState.transactionId = InterlockedIncrement(&this->nextTransactionId);
-
-		writeState.state = state;
-		writeState.finishCalled = false;
-
-		result = write(writeContext, &writeState, TransactionQueue_applyWrite_insertWriteCallbackBase, TransactionQueue_applyWrite_finish);
-		if (result == 1) continue;
-		if (result > 1) {
-			return result;
-		}
-
-		if (!writeState.finishCalled) {
-			return 2;
-		}
-
-		return 0;
-
-	} while (false);
-
-	return 0;
-}
 
 
 // Okay, allocations on top of 
 
 
 
-todonext
+//todonext
 // So... our actual data structure now has the transaction queue. This can guarantee transactions are applied non-interlaced,
 //	when they have seen fresh data (and that gets will get non-interlaced data too) AND that they won't partially apply, and
 //	writes and gets won't see partially applied data!
@@ -561,6 +159,7 @@ todonext
 
 // We want a SmallPointerTable anyway, AND we want it to be allocating memory, that way it can guarantee it never double frees.
 
+/*
 #pragma pack(push, 1)
 typedef struct {
 	void* pointer;
@@ -569,7 +168,7 @@ typedef struct {
 #pragma pack(pop)
 
 #pragma pack(push, 1)
-typedef struct {
+typedef __declspec(align(16)) struct {
 
 	uint64_t primaryAllocationIndex;
 	uint64_t secondaryAllocationIndex;
@@ -589,20 +188,15 @@ typedef struct {
 
 } SmallPointerTable;
 #pragma pack(pop)
+*/
+
+// __declspec(align(16))
 
 
-todonext
-// Oh... so applyChange has to finish before moving to the next change OR until gets run. So... we should store
-//	our memory with transactions somewhere, and then store it compactly (so we can look at it like a struct),
-//	somewhere else. When we apply changes if the transaction value is >= we should copy to the compact memory.
-//	- This also makes our reads REALLY nice, because it means reads can just read from the compact memory
-todonext
-//	- BUT WAIT A SECOND! Doesn't this then mean we don't even need to store the transaction id with the memory?
-//		Couldn't we just set the transaction id, then try to set the other memory?
-//		- Well... atomically set/increase the transaction id
-//			- WAIT! Can't we use a universal transaction id...
-todonext
-// NO, that doesn't work... because we could hang after the transaction id
+// Okay, so... we should add a macro to wrap static structs to make a struct 4X as big (so every 32 bits is mapped
+//	to 128 bits), unioned with the original struct.
+// Then a get macro will use the offset of a member to know where to get the value from, and even use sizeof to know
+//	how many bytes to get.
 
 
 // And then we should provide macros/helper functions to write to the data, which can use struct offsets
@@ -611,7 +205,7 @@ todonext
 //	just have its own TransactionQueue? Hmm... nested TransactionQueues could get tricky though... I think there is
 //	a problem with them I am not remembering right now...
 
-
+/*
 
 
 
@@ -1290,3 +884,4 @@ long resizeTable(SimpleTable* table, long targetCount) {
 
 	table->isResizing = 0;
 } 
+*/

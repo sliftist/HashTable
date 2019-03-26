@@ -158,6 +158,7 @@ void mersenne_seed(uint32_t value)
 
 uint32_t mersenne_rand_u32() {
 	if (state.index == SIZE || !stateIndexInitialized) {
+		mersenne_seed(0x7cdd44b);
 		stateIndexInitialized = 1;
 		generate_numbers();
 		state.index = 0;

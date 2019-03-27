@@ -90,15 +90,19 @@ int AtomicHashTable_find(
 	// May return results that don't equal the given hash, so a deep comparison should be done on the value
 	//	to determine if it is the one you want.
 	// (and obviously, may call this callback multiple times for one call)
-	void(*callback)(void* callbackContext, uint64_t valueSmallPointer)
+	void(*callback)(void* callbackContext, void* value)
 );
+
+
 int AtomicHashTable_remove(
 	AtomicHashTable* self,
 	uint64_t hash,
 	void* callbackContext,
 	// On true, removes the value from the table
-	bool(*callback)(void* callbackContext, uint64_t valueSmallPointer)
+	bool(*callback)(void* callbackContext, void* value)
 );
+
+
 
 //todnext
 // Hmm... actually... so if the client passes us a pointer, how can we tell if that pointer is alive?

@@ -141,7 +141,8 @@ int Set_##type( \
 #define Get_X_impl(type) \
 type Get_##type( \
 	AtomicUnit* units, \
-	type* offset \
+	type* offset, \
+	type* output
 ) { \
 	type output; \
 	Get_Bytes( \

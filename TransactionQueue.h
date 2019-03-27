@@ -134,7 +134,7 @@ CASSERT(sizeof(TransactionChange) == 16);
 
 #define TransactionChange_set_dataIndex(x, value) { \
 	(x)->dataIndexHigh = value >> 24; \
-	(x)->dataIndexLow = value; /* Eh... the bitfield should just cut off the top bits... right? */ \
+	(x)->dataIndexLow = value; \
 }
 
 #define TransactionChange_get_dataIndex(x) (((x)->dataIndexHigh << 24) | ((x)->dataIndexLow))

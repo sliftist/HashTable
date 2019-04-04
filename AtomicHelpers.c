@@ -6,15 +6,14 @@ bool InterlockedCompareExchangeStruct128
 	void* structOriginal,
 	void* structNew
 ) {
-	int zero = 0;
 	if ((LONG64)structAddress % 16 != 0) {
-		zero = 1 / zero;
+		OnError(4);
 	}
 	if ((LONG64)structOriginal % 16 != 0) {
-		zero = 1 / zero;
+		OnError(4);
 	}
 	if ((LONG64)structNew % 16 != 0) {
-		zero = 1 / zero;
+		OnError(4);
 	}
 	return InterlockedCompareExchange128(
 		(LONG64*)structAddress,

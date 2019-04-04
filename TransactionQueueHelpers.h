@@ -53,8 +53,7 @@ int Set_##type( \
 #define Get_X(type) \
 type Get_##type( \
 	AtomicUnit* units, \
-	type* offset, \
-	type* output \
+	type* offset \
 );
 
 Set_X(int32_t)

@@ -26,7 +26,10 @@
 extern "C" {
 #endif
 
-void OnError(int code);
+void OnErrorInner(int code, const char* name, unsigned long long line);
+#define OnError(code) OnErrorInner(code, __FILE__, __LINE__)
+
+#define ErrorTop(statement) { int errorTopResult = statement; if(errorTopResult != 0) OnError(errorTopResult); }
 
 #ifdef __cplusplus
 }

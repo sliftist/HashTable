@@ -2,6 +2,8 @@
 #include "environment.h"
 #include "AtomicHelpers.h"
 
+#include "Timing.h"
+
 // https://graphics.stanford.edu/~seander/bithacks.html
 #define LT(n) n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n
 static const char LogTable256[256] =
@@ -56,13 +58,17 @@ SmallPointerTable* debug_getPointerTable() {
 	return &this;
 }
 
+uint64_t allocSize(uint64_t allocIndex) {
+	return 1ll << allocIndex;
+}
+
 // (index can be beyond the end of our memory, we will just wrap it around.
 SmallPointerEntry* getEntry(uint64_t* index) {
 	uint64_t indexValue = *index = *index % ((1 << this.allocationsCreated) - 1);
 	uint64_t allocationIndex = log2(indexValue + 1);
-	uint64_t indexInAllocation = indexValue % (1ll << (allocationIndex));
+	uint64_t indexInAllocation = indexValue % allocSize(allocationIndex);
 	
-	return &this.allocations[allocationIndex][indexInAllocation];
+	return (SmallPointerEntry*)&this.allocations[allocationIndex][indexInAllocation];
 }
 
 // Returns false on error
@@ -88,19 +94,20 @@ bool incrementFilledCount() {
 
 	for (uint64_t allocIndex = allocationsCreated; allocIndex < requiredAllocations; allocIndex++) {
 		InterlockedIncrement64(&this.mallocCalls);
-		uint64_t size = (1ll << allocIndex) * sizeof(SmallPointerEntry);
+		uint64_t size = (1ll << allocIndex) * sizeof(SmallPointerEntry_Extended);
 		SmallPointerEntry* newArray =  malloc(size);
-		// TODO: We should probably slowly initialize this, as needed, because in theory a large malloc can be constant time,
-		//	but a large memset will be linear.
-		memset(newArray, 0, size);
 		if (!newArray) {
 			return false;
 		}
+		// TODO: We should probably slowly initialize this, as needed, because in theory a large malloc can be constant time,
+		//	but a large memset will be linear.
+		memset(newArray, 0, size);
 		if (InterlockedCompareExchangePointer(&this.allocations[allocIndex], newArray, nullptr) != nullptr) {
 			free(newArray);
 			// The other thread probably allocated more than just 1, so jump to the next allocation actually needed.
 			allocIndex = this.allocationsCreated;
 		}
+
 	}
 
 	while (true) {
@@ -190,7 +197,8 @@ bool claimIndex(uint64_t* seekIndex) {
 	}
 }
 
-uint64_t AllocateAsSmallPointer(uint64_t size, void** pointerOut) {
+
+uint64_t AllocateAsSmallPointerRaw(uint64_t size, void** pointerOut, const char* fileName, uint64_t line) {
 	if (!incrementFilledCount()) {
 		return 0;
 	}
@@ -201,6 +209,7 @@ uint64_t AllocateAsSmallPointer(uint64_t size, void** pointerOut) {
 	if (!pointer) {
 		return 0;
 	}
+	memset(pointer, 0, size);
 
 	uint64_t index = (uint64_t)pointer;
 	if (!claimIndex(&index)) {
@@ -208,16 +217,67 @@ uint64_t AllocateAsSmallPointer(uint64_t size, void** pointerOut) {
 		return 0;
 	}
 
-	SmallPointerEntry* entry = getEntry(&index);
+	SmallPointerEntry_Extended* entry = (void*)getEntry(&index);
 	// Eh... we could do an interlocked compare exchange, but... this should always be exclusively ours,
 	//	as it should have a reference (so it can't be freed or reused), and no pointer (so it can't be
 	//	referenced by anyone else).
 	entry->pointer = pointer;
+	entry->size = size;
+	entry->fileName = fileName;
+	entry->line = line;
+	entry->smallPointerNumber = index;
 
 	*pointerOut = pointer;
 
+	//printf("alloc %llu\n", index);
+
 	return (uint64_t)(index + 1);
 
+}
+
+void* ReferenceSmallPointerInner(uint64_t smallPointer) {
+
+	//TimeBlock(ReferenceGetEntry, 
+	smallPointer--;
+	SmallPointerEntry* entry = getEntry(&smallPointer);
+	//);
+
+	void* p = nullptr;
+#ifdef FAST_UNSAFE_CHANGES
+	//TimeBlock(ReferenceInterlocked,
+		entry->referenceCount++;
+		p = entry->pointer;
+	//);
+#else
+	//TimeBlock(ReferenceInterlocked,
+	while (true) {
+		SmallPointerEntry value = *entry;
+		if (!value.pointer) {
+			// Should be impossible, it means it has been freed. This is a bad case, as someone else could
+			//	have reused the entry before we got here, resulting in them referencing a random pointer...
+			OnError(3);
+			return nullptr;
+		}
+		SmallPointerEntry newValue = value;
+		newValue.referenceCount++;
+		if (InterlockedCompareExchangeStruct128(
+			entry,
+			&value,
+			&newValue
+		)) {
+			p = newValue.pointer;
+			break;
+		}
+	}
+	//);
+#endif
+	return p;
+}
+void* ReferenceSmallPointer(uint64_t smallPointer) {
+	//TimeBlock(ReferenceSmallPointer,
+		void* p = ReferenceSmallPointerInner(smallPointer);
+	//);
+	return p;
 }
 
 void* SafeReferenceSmallPointer64(uint64_t* smallPointer) {
@@ -249,42 +309,30 @@ void* SafeReferenceSmallPointer32(uint32_t* smallPointer) {
 	return p;
 }
 
-void* ReferenceSmallPointer(uint64_t smallPointer) {
-	smallPointer--;
-	SmallPointerEntry* entry = getEntry(&smallPointer);
-	
-	while (true) {
-		SmallPointerEntry value = *entry;
-		if (!value.pointer) {
-			// Should be impossible, it means it has been freed. This is a bad case, as someone else could
-			//	have reused the entry before we got here, resulting in them referencing a random pointer...
-			return nullptr;
-		}
-		SmallPointerEntry newValue = value;
-		newValue.referenceCount++;
-		if (InterlockedCompareExchangeStruct128(
-			entry,
-			&value,
-			&newValue
-		)) {
-			return newValue.pointer;
-		}
-	}
-}
-void DereferenceSmallPointer(uint64_t smallPointer) {
+
+void DereferenceSmallPointerInner(uint64_t smallPointer) {
 	smallPointer--;
 	SmallPointerEntry* entry = getEntry(&smallPointer);
 
+#ifdef FAST_UNSAFE_CHANGES
+	entry->referenceCount--;
+	if (entry->referenceCount == 0) {
+		free(entry->pointer);
+		entry->pointer = nullptr;
+	}
+#else
 	while (true) {
 		SmallPointerEntry value = *entry;
 		if (!value.pointer) {
 			// Should be impossible, it means it has been freed. This is a bad case, as someone else could
 			//	have reused the entry before we got here, resulting in us dereferencing a random pointer...
+			OnError(3);
 			return;
 		}
 		SmallPointerEntry newValue = value;
 		if (newValue.referenceCount == 0) {
 			// Too many frees. Should be impossible...
+			OnError(3);
 			return;
 		}
 		newValue.referenceCount--;
@@ -298,9 +346,85 @@ void DereferenceSmallPointer(uint64_t smallPointer) {
 		)) {
 			// We WILL leak the pointer here, if our thread dies.
 			if (value.referenceCount == 1) {
+				if (smallPointer == 2003) {
+					int here = 0;
+				}
+				//printf("free %llu\n", smallPointer);
 				free(value.pointer);
 			}
 			return;
 		}
 	}
+#endif
+}
+void DereferenceSmallPointer(uint64_t smallPointer) {
+	//TimeBlock(DereferenceSmallPointer, 
+	DereferenceSmallPointerInner(smallPointer);
+	//);
+}
+
+uint64_t Debug_GetAllReferenceCounts() {
+	uint64_t allRefsCount = 0;
+	for(uint64_t j = 0; j < this.allocationsCreated; j++) {
+		for(uint64_t i = 0; i < allocSize(j); i++) {
+			SmallPointerEntry_Extended* entry = (void*)&this.allocations[j][i];
+			uint64_t count = entry->referenceCount;
+			if (count) {
+				allRefsCount += count;
+			}
+		}
+	}
+	return allRefsCount;
+}
+
+uint64_t Debug_GetReferences() {
+	uint64_t allRefsCount = 0;
+	for (uint64_t j = 0; j < this.allocationsCreated; j++) {
+		for (uint64_t i = 0; i < allocSize(j); i++) {
+			SmallPointerEntry_Extended* entry = (void*)&this.allocations[j][i];
+			uint64_t count = entry->referenceCount;
+			if (count) {
+				allRefsCount++;
+			}
+		}
+	}
+	return allRefsCount;
+}
+
+SmallPointerTable* Debug_GetSmallPointerTable() {
+	return &this;
+}
+
+PointersSnapshot* Debug_GetPointersSnapshot() {
+	PointersSnapshot* snapshot = malloc(sizeof(PointersSnapshot));
+	snapshot->entryCount = Debug_GetReferences();
+	snapshot->entries = (void*)malloc(snapshot->entryCount * sizeof(SmallPointerEntry_Extended));
+	uint64_t nextIndex = 0;
+	for(uint64_t j = 0; j < this.allocationsCreated; j++) {
+		for(uint64_t i = 0; i < allocSize(j); i++) {
+			SmallPointerEntry_Extended* entry = (void*)&this.allocations[j][i];
+			uint64_t count = entry->referenceCount;
+			if (count) {
+				uint64_t index = nextIndex++;
+				if(index >= snapshot->entryCount) {
+					// Reference counts change during snapshot
+					return nullptr;
+				}
+				snapshot->entries[index] = *entry;
+			}
+		}
+	}
+	if(nextIndex != snapshot->entryCount) {
+		// Reference counts change during snapshot
+		return nullptr;
+	}
+
+	return snapshot;
+}
+
+void Debug_DeallocatePointersSnapshot(PointersSnapshot* info) {
+	free(info->entries);
+	info->entries = nullptr;
+	info->entryCount = 0;
+	free(info);
 }

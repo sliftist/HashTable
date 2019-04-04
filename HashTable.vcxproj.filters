@@ -39,6 +39,15 @@
     <ClCompile Include="mersenne-twister.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="AtomicHashTableDebug.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Timing.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TimingDebug.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="mersenne-twister.h">
@@ -63,6 +72,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ReferenceCounter.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="AtomicHashTableDebug.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Timing.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

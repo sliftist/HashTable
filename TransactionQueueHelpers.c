@@ -2,6 +2,7 @@
 #include "TransactionQueueHelpers.h"
 #include "AtomicHelpers.h"
 
+#include "Timing.h"
 
 int AtomicSet(AtomicUnit* unit, TransactionChange change) {
 	while (true) {
@@ -87,7 +88,8 @@ void Get_Bytes(
 	unsigned char* values,
 	uint64_t valuesCount
 ) {
-	// We could change this to work with different amounts of bytes, but we would have to change it from uint32_t.
+	//TimeBlock(Get_Bytes, {
+	/* We could change this to work with different amounts of bytes, but we would have to change it from uint32_t. */
 	CASSERT(BYTES_PER_TRANSACTION == 4);
 
 	uint64_t bytesOffset = (uint64_t)offset - (uint64_t)units;
@@ -100,8 +102,8 @@ void Get_Bytes(
 		uint64_t valuesIndexStart = pos - bytesOffset;
 		uint32_t value = (uint32_t)units[pos / 4].value;
 
-		// TODO: For all but the last and first iteration this can be simplified to
-		//*(uint32_t*)(values + valuesIndexStart) = value;
+		/*TODO: For all but the last and first iteration this can be simplified to
+		*(uint32_t*)(values + valuesIndexStart) = value;*/
 
 		for (int offset = 0; offset < 4; offset++) {
 			uint64_t valuesIndex = valuesIndexStart + offset;
@@ -112,6 +114,7 @@ void Get_Bytes(
 			values[valuesIndex] = byte;
 		}
 	}
+	//});
 }
 
 
@@ -141,8 +144,7 @@ int Set_##type( \
 #define Get_X_impl(type) \
 type Get_##type( \
 	AtomicUnit* units, \
-	type* offset, \
-	type* output
+	type* offset \
 ) { \
 	type output; \
 	Get_Bytes( \
@@ -156,3 +158,9 @@ type Get_##type( \
 
 Set_X_impl(int32_t)
 Get_X_impl(int32_t)
+
+Set_X_impl(uint32_t)
+Get_X_impl(uint32_t)
+
+Set_X_impl(uint64_t)
+Get_X_impl(uint64_t)

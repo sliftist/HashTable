@@ -1,8 +1,6 @@
 #include "AtomicHashTable.h"
 
-todonext
-// Get this compiling, and then fix the many single threaded bugs, and then fix the many multithreaded races, and then
-//	make sure it is fast, and then... make sure it is fast in the kernel, and then finally, use it in the kernel.
+#include "Timing.h"
 
 #pragma pack(push, 1)
 typedef union {
@@ -13,6 +11,23 @@ typedef union {
 	};
 } DataIndex;
 #pragma pack(pop)
+
+// If we make this smaller we have to change one of ours tests... Basically, our shrink factor also provides another
+//	value, which we may be smaller than, but which we never shrink once we are below that value. Right now this value
+//	is greater than that, but it doesn't really matter... (although, allocating more memory is better, as misses
+//	are much faster the more we allocate).
+uint64_t logMinEntryCount = 10;
+// This can be close to 33, but... it takes so long to insert (> 1000ns), so I don't think it matters if this is less...
+//	Also, even at 27 we use ~30GB, so we use ~450 bytes per insert (for a very small value struct), so we won't have
+//	enough memory for 33 anyway...
+uint64_t logMaxEntryCount = 27;
+
+uint64_t allocLogToSize(uint64_t log) {
+	return log == 0 ? 0 : (1 << (log - 1));
+}
+uint64_t hashToIndex(uint64_t hash, uint64_t log) {
+	return hash >> (64 - log + 1);
+}
 
 
 int atomicHashTable_applyChange(
@@ -27,10 +42,9 @@ int atomicHashTable_applyChange(
 		allocation = this->zeroAllocation;
 	}
 	else {
-		Get_uint32_t(
+		allocRef = Get_uint32_t(
 			this->zeroAllocation,
-			&this->base.allocations[index.allocation - 1],
-			&allocRef
+			&this->base.allocations[index.allocation - 1]
 		);
 		// Reference it, in case it is removed from the allocation while we are running
 		allocation = SafeReferenceSmallPointer32(&allocRef);
@@ -82,17 +96,20 @@ int atomicHashTable_dtorTransaction(
 	//	not find A. Which is verifiably bad...)
 	for (int i = 0; i < ALLOCATION_COUNT; i++) {
 		uint32_t alloc = allocations[i];
+		if (!alloc) {
+			continue;
+		}
 		AtomicUnit* units = SafeReferenceSmallPointer32(&alloc);
 		if (!units) {
 			continue;
-		}
-		uint64_t size = 1ll << i;
+		} 
+		uint64_t size = allocLogToSize(i + 1);
 		for (int k = 0; k < size; k++) {
-			uint32_t listHead = units[i].value;
+			uint64_t listHead = units[k].value;
 			while (listHead) {
-				HashEntry* entry = SafeReferenceSmallPointer32(&listHead);
+				HashEntry* entry = SafeReferenceSmallPointer64(&listHead);
 				if (!entry) break;
-				uint32_t nextEntry = entry->nextEntry;
+				uint64_t nextEntry = entry->nextEntry;
 				DereferenceSmallPointer(entry->value);
 				DereferenceSmallPointer(listHead);
 				// This will free it from the list, orphaning the other entries, leaking them
@@ -101,16 +118,21 @@ int atomicHashTable_dtorTransaction(
 				listHead = nextEntry;
 			}
 		}
+		DereferenceSmallPointer(alloc);
+		DereferenceSmallPointer(alloc);
 	}
 
 
 	TransactionProperties props = { 0 };
 	// Base sets use an allocation index of 0, and so can just be set raw
-	return Set_Bytes(context, insertWrite, this->zeroAllocation,
+	int result = Set_Bytes(context, insertWrite, this->zeroAllocation,
 		&this->base,
 		(unsigned char*)&props,
 		sizeof(props)
 	);
+	if (result != 0) return result;
+
+	return finish(context);
 }
 int AtomicHashTable_dtor(AtomicHashTable* this) {
 	DtorTransactionState state = { 0 };
@@ -118,7 +140,7 @@ int AtomicHashTable_dtor(AtomicHashTable* this) {
 
 	int result = TransactionQueue_ApplyWrite(
 		&this->transactions,
-		state,
+		&state,
 		atomicHashTable_dtorTransaction,
 		this,
 		atomicHashTable_applyChange
@@ -129,7 +151,7 @@ int AtomicHashTable_dtor(AtomicHashTable* this) {
 	}
 
 	for (int i = 0; i < ALLOCATION_COUNT; i++) {
-		uint32_t alloc = state.allocation[i];
+		uint32_t alloc = state.allocations[i];
 		if (alloc) {
 			// We atomically swapped it out of the table (via a transaction), so... it is safe to just free
 			//	the table reference.
@@ -139,7 +161,6 @@ int AtomicHashTable_dtor(AtomicHashTable* this) {
 	return 0;
 }
 
-uint64_t logMinEntryCount = 6;
 
 // TransactionChange_set_dataIndex
 
@@ -162,6 +183,8 @@ typedef struct {
 	bool(*callback)(void* callbackContext, void* value);
 
 } StateChangeCore;
+
+#define MOVE_FACTOR 64
 
 typedef struct {
 	AtomicHashTable* this;
@@ -187,31 +210,28 @@ typedef struct {
 
 	// (output)
 	// May be sparsely populated, (so we do have to iterate all of them).
-	uint64_t listsToFree[4];
+	uint64_t listsToFree[MOVE_FACTOR];
 
 	// (output)
 	uint64_t countRemoved;
 
 } InsertState;
 
-uint64_t allocLogToSize(uint64_t log) {
-	return count == 0 ? 0 : (1 << (count - 1));
-}
 
 // Returns < 0 if an error occurs when reading
 int64_t atomicHashTable_countListSize(uint64_t listHead) {
 	int64_t count = 0;
 	while (listHead) {
-		HashEntry* entry = SafeReferenceSmallPointer64(&oldListHeadTemp);
+		HashEntry* entry = SafeReferenceSmallPointer64(&listHead);
 		if (!entry) {
 			return -1;
 		}
 		if (entry->value) {
 			count++;
 		}
-		uint64_t nextOldListHeadTemp = entry->nextEntry;
-		DereferenceSmallPointer(oldListHeadTemp);
-		oldListHeadTemp = nextOldListHeadTemp;
+		uint64_t nextListHead = entry->nextEntry;
+		DereferenceSmallPointer(listHead);
+		listHead = nextListHead;
 	}
 	return count;
 }
@@ -227,22 +247,128 @@ int atomicHashTable_decrementTransaction(
 	int(*finish)(void* context)
 ) {
 	uint64_t currentFillCount;
-	Get_uint64_t(
+	currentFillCount = Get_uint64_t(
 		state->this->zeroAllocation,
-		&state->this->base.currentFillCount,
-		&currentFillCount
+		&state->this->base.currentFillCount
 	);
 
-	currentFillCount -= state.count;
+	currentFillCount -= state->count;
 
-	return Set_uint64_t(
+	int result = Set_uint64_t(
 		context,
 		insert,
 		state->this->zeroAllocation,
 		&state->this->base.currentFillCount,
 		currentFillCount
 	);
+
+	if (result != 0) {
+		OnError(result);
+		return result;
+	}
+
+	return finish(context);
 }
+
+// Returns true if the head of the list has been deallocated
+bool atomicHashTable_removeEmptyEntries(
+	uint32_t listHead
+) {
+	uint32_t lastPointerWithNoValue = 0;
+
+	// Eh... 10 seems good? This number is arbitrary though, and could be lower (or higher).
+	#define lastEntriesSize 10
+	uint32_t lastEntries[lastEntriesSize] = { 0 };
+	uint32_t lastEntriesAddIndex = 0;
+	{
+		uint32_t listHeadTemp = listHead;
+		while (listHeadTemp) {
+			lastEntries[lastEntriesAddIndex] = listHeadTemp;
+			lastEntriesAddIndex = (lastEntriesAddIndex + 1) % lastEntriesSize;
+			HashEntry* entry = SafeReferenceSmallPointer32(&listHeadTemp);
+			if (!entry) {
+				// Contention, but... I guess just return, and let it retry, OR maybe it won't,
+				//	but as these is only removal that is okay?
+				return false;
+			}
+
+			if(!entry->value && !entry->nextEntry) {
+				// Leave the reference to lastPointerWithNoValue, so it stays unique
+				lastPointerWithNoValue = listHeadTemp;
+				break;
+			} else {
+				uint64_t nextListHeadPointer = entry->nextEntry;
+				DereferenceSmallPointer(listHeadTemp);
+				listHeadTemp = (uint32_t)nextListHeadPointer;
+			}
+		}
+	}
+
+	// Now iterate over the last X backwards...
+	bool prevHasNoValue = false;
+	for (uint64_t i = 1; i <= lastEntriesSize; i++) {
+		// Go to the entry before the last value
+		uint64_t ii = (lastEntriesAddIndex - i + lastEntriesSize * 2 - 1) % lastEntriesSize;
+		uint32_t entryPointer = lastEntries[ii];
+		if (!entryPointer) break;
+
+		HashEntry* entry = SafeReferenceSmallPointer32(&entryPointer);
+		if (!entry) {
+			// Contention probably...
+			break;
+		}
+
+		// Will be true, unless this is the last member of the list
+		if (entry->nextEntry != lastPointerWithNoValue) {
+			DereferenceSmallPointer(entryPointer);
+			break;
+		}
+
+		// Wipe it out
+		entry->nextEntry = 0;
+
+		// So this is the second last entry
+		DereferenceSmallPointer(lastPointerWithNoValue);
+		// And the second deref should free the last entry
+		DereferenceSmallPointer(lastPointerWithNoValue);
+		lastPointerWithNoValue = nullptr;
+
+		lastEntries[(ii + 1) % lastEntriesSize] = 0;
+
+		// If the last entry now has a value, stop
+		if (entry->value) {
+			DereferenceSmallPointer(entryPointer);
+			break;
+		}
+
+		// Now try to free this entry,
+		lastPointerWithNoValue = entryPointer;
+	}
+
+	if (lastPointerWithNoValue == 2004) {
+		int here = 0;
+	}
+	if (lastPointerWithNoValue) {
+		// This removes the extra ref we added to last pointer
+		DereferenceSmallPointer(lastPointerWithNoValue);
+	}
+
+	// We deallocated the head, now wipe it out (if this fails... it is okay. The list becomes slower, because it has
+	//	to dereference before knowing the value is really empty, but that is fine...)
+	if (lastPointerWithNoValue == listHead) {
+
+		// Because our pop loop can't free the last value
+		HashEntry* entry = SafeReferenceSmallPointer32(&lastPointerWithNoValue);
+		if (entry) {
+			DereferenceSmallPointer(lastPointerWithNoValue);
+			DereferenceSmallPointer(lastPointerWithNoValue);
+		}
+
+		return true;
+	}
+	return false;
+}
+
 
 int atomicHashTable_insertTransaction(
 	InsertState* state,
@@ -250,7 +376,7 @@ int atomicHashTable_insertTransaction(
 	int(*insert)(void*context, TransactionChange change),
 	int(*finish)(void* context)
 ) {
-	AtomicHashTable this = state->this;
+	AtomicHashTable* this = state->this;
 
 	// Eh... we don't need to read so much. But... this makes things slightly easier, and
 	//	reading should be orders of magnitude faster than writing, so this should be fine...
@@ -258,7 +384,7 @@ int atomicHashTable_insertTransaction(
 
 	Get_Bytes(this->zeroAllocation,
 		&this->base,
-		&props,
+		(unsigned char*)&props,
 		sizeof(props)
 	);
 
@@ -267,28 +393,80 @@ int atomicHashTable_insertTransaction(
 	// We decrement currentFillCount outside of the main transaction, as we remove values outside of transactional memory.
 	//	This insures anything we unallocate WILL actually be removed from the transaction count. The resize after removing
 	//	is then delayed... but only by 1 call (or the number of threads), which is fine...
-	uint64_t newFillCount = props.currentFillCount;
-	if (state->isAdd) {
-		newFillCount++;
+	if (state->change.isAdd) {
+		props.currentFillCount++;
 	}
-	uint64_t currentEntrySize = allocLogToSize(props.currentAllocationLog);
+
+	uint64_t currentEntrySize = props.moveAllocationLog ? allocLogToSize(props.moveAllocationLog) : allocLogToSize(props.currentAllocationLog);
+
+	// Move factor calculations
+
+	// We move with a factor of F of the larger number.
+
+	// So, if we grow, we go from X fill capacity, to X/2. So
+	//	NEW_CAP * X/2 = CURRENT_ELEMENTS
+	//	NEW_CAP * Y = SHRINK_COUNT
+	//	NEW_CAP / F = ELEMENTS_TO_MOVE_ALL
+	//	CURRENT_ELEMENTS - SHRINK_COUNT > ELEMENTS_TO_MOVE_ALL
+	//	NEW_CAP * X/2 - NEW_CAP * Y > NEW_CAP / F
+	//	X/2 - Y > 1 / F
+
+	// When we shrink we go from Y fill capacity to Y*2
+	//	OLD_CAP * Y = CURRENT_ELEMENTS
+	//	OLD_CAP * X = GROW_COUNT
+	//	OLD_CAP / (F / 2) = ELEMENT_TO_MOVE_ALL
+	//	GROW_COUNT - CURRENT_ELEMENTS > ELEMENT_TO_MOVE_ALL
+	//	OLD_CAP * X - OLD_CAP * Y > OLD_CAP / (F / 2)
+	//	X - Y > 1 / (F / 2)
+
+	// And also, we need to be able to move everything before we shrink again!
+	//	OLD_CAP * Y = CURRENT_ELEMENTS
+	//	OLD_CAP * Y * Y = SHRINK_COUNT
+	//	OLD_CAP / (F / 2) = ELEMENT_TO_MOVE_ALL
+	//	CURRENT_ELEMENTS - SHRINK_COUNT > ELEMENT_TO_MOVE_ALL
+	//	OLD_CAP * Y - OLD_CAP * Y * Y > OLD_CAP / (F / 2)
+	//	Y - Y*Y > 1 / (F / 2)
+
+	// And before we grow again
+	//	NEW_CAP * X/2 = CURRENT_ELEMENTS
+	//	NEW_CAP * X = GROW_COUNT
+	//	NEW_CAP / F = ELEMENTS_TO_MOVE_ALL
+	//	GROW_COUNT - CURRENT_ELEMENTS > ELEMENTS_TO_MOVE_ALL
+	//	X/2 > 1 / F
+
+	//	X/2 - Y > 1 / F
+	//	X - Y > 1 / (F / 2)
+	//	Y - Y*Y > 1 / (F / 2)
+	//	X/2 > 1 / F
+
+	// TODO: Once we know we aren't going to fall behind in our moves, add checks to prevent trying to move twice, to
+	//	sort out the small number test cases, or at least to not hard fail if my calculations are wrong...
 
 	bool resizeGrow = (
-		newFillCount >= currentEntrySize / 10 * 7
+		props.currentFillCount >= currentEntrySize / 10 * 5
 		// One exact chance, which will give us some time to resize uninterrupted, until we reach 70% at which point
 		//	we will absolutely need to resize.
-		|| newFillCount == currentEntrySize / 2
+		|| props.currentFillCount == currentEntrySize / 10 * 4
 	);
+	// TODO: Also add, props.currentAllocationLog > logMinEntryCount? Maybe never allocating under logMinEntryCount
+	//	once we use any entries?
 	bool resizeShrink = (
-		newFileCount < currentEntrySize / 10 * 1
-		|| newFileCount == (currentEntrySize / 10 * 2 - 1)
+		props.currentFillCount < currentEntrySize / 20 * 1
+		|| props.currentFillCount == (currentEntrySize / 10 * 1 - 1)
 	);
+	if (resizeShrink && props.currentAllocationLog == logMinEntryCount) {
+		resizeShrink = false;
+	}
+	if (resizeGrow && props.currentAllocationLog == logMaxEntryCount) {
+		resizeGrow = false;
+	}
 
 	bool usedAllocationToAdd = false;
 
 	if (resizeGrow || resizeShrink) {
-		if (props.moveAllocationCount) {
+		if (props.moveAllocationLog) {
 			// Impossible. We haven't finished the previous move.
+			OnError(2);
 			return 2;
 		}
 
@@ -297,18 +475,18 @@ int atomicHashTable_insertTransaction(
 			// Skip the first few allocation sizes
 			newAllocationLog = logMinEntryCount;
 		}
-		uint64_t newAllocationSize = allocLogToSize(newAllocationLog) * sizeof(HashSlot);
+		uint64_t newAllocationSize = allocLogToSize(newAllocationLog) * sizeof(AtomicUnit);
 		uint64_t newAllocation = 0;
-		if (state.needsAllocationOfSize >= newAllocationSize) {
+		if (state->needsAllocationOfSize >= newAllocationSize) {
 			usedAllocationToAdd = true;
-			newAllocation = state.allocationToAdd;
+			newAllocation = state->allocationToAdd;
 		}
 		else {
-			state.needsAllocationOfSize = newAllocationSize;
+			state->needsAllocationOfSize = newAllocationSize;
 			return 2;
 		}
 
-		props.allocations[newAllocationLog - 1] = newAllocation;
+		props.allocations[newAllocationLog - 1] = (uint32_t)newAllocation;
 		props.moveAllocationLog = newAllocationLog;
 		props.nextMoveSlotIndex = 0;
 	}
@@ -316,75 +494,79 @@ int atomicHashTable_insertTransaction(
 
 	typedef struct {
 		uint64_t allocLog;
-		uint32_t allocIndex;
+		uint64_t allocIndex;
 		HashSlot listHead;
 	} EntrySetIntent;
 	uint64_t setIntentCount = 0;
-	// 4 for resizing, and 1 for insert
-	EntrySetIntent setIntents[5] = { 0 };
+	// MOVE_FACTOR for resizing, and 1 for insert
+	EntrySetIntent setIntents[MOVE_FACTOR + 1] = { 0 };
 
 	// We only remove from the end of the list, and insert to the beginning, so we don't have to worry about our list
 	//	being cut up (without the transaction memory from changing, which would cause us to rerun anyway)...
 
-	uint64_t sourceLists[4] = { 0 };
-	uint64_t destListHeads[4] = { 0 };
+	uint64_t sourceLists[MOVE_FACTOR] = { 0 };
+	uint64_t destListHeads[MOVE_FACTOR] = { 0 };
+	uint64_t usedNewListEntries = 0;
+
+	uint64_t prevAllocSmallPointer = 0;
 
 	if (props.moveAllocationLog) {
 		uint64_t nextMoveSlotIndex = props.nextMoveSlotIndex;
-		uint64_t nextMoveSize = allocLogToSize(moveAllocationLog);
+		uint64_t destMoveSize = allocLogToSize(props.moveAllocationLog);
 		uint64_t sourceSize = allocLogToSize(props.currentAllocationLog);
 
 		uint64_t destChooseBit = 0;
 
-		bool growing = moveAllocationLog > props.currentAllocationLog;
-		if (growing) {
-			destChooseBit = props.moveAllocationLog;
-		}
-		else {
-			destChooseBit = props.currentAllocationLog;
-		}
+		bool growing = props.moveAllocationLog > props.currentAllocationLog;
 
-		uint64_t sourceCount = growing ? 2 : 4;
-		uint64_t destCount = growing ? 4 : 2;
+		uint64_t sourceCount = growing ? (MOVE_FACTOR / 2) : MOVE_FACTOR;
+		uint64_t destCount = growing ? MOVE_FACTOR : (MOVE_FACTOR / 2);
+		if (sourceCount > sourceSize - nextMoveSlotIndex) {
+			sourceCount = sourceSize - nextMoveSlotIndex;
+		}
 
 		uint64_t destSlotIndex = growing ? nextMoveSlotIndex * 2 : nextMoveSlotIndex / 2;
+		if (destCount > destMoveSize - destSlotIndex) {
+			destCount = destMoveSize - destSlotIndex;
+		}
 
 		
-		AtomicUnit* sourceUnits = nullptr;
-		for (uint64_t i = 0; i < sourceCount; i++) {
-			uint64_t sourceSlotIndex = nextMoveSlotIndex + i;
-			if (sourceSlotIndex >= sourceSize) break;
+		uint32_t sourceAlloc = props.allocations[props.currentAllocationLog - 1];
+		if (sourceAlloc) {
+			AtomicUnit* sourceUnits = SafeReferenceSmallPointer32(&sourceAlloc);
 			if (!sourceUnits) {
-				sourceUnits = SafeReferenceSmallPointer32(&props.allocations[props.currentAllocationLog - 1]);
-				if (!sourceUnits) {
-					return 2;
-				}
+				// Probably due to contention
+				return 1;
 			}
-			HashSlot sourceSlot;
-			Get_Bytes(
-				sourceUnits,
-				(void*)(sourceSlotIndex * sizeof(slot)),
-				(unsigned char*)&slot,
-				sizeof(slot)
-			);
-			sourceLists[i] = sourceSlot.listHead;
+			for (uint64_t i = 0; i < sourceCount; i++) {
+				uint64_t sourceSlotIndex = nextMoveSlotIndex + i;
+				if (sourceSlotIndex >= sourceSize) break;
+				HashSlot sourceSlot;
+				Get_Bytes(
+					sourceUnits,
+					(void*)((uint64_t)sourceUnits + sourceSlotIndex * sizeof(sourceSlot)),
+					(unsigned char*)&sourceSlot,
+					sizeof(sourceSlot)
+				);
+				sourceLists[i] = sourceSlot.listHead;
+			}
+			DereferenceSmallPointer(sourceAlloc);
 		}
 
 		int64_t neededEntries = 0;
 		for (uint64_t i = 0; i < sourceCount; i++) {
 			uint64_t sourceList = sourceLists[i];
-			int64_t neededEntriesCur = atomicHashTable_countListSize(oldListHead);
+			int64_t neededEntriesCur = atomicHashTable_countListSize(sourceList);
 			if (neededEntriesCur < 0) return 1;
 			neededEntries += neededEntriesCur;
 		}
 
-		if (neededEntries > state.needsListEntries) {
+		if ((uint64_t)neededEntries > state->needsListEntries) {
 			// + 5 + 25%, so even if more entries are added, we will probably still have enough buffer to expand
-			state.needsListEntries = (neededEntries + 5) * 5 / 4;
+			state->needsListEntries = (neededEntries + 5) * 5 / 4;
 			return 2;
 		}
 
-		uint64_t usedNewListEntries = 0;
 		for (uint64_t i = 0; i < sourceCount; i++) {
 			uint64_t sourceList = sourceLists[i];
 			if (sourceList == 0) continue;
@@ -394,38 +576,45 @@ int atomicHashTable_insertTransaction(
 				if (!entry) {
 					return 1;
 				}
-
-				// Empty, no need to move it...
-				if (!entry->value) continue;
-
-				if (usedNewListEntries >= state.needsListEntries) {
-					// Surely we ran out just because entries were added while we were iterating
-					return 1;
+				if (entry->value == 14930) {
+					int here = 0;
 				}
 
-				uint64_t destIndex = (entry->hash >> (64 - destChooseBit)) & 0x3;
-				uint64_t prevListHead = destListHeads[destIndex];
+				// Only move entries with values
+				if (entry->value) {
+					if (usedNewListEntries >= state->needsListEntries) {
+						// Surely we ran out just because entries were added while we were iterating
+						return 1;
+					}
 
-				uint64_t newListHead = state.entries[usedNewListEntries];
-				state.entries[usedNewListEntries] = 0;
-				usedNewListEntries++;
-				state.listsToFree[newBit] = destListHeads[newBit] = newListHead;
+					uint64_t destIndex = hashToIndex(entry->hash, props.moveAllocationLog) % destCount;
+					uint64_t prevListHead = destListHeads[destIndex];
 
-				HashEntry* newListEntry = SafeReferenceSmallPointer64(&newListHead);
-				if (!newListEntry) {
-					// Should be impossible, how could this have been freed already?
-					// TODO: We should free anything we put in destListHeads already here... because right now we leak all of that...
-					return 2;
+					uint64_t newListHead = state->entries[usedNewListEntries++];
+					//state->listsToFree[destIndex] =
+					destListHeads[destIndex] = newListHead;
+
+					HashEntry* newListEntry = SafeReferenceSmallPointer64(&newListHead);
+					if (!newListEntry) {
+						// Should be impossible, how could this have been freed already, we haven't inserted it yet...
+						// TODO: We should free anything we put in destListHeads already here... because right now we leak all of that...
+						OnError(2);
+						return 2;
+					}
+					// It already comes referenced, but when we dereference it here it crashes?
+					DereferenceSmallPointer(newListHead);
+
+					newListEntry->hash = entry->hash;
+					// value can be safely moved, as anything that might remove it will have to operate at least with a get
+					//	on the transaction loop, which means either we will get a retry upon calling insert, or they will...
+					newListEntry->value = entry->value;
+					newListEntry->nextEntry = prevListHead;
 				}
-				newListEntry->hash = entry->hash;
-				// value can be safely moved, as anything that might remove it will have to operate at least with a get
-				//	on the transaction loop, which means either we will get a retry upon calling insert, or they will...
-				newListEntry->value = entry->value;
-				newListEntry->nextEntry = *prevListHead;
+
+				uint64_t prevSourceList = sourceList;
+				sourceList = entry->nextEntry;
+				DereferenceSmallPointer(prevSourceList);
 			}
-
-			// So, set the two new slots in moveUnits to destListHeads, and then advance 
-			// (AND IMPORTANTLY! Always set! Even if we set 0, this is important, as we may need to wipe out previous entries)
 		}
 
 		for (uint64_t i = 0; i < destCount; i++) {
@@ -434,172 +623,147 @@ int atomicHashTable_insertTransaction(
 			// Okay, so... the indexes inside of destListHeads (i) doesn't linearily map as offsets to destSlotIndex.
 			//	Those indexes are just the bits choosen, which may need to be mapped [3, 0, 1, 2], [2,3,0,1], [1,2,3,0] or [0,1,2,3]
 			uint64_t destListHead = destListHeads[(destSlotIndexCur % destCount)];
-			setIntents[setIntentCount++] = { props.moveAllocationLog, destSlotIndexCur, destListHead };
+			EntrySetIntent newState = { 0 };
+			newState.allocLog = props.moveAllocationLog;
+			newState.allocIndex = destSlotIndexCur;
+			newState.listHead.listHead = (uint32_t)destListHead;
+			setIntents[setIntentCount++] = newState;
 		}
 
+		props.nextMoveSlotIndex += sourceCount;
 		// Finish the move, if its done
-		if (nextMoveSlotIndex + sourceCount >= sourceSize) {
+		if (props.nextMoveSlotIndex >= sourceSize) {
+			prevAllocSmallPointer = props.allocations[props.currentAllocationLog - 1];
+			// Clear out the previous allocation
+			props.allocations[props.currentAllocationLog - 1] = 0;
 			props.currentAllocationLog = props.moveAllocationLog;
 			props.moveAllocationLog = 0;
 			props.nextMoveSlotIndex = 0;
 		}
 	}
 
+	if (props.currentFillCount > allocLogToSize(props.currentAllocationLog)) {
+		// Probably out of memory, not really an error... it should be handed well
+		//	Could also be a mistake an in the resizing code not making us big enough...
+		return 10;
+	}
 
 	// Add to setIntents, deduping/solving multiple writes, and then apply everything finally
 
 	if (state->change.isAdd) {
 		HashEntry* entry = state->change.entry;
-		uint64_t targetIndex = entry->hash >> (64 - props.currentAllocationLog);
+		uint64_t targetIndex = hashToIndex(entry->hash, props.currentAllocationLog);
+
+		uint64_t allocUsedLog = props.currentAllocationLog;
+		if (props.moveAllocationLog && targetIndex < props.nextMoveSlotIndex) {
+			// It is in the already moved memory
+			targetIndex = hashToIndex(entry->hash, props.moveAllocationLog);
+			allocUsedLog = props.moveAllocationLog;
+		}
 
 		// If we are moving it, then make sure our insert piggybacks on the insert
 		bool foundIntent = false;
 		for (uint64_t i = 0; i < setIntentCount; i++) {
-			if (setIntents[i].allocLog == props.currentAllocationLog && setIntents[i].allocIndex == targetIndex) {
+			if (setIntents[i].allocLog == allocUsedLog && setIntents[i].allocIndex == targetIndex) {
 				foundIntent = true;
 				entry->nextEntry = setIntents[i].listHead.listHead;
-				setIntents[i].listHead = state->entrySmallPointer;
-				setIntents[i].freeAll = false;
+				setIntents[i].listHead.listHead = (uint32_t)state->change.entrySmallPointer;
 			}
 		}
 
 		if (!foundIntent) {
 			AtomicUnit* units;
-			uint64_t allocUsedLog = props.currentAllocationLog;
-			if (props.moveAllocationLog && targetIndex < nextMoveSlotIndex) {
-				// It is in the already moved memory
-				targetIndex = entry->hash >> (64 - props.moveAllocationLog);
-				allocUsedLog = props.moveAllocationLog;
-			}
 			uint32_t allocUsed = props.allocations[allocUsedLog - 1];
 			units = SafeReferenceSmallPointer32(&allocUsed);
-			if (!unit) return 1;
+			if (!units) {
+				return 1;
+			}
 
-			uint32_t prevEntryPointer = units[targetIndex].value;
+			uint32_t prevEntryPointer = (uint32_t)units[targetIndex].value;
 			entry->nextEntry = prevEntryPointer;
 
-			setIntents[setIntentCount++] = { allocLogUsed, targetIndex, state->entrySmallPointer };
+			EntrySetIntent newState = { 0 };
+			newState.allocLog = allocUsedLog;
+			newState.allocIndex = targetIndex;
+			newState.listHead.listHead = (uint32_t)state->change.entrySmallPointer;
+			setIntents[setIntentCount++] = newState;
 
 			DereferenceSmallPointer(allocUsed);
 		}
 	}
 	else {
-		/*
-		typedef struct {
-			bool isAdd;
-
-			// Add values
-			uint64_t entrySmallPointer : BITS_IN_SMALL_POINTER;
-			HashEntry* entry;
-
-			// Remove values
-			uint64_t hash;
-			void* callbackContext;
-			// On true, removes the value from the table
-			bool(*callback)(void* callbackContext, void* value);
-
-		} StateChangeCore;
-
-		typedef struct {
-			AtomicHashTable* this;
-
-			StateChangeCore change;	
-		*/
-		
-
-		uint64_t targetIndex = state->change.hash >> (64 - props.currentAllocationLog);
+		uint64_t targetIndex = hashToIndex(state->change.hash, props.currentAllocationLog);
 
 		AtomicUnit* units;
 		uint64_t allocUsedLog = props.currentAllocationLog;
-		if (props.moveAllocationLog && targetIndex < nextMoveSlotIndex) {
+		if (props.moveAllocationLog && targetIndex == props.nextMoveSlotIndex) {
+			int here = 0;
+		}
+		if (props.moveAllocationLog && targetIndex < props.nextMoveSlotIndex) {
 			// It is in the already moved memory
-			targetIndex = entry->hash >> (64 - props.moveAllocationLog);
+			targetIndex = hashToIndex(state->change.hash, props.moveAllocationLog);
 			allocUsedLog = props.moveAllocationLog;
 		}
 		uint32_t allocUsed = props.allocations[allocUsedLog - 1];
 		units = SafeReferenceSmallPointer32(&allocUsed);
-		if (!unit) return 1;
+		if (!units) {
+			return 1;
+		}
 
-		// We add a reference to this
-		uint32_t lastPointerWithNoValue = 0;
+		uint32_t listHeadPointer = (uint32_t)units[targetIndex].value;
 
-		uint32_t listHeadPointer = units[targetIndex].value;
-		while (listHeadPointer) {
-			HashEntry* entry = SafeReferenceSmallPointer32(&listHeadPointer);
+		bool foundIntent = false;
+		uint64_t foundIntentIndex = 0;
+		for (uint64_t i = 0; i < setIntentCount; i++) {
+			if (setIntents[i].allocLog == allocUsedLog && setIntents[i].allocIndex == targetIndex) {
+				foundIntent = true;
+				foundIntentIndex = i;
+				listHeadPointer = setIntents[i].listHead.listHead;
+			}
+		}
+
+		bool isRemovalCondidate = false;
+
+		uint32_t listHeadTemp = listHeadPointer;
+		while (listHeadTemp) {
+			HashEntry* entry = SafeReferenceSmallPointer32(&listHeadTemp);
 			if (!entry) break;
 
 			uint64_t valuePointer = entry->value;
-			void* value = SafeReferenceSmallPointer64(&valuePointer);
-			bool shouldDelete = state->change.callback(state->change.callbackContext, value);
-			if (shouldDelete) {
+			if (valuePointer) {
+				void* value = SafeReferenceSmallPointer64(&valuePointer);
+			
+				bool shouldDelete = state->change.callback(state->change.callbackContext, value);
+				if (shouldDelete) {
+					state->countRemoved++;
+					// Order is important here. This order means removed values are not kept around
+					//	preferring to keep the list good rather than free all items.
+					entry->value = 0;
+					DereferenceSmallPointer(valuePointer);
+				}
 				DereferenceSmallPointer(valuePointer);
-				entry->value = 0;
 			}
-			DereferenceSmallPointer(valuePointer);
 
 			if (!entry->nextEntry && !entry->value) {
-				state->countRemoved++;
-				lastPointerWithNoValue = listHeadPointer;
-				SafeReferenceSmallPointer32(&lastPointerWithNoValue);
+				isRemovalCondidate = true;
 			}
 
-			uint32_t nextListHeadPointer = entry->nextEntry;
-			DereferenceSmallPointer(listHeaderPointer);
-			listHeadPointer = nextListHeadPointer;
+			uint64_t nextListHeadPointer = entry->nextEntry;
+			DereferenceSmallPointer(listHeadTemp);
+			listHeadTemp = (uint32_t)nextListHeadPointer;
 		}
 
-		if (lastPointerWithNoValue) {
-			listHeadPointer = units[targetIndex].value;
-			// Eh... 10 seems good? It is really arbitrary though...
-			#define lastEntriesSize 10;
-			uint32_t lastEntries[lastEntriesSize] = { 0 };
-			uint32_t lastEntriesAddIndex = 0;
-			while (listHeadPointer) {
-				lastEntries[lastEntriesAddIndex] = listHeadPointer;
-				lastEntriesAddIndex = (lastEntriesAddIndex + 1) % lastEntriesSize;
-				HashEntry* entry = SafeReferenceSmallPointer32(&listHeadPointer);
-				if (!entry) break;
-				uint32_t nextListHeadPointer = entry->nextEntry;
-				DereferenceSmallPointer(listHeaderPointer);
-				listHeadPointer = nextListHeadPointer;
-			}
-
-			// Now iterate over the last X backwards...
-			bool prevHasNoValue = false;
-			for (uint64_t i = 1; i <= lastEntriesSize; i++) {
-				uint64_t ii = (lastEntriesAddIndex - i + lastEntriesSize) % lastEntriesSize;
-				uint32_t entryPointer = lastEntries[ii];
-
-				HashEntry* entry = SafeReferenceSmallPointer32(&entryPointer);
-
-				// Should be true...
-				if (entry->nextEntry != lastPointerWithNoValue) {
-					DereferenceSmallPointer(entryPointer);
-					break;
+		if(isRemovalCondidate) {
+			if(atomicHashTable_removeEmptyEntries(listHeadPointer)) {
+				if(foundIntent) {
+					setIntents[foundIntentIndex].listHead.listHead = 0;
+				} else {
+					EntrySetIntent newState = { 0 };
+					newState.allocLog = allocUsedLog;
+					newState.allocIndex = targetIndex;
+					newState.listHead.listHead = 0;
+					setIntents[setIntentCount++] = newState;
 				}
-
-				// So this is the second last entry
-				Dereference(lastPointerWithNoValue);
-				// And the second deref should free the last entry
-				Dereference(lastPointerWithNoValue);
-
-				// If the last entry now has a value, stop
-				if (entry->value) {
-					DereferenceSmallPointer(entryPointer);
-					break;
-				}
-
-				// Now try to free this entry,
-				lastPointerWithNoValue = entryPointer;
-				state->countRemoved++;
-			}
-
-			DereferenceSmallPointer(lastPointerWithNoValue);
-
-			// We deallocated the head, now wipe it out (if this fails... it is okay. The list becomes slower, because it has
-			//	to dereference before knowing the value is really empty, but that is fine...)
-			if (lastPointerWithNoValue == units[targetIndex].value) {
-				setIntents[setIntentCount++] = { allocLogUsed, targetIndex, 0 };
 			}
 		}
 
@@ -611,14 +775,15 @@ int atomicHashTable_insertTransaction(
 
 	uint32_t* origP = (void*)&originalProps;
 	uint32_t* newP = (void*)&props;
-	uint64_t size = sizeof(TransactionProperties) / sizeof(uint32_t);
-	for (uint64_t i = 0; i < size; i++) {
+	uint64_t atomicCount = sizeof(TransactionProperties) / sizeof(uint32_t);
+
+	for (uint64_t i = 0; i < atomicCount; i++) {
 		if (origP[i] == newP[i]) continue;
 		int result = Set_uint32_t(
 			context,
 			insert,
 			this->zeroAllocation,
-			(void*)(i * sizeof(uint32_t)),
+			(void*)((uint64_t)this->zeroAllocation + i * sizeof(uint32_t)),
 			newP[i]
 		);
 		if (result != 0) {
@@ -646,15 +811,24 @@ int atomicHashTable_insertTransaction(
 			return result;
 		}
 	}
-
+	
 	int finalResult = finish(context);
 	if (finalResult != 0) {
 		return finalResult;
 	}
 
-	// Now the source lists have moved (confirmed), so we can free them (instead of the destination lists)
-	for (uint64_t i = 0; i < 4; i++) {
+	// Now that we committed our change, null out the entries we used
+	for (uint64_t i = 0; i < usedNewListEntries; i++) {
+		state->entries[i] = 0;
+	}
+
+	// Now the source lists have moved (confirmed), so we can free them
+	for (uint64_t i = 0; i < MOVE_FACTOR; i++) {
 		state->listsToFree[i] = sourceLists[i];
+	}
+
+	if (prevAllocSmallPointer) {
+		DereferenceSmallPointer(prevAllocSmallPointer);
 	}
 
 	if (usedAllocationToAdd) {
@@ -676,9 +850,9 @@ int AtomicHashTable_mutate(
 	state.this = this;
 	state.change.isAdd = !shouldRemove;
 	if (state.change.isAdd) {
-		state.change.entrySmallPointer = AllocateAsSmallPointer(sizeof(HashEntry), &state.entry);
+		state.change.entrySmallPointer = AllocateAsSmallPointer(sizeof(HashEntry), &state.change.entry);
 
-		state.change.entry->prevEntry = 0;
+		state.change.hash = hash;
 		state.change.entry->hash = hash;
 		state.change.entry->value = valueSmallPointer;
 		state.change.entry->nextEntry = 0;
@@ -696,7 +870,7 @@ int AtomicHashTable_mutate(
 	while (true) {
 		result = TransactionQueue_ApplyWrite(
 			&this->transactions,
-			state,
+			&state,
 			atomicHashTable_insertTransaction,
 			this,
 			atomicHashTable_applyChange
@@ -724,6 +898,7 @@ int AtomicHashTable_mutate(
 			if (state.entries) {
 				for (uint64_t i = 0; i < lastEntriesCount; i++) {
 					DereferenceSmallPointer(state.entries[i]);
+					state.entries[i] = nullptr;
 				}
 				free(state.entries);
 				state.entries = nullptr;
@@ -734,6 +909,7 @@ int AtomicHashTable_mutate(
 				state.entries[i] = AllocateAsSmallPointer(sizeof(HashEntry), &p);
 				if (!state.entries[i]) {
 					// TODO: We should free entries if we allocated any, otherwise we leak it...
+					OnError(2);
 					return 2;
 				}
 			}
@@ -751,14 +927,39 @@ int AtomicHashTable_mutate(
 
 	if (state.entries) {
 		for (uint64_t i = 0; i < lastEntriesCount; i++) {
-			DereferenceSmallPointer(state.entries[i]);
+			if (state.entries[i]) {
+				DereferenceSmallPointer(state.entries[i]);
+				state.entries[i] = nullptr;
+			}
 		}
 		free(state.entries);
 		state.entries = nullptr;
 	}
 
+	for(uint64_t i = 0; i < MOVE_FACTOR; i++) {
+		uint64_t list = state.listsToFree[i];
+		state.listsToFree[i] = nullptr;
+		while(list) {
+			HashEntry* entry = SafeReferenceSmallPointer64(&list);
+			if(!entry) {
+				// Impossible...
+				OnError(3);
+				break;
+			}
+
+			DereferenceSmallPointer(list);
+
+			uint64_t nextList = entry->nextEntry;
+			DereferenceSmallPointer(list);
+			list = nextList;
+		}
+	}
+
 	if (result != 0) {
-		DereferenceSmallPointer(state.entrySmallPointer);
+		if(state.change.entrySmallPointer) {
+			DereferenceSmallPointer(state.change.entrySmallPointer);
+			state.change.entrySmallPointer = 0;
+		}
 	}
 	
 	// So... even on hard failures we still deallocated, so this should be fine...
@@ -769,7 +970,7 @@ int AtomicHashTable_mutate(
 
 		int decResult = TransactionQueue_ApplyWrite(
 			&this->transactions,
-			decState,
+			&decState,
 			atomicHashTable_decrementTransaction,
 			this,
 			atomicHashTable_applyChange
@@ -788,52 +989,151 @@ int AtomicHashTable_mutate(
 typedef struct {
 	AtomicHashTable* this;
 	uint64_t hash;
-	void* callbackContext;
-	void(*callback)(void* callbackContext, void* value);
+
+	// (input/output)
+	uint64_t valueSmallPointersCount;
+	// All of these pointers should have references to them, or else our caller might complain about inconsistency in the results.
+	uint32_t* valueSmallPointers;
+	uint64_t valueSmallPointersUsed;
 } FindState;
 
-int AtomicHashTable_findTransaction(
+int AtomicHashTable_findTransactionInner(
 	FindState* state
 ) {
+	// Handle retry loops (by reseting our results)
+	for (uint64_t i = 0; i < state->valueSmallPointersUsed; i++) {
+		uint32_t valueSmallPointer = state->valueSmallPointers[i];
+		if (valueSmallPointer) {
+			state->valueSmallPointers[i] = 0;
+			DereferenceSmallPointer(valueSmallPointer);
+		}
+	}
+	state->valueSmallPointersUsed = 0;
+
 	AtomicHashTable* this = state->this;
 	uint64_t hash = state->hash;
-	void* callbackContext = state->callbackContext;
-	void(*callback)(void* callbackContext, void* value) = state->callback;
 
-	if (!this->currentAllocationLog) {
-		return;
+	// Eh... we don't need to read so much. But... this makes things slightly easier, and
+	//	reading should be orders of magnitude faster than writing, so this should be fine...
+	/*
+	TransactionProperties props;
+
+	Get_Bytes(this->zeroAllocation,
+		&this->base,
+		(unsigned char*)&props,
+		sizeof(props)
+	);
+	*/
+
+	uint64_t currentAllocationLog = Get_uint64_t(this->zeroAllocation, &this->base.currentAllocationLog);
+
+	if (!currentAllocationLog) {
+		return 0;
 	}
 
-	uint32_t allocSmallPointer = this->allocations[this->currentAllocationLog - 1];
+	uint64_t nextMoveSlotIndex = Get_uint64_t(this->zeroAllocation, &this->base.nextMoveSlotIndex);
+
+	uint32_t allocSmallPointer = Get_uint32_t(this->zeroAllocation, (this->base.allocations + currentAllocationLog - 1));
+
+	//TimeBlock(FindTransactionSetup,
+
+	int result = 0;
+	uint64_t nextSmallRefIndex = 0;
+	// Used so we can cleanup our references after we finish. We only use 2 of these entries right now.
+	uint64_t smallRefs[10] = { 0 };
+
+	uint64_t unitsIndex = nextSmallRefIndex++;
+	uint64_t entryIndex = nextSmallRefIndex++;
+
 	AtomicUnit* units = SafeReferenceSmallPointer32(&allocSmallPointer);
 	if (!units) {
-		return 1;
+		result = 1;
+		goto cleanup;
 	}
+	smallRefs[unitsIndex] = allocSmallPointer;
 	
-	uint64_t index = hash >> (64 - props.currentAllocationLog);
-	uint32_t listHead = units[index].value;
+	uint64_t index = hashToIndex(hash, currentAllocationLog);
+	if(index < nextMoveSlotIndex) {
+		uint64_t moveAllocationLog = Get_uint64_t(this->zeroAllocation, &this->base.moveAllocationLog);
+		DereferenceSmallPointer(allocSmallPointer);
+		smallRefs[unitsIndex] = 0;
+		allocSmallPointer = Get_uint32_t(this->zeroAllocation, (this->base.allocations + moveAllocationLog - 1));
+		units = SafeReferenceSmallPointer32(&allocSmallPointer);
+		if (!units) {
+			result = 1;
+			goto cleanup;
+		}
+		smallRefs[unitsIndex] = allocSmallPointer;
+		index = hashToIndex(hash, moveAllocationLog);
+	}
+	uint32_t listHead = (uint32_t)units[index].value;
+	//);
 
 	// So... the retries in this loop are funny. Other retries are when a function detects contention in the synced data,
 	//	and so returns. The transaction queue should be able to figure out where the contention happened (but won't, as
 	//	there is no need). HOWEVER, these retries are for contention outside of the synced data, so the transaction
 	//	queue won't know why it is retrying (it will still work, but... you know...).
+
+	TimeBlock(FindSlotLoop, {
 	while (listHead) {
+		TimeBlock(FindSlotLoopInner, {
 		HashEntry* entry = SafeReferenceSmallPointer32(&listHead);
 		if (!entry) {
-			return 1;
+			result = 1;
+			goto cleanup;
 		}
+
+		smallRefs[entryIndex] = listHead;
+
 		uint64_t valueSmallPointer = entry->value;
-		uint32_t nextHead = entry->nextEntry;
-		DereferenceSmallPoitner(listHead);
-		void* value = SafeReferenceSmallPointer64(&valueSmallPointer);
-		if (value) {
-			callback(callbackContext, value);
-			DereferenceSmallPointer(valueSmallPointer);
-		} // else it is just an empty value, this is fine...
-		listHead = nextHead;
+		if (valueSmallPointer) {
+			uint64_t valueIndex = state->valueSmallPointersUsed++;
+			if (valueIndex >= state->valueSmallPointersCount) {
+				state->valueSmallPointersCount = state->valueSmallPointersCount * 2;
+				result = 2;
+				goto cleanup;
+			}
+
+			void* value = SafeReferenceSmallPointer64(&valueSmallPointer);
+			if (!value) {
+				// It must have been removed before we could add a reference to it
+				result = 1;
+				goto cleanup;
+			}
+			state->valueSmallPointers[valueIndex] = (uint32_t)valueSmallPointer;
+			// (we purposely keep a reference to valueSmallPointers)
+		} // else it is an empty value, which is okay
+
+		uint64_t nextHead = entry->nextEntry;
+		DereferenceSmallPointer(listHead);
+		listHead = (uint32_t)nextHead;
+
+		smallRefs[entryIndex] = 0;
+		});
 	}
+	});
+
+cleanup:
+	for(uint64_t i = 0; i < nextSmallRefIndex; i++) {
+		uint64_t smallP = smallRefs[i];
+		if(smallP) {
+			DereferenceSmallPointer(smallP);
+		}
+	}
+	return result;
 }
 
+int AtomicHashTable_findTransaction(
+	FindState* state
+) {
+	TimeBlock(AtomicHashTable_findTransaction,
+	int result = AtomicHashTable_findTransactionInner(state);
+	);
+
+	return result;
+}
+
+// TODO: Add a multi-find? As once we are inside the loop and have the allocations we can probably run many finds really quickly.
 int AtomicHashTable_find(
 	AtomicHashTable* this,
 	uint64_t hash,
@@ -843,18 +1143,111 @@ int AtomicHashTable_find(
 	// (and obviously, may call this callback multiple times for one call)
 	void(*callback)(void* callbackContext, void* value)
 ) {
+
 	FindState state = { 0 };
 	state.this = this;
 	state.hash = hash;
-	state.callbackContext = callbackContext;
-	state.callback = callback;
-	return TransactionQueue_RunGetter(
-		&this->transactions,
-		&state,
-		AtomicHashTable_findTransaction,
-		this,
-		atomicHashTable_applyChange
-	);
+
+#define STACK_OUTPUT_COUNT 10
+	uint32_t stackOutput[STACK_OUTPUT_COUNT] = { 0 };
+
+	uint64_t lastValueSmallPointersCount = state.valueSmallPointersCount = STACK_OUTPUT_COUNT;
+	state.valueSmallPointers = stackOutput;
+
+	int result = 0;
+
+	TimeBlock(AtomicHashTable_find_RunLoop, {
+	while (true) {
+		result = TransactionQueue_RunGetter(
+			&this->transactions,
+			&state,
+			AtomicHashTable_findTransaction,
+			this,
+			atomicHashTable_applyChange
+		);
+		if (state.valueSmallPointersCount != lastValueSmallPointersCount) {
+			for (uint64_t i = 0; i < lastValueSmallPointersCount; i++) {
+				uint32_t prevP = state.valueSmallPointers[i];
+				if (prevP) {
+					DereferenceSmallPointer(prevP);
+				}
+			}
+
+			if (state.valueSmallPointers && state.valueSmallPointers != stackOutput) {
+				free(state.valueSmallPointers);
+				state.valueSmallPointers = nullptr;
+			}
+			lastValueSmallPointersCount = state.valueSmallPointersCount;
+			state.valueSmallPointers = malloc(lastValueSmallPointersCount * sizeof(uint32_t));
+			if (!state.valueSmallPointers) {
+				OnError(2);
+				return 2;
+			}
+			continue;
+		}
+		break;
+	}
+	});
+
+	TimeBlock(AtomicHashTable_find_finish, {
+	if (result == 0) {
+		HashEntry* stackEntries[STACK_OUTPUT_COUNT] = { 0 };
+		HashEntry** entries = stackEntries;
+		if(lastValueSmallPointersCount > STACK_OUTPUT_COUNT) {
+			entries = malloc(sizeof(HashEntry*) * lastValueSmallPointersCount);
+			memset(entries, 0, sizeof(HashEntry*) * lastValueSmallPointersCount);
+		}
+
+		for (uint64_t i = 0; i < state.valueSmallPointersUsed; i++) {
+			uint32_t smallP = state.valueSmallPointers[i];
+
+			HashEntry* entry = SafeReferenceSmallPointer32(&smallP);
+			if (!entry) {
+				// What!? Our inner transaction function failed us, it should have added a reference to the pointer!
+				//	TODO: Don't leak everything here. Its annoying, because the reference count varies depending on i
+				//	(either it is 1 or 2)
+				return 3;
+			}
+			entries[i] = entry;
+		}
+
+		// Call callbacks
+		// TODO: Add a try/catch around the callback function...
+		for (uint64_t i = 0; i < state.valueSmallPointersUsed; i++) {
+			HashEntry* entry = entries[i];
+			callback(callbackContext, entry);
+		}
+
+		for (uint64_t i = 0; i < state.valueSmallPointersUsed; i++) {
+			uint32_t smallP = state.valueSmallPointers[i];
+			// 1 for the inner loop, another for our loop which gets the HashEntry value
+			DereferenceSmallPointer(smallP);
+			DereferenceSmallPointer(smallP);
+		}
+
+		if(entries != stackEntries) {
+			free(entries);
+			entries = nullptr;
+		}
+	}
+	else {
+		for (uint64_t i = 0; i < lastValueSmallPointersCount; i++) {
+			uint32_t smallP = state.valueSmallPointers[i];
+			if (smallP) {
+				state.valueSmallPointers[i] = 0;
+				DereferenceSmallPointer(smallP);
+			}
+		}
+	}
+
+	if (state.valueSmallPointers && state.valueSmallPointers != stackOutput) {
+		free(state.valueSmallPointers);
+		state.valueSmallPointers = nullptr;
+	}
+
+	});
+
+	return result;
 }
 
 int AtomicHashTable_insert(AtomicHashTable* this, uint64_t hash, uint64_t valueSmallPointer) {
@@ -869,4 +1262,16 @@ int AtomicHashTable_remove(
 	bool(*callback)(void* callbackContext, void* value)
 ) {
 	return AtomicHashTable_mutate(this, hash, 0, callbackContext, callback);
+}
+
+TransactionProperties DebugAtomicHashTable_properties(AtomicHashTable* this) {
+	TransactionProperties props;
+
+	Get_Bytes(this->zeroAllocation,
+		&this->base,
+		(unsigned char*)&props,
+		sizeof(props)
+	);
+
+	return props;
 }

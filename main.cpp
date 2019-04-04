@@ -24,6 +24,9 @@
 
 #include "simple_table.h"
 
+#include <immintrin.h>
+
+
 
 void randomBytes(unsigned char* key, int size, unsigned long long seed) {
 	mersenne_seed((unsigned long)seed);
@@ -31,6 +34,24 @@ void randomBytes(unsigned char* key, int size, unsigned long long seed) {
 		unsigned int v = mersenne_rand_u32();
 		// Eh... this might be a bit biased. But I don't think it impacts the security of this. Also... this probably won't be called anyway.
 		key[i] = (char)v;
+	}
+}
+
+void randomBytesSecure(unsigned char* key, int size) {
+	for (int i = 0; i < size;) {
+		uint64_t value = 0;
+		if (_rdrand64_step(&value) == 0) {
+			throw "impossible";
+		}
+		
+		if (size - i < 8) {
+			key[i] = (char)value;
+			i++;
+		}
+		else {
+			*(uint64_t*)(key + i) = value;
+			i += 8;
+		}
 	}
 }
 
@@ -332,8 +353,8 @@ void runTransactionTest() {
 }
 
 extern "C" {
-	void OnError(int code) {
-		printf("Error %d\n");
+	void OnErrorInner(int code, const char* name, unsigned long long line) {
+		printf("Error %d, %s:%llu\n", code, name, line);
 	}
 }
 
@@ -589,9 +610,506 @@ void runRefTest2() {
 	);
 }
 
+#include "AtomicHashTable.h"
+
+
+uint64_t invertBits(uint64_t value) {
+	uint64_t output = 0;
+	uint64_t mask = 1;
+	for (int bit = 0; bit < 63; bit++) {
+		output = output | ((value & mask) >> bit << (63 - bit));
+		mask = mask << 1;
+	}
+	return output;
+}
+uint64_t getHash(uint64_t a, uint64_t b) {
+	return invertBits(a + b);
+}
+
+
+typedef struct {
+	uint64_t a;
+	uint64_t b;
+	uint64_t c;
+} Item;
+void testAdd(AtomicHashTable& table, uint64_t a, uint64_t b, uint64_t c) {
+	Item* item;
+	uint64_t itemSmallPointer = AllocateAsSmallPointer(sizeof(Item), (void**)&item);
+	item->a = a;
+	item->b = b;
+	item->c = c;
+	uint64_t hash = getHash(a, b);
+	ErrorTop(AtomicHashTable_insert(&table, hash, itemSmallPointer));
+}
+
+uint64_t testRemove(AtomicHashTable& table, Item* item) {
+	uint64_t hash = getHash(item->a, item->b);
+	typedef struct {
+		Item item;
+		uint64_t count;
+	} Context;
+	Context context = { 0 };
+	context.item = *item;
+	int result = (AtomicHashTable_remove(&table, hash, &context, [](void* callbackContextVoid, void* valueVoid){
+		Context* context = (Context*)callbackContextVoid;
+		Item* item = &context->item;
+		Item* other = (Item*)valueVoid;
+		int shouldRemove = (int)(item->a == other->a && item->b == other->b);
+		if (shouldRemove) {
+			context->count++;
+		}
+		return shouldRemove;
+	}));
+	ErrorTop(result);
+	return context.count;
+}
+Item testGetSome(AtomicHashTable& table, Item* item) {
+	uint64_t hash = getHash(item->a, item->b);
+	typedef struct {
+		Item itemIn;
+		Item itemOut;
+	} Context;
+	Context context = { 0 };
+	context.itemIn = *item;
+
+	ErrorTop(AtomicHashTable_find(&table, hash, &context, [](void* contextVoid, void* valueAny) {
+		Context* context = (Context*)contextVoid;
+		Item* value = (Item*)valueAny;
+		if (context->itemIn.a == value->a && context->itemIn.b == value->b) {
+			context->itemOut = *value;
+		}
+	}));
+	return context.itemOut;
+}
+uint64_t testGetCount(AtomicHashTable& table, uint64_t a, uint64_t b) {
+
+	typedef struct {
+		Item item;
+		uint64_t count;
+	} Context;
+	Context context = { 0 };
+	context.item.a = a;
+	context.item.b = b;
+
+	uint64_t hash = getHash(a, b);
+	ErrorTop(AtomicHashTable_find(&table, hash, &context, [](void* contextAny, void* value){
+		Context* context = (Context*)contextAny;
+		Item* item = (Item*)value;
+		if (context->item.a == item->a && context->item.b == item->b) {
+			context->count++;
+		}
+	}));
+	return context.count;
+}
+
+void AssertEqual(uint64_t correct, uint64_t test) {
+	if(correct != test) {
+		printf("Error. Correct %llu was %llu\n", correct, test);
+	}
+}
+
+void runAtomicHashTableTestInner(AtomicHashTable& table) {
+	testAdd(table, 0, 1, 2);
+	{
+		Item item = { 0 };
+		item.a = 0;
+		item.b = 1;
+		item.c = 2;
+		uint64_t v = testGetSome(table, &item).c;
+		AssertEqual(2, v);
+	}
+	{
+		Item item = { 0 };
+		item.a = 0;
+		item.b = 1;
+		item.c = 2;
+		uint64_t v = testGetSome(table, &item).c;
+		AssertEqual(2, v);
+	}
+}
+
+
+
+typedef struct {
+	uint64_t fillCount;
+	PointersSnapshot* snapshot;
+	AtomicHashTable* table;
+} TableSnapshot;
+
+TableSnapshot GetSnapshot(AtomicHashTable& table) {
+	return { DebugAtomicHashTable_properties(&table).currentFillCount, Debug_GetPointersSnapshot(), &table };
+}
+
+int CompareSnapshot(TableSnapshot info) {
+	
+	AssertEqual(info.fillCount, DebugAtomicHashTable_properties(info.table).currentFillCount);
+
+	PointersSnapshotDelta delta = Debug_ComparePointersSnapshot(info.snapshot);
+	if(delta.changeType) {
+		if(delta.changeType == 1) {
+			printf("Removed pointer size %llu allocated at %s:%llu, value %llu\n", delta.entry.size, delta.entry.fileName, delta.entry.line, delta.entry.smallPointerNumber);
+		} else if(delta.changeType == 2) {
+			printf("Added pointer size %llu allocated at %s:%llu, value %llu\n", delta.entry.size, delta.entry.fileName, delta.entry.line, delta.entry.smallPointerNumber);
+		} else if(delta.changeType == 3) {
+			printf("Changed ref count of pointer size %llu, by %llu, allocated at %s:%llu, value %llu\n", delta.entry.size, delta.refCountDelta, delta.entry.fileName, delta.entry.line, delta.entry.smallPointerNumber);
+		}
+	}
+	return delta.changeType;
+}
+
+void testHashLeaksRefs() {
+	AtomicHashTable table = { 0 };
+
+	auto zeroState = GetSnapshot(table);
+	
+	runAtomicHashTableTestInner(table);
+	auto afterRun = GetSnapshot(table);
+	AtomicHashTable_dtor(&table);
+
+	CompareSnapshot(zeroState);
+
+	runAtomicHashTableTestInner(table);
+	CompareSnapshot(afterRun);
+}
+
+void testHashChurnVar(int variation) {
+	uint64_t stride = 10;
+	uint64_t totalCount = 1000;
+
+	//stride = 1;
+	//totalCount = 100;
+
+	Item* items = (Item*)malloc(totalCount * sizeof(Item));
+	if (variation == 0) {
+		memset(items, 1, totalCount * sizeof(Item));
+	}
+	if (variation == 1) {
+		randomBytes((unsigned char*)items, (int)(totalCount * sizeof(Item)), 0x7cdd44b);
+	}
+
+	AtomicHashTable table = { 0 };
+	auto zeroState = GetSnapshot(table);
+
+	TableSnapshot firstInsert = { 0 };
+
+	for (uint64_t i = 0; i < totalCount; i += stride) {
+		for (uint64_t j = 0; j < stride; j++) {
+			Item* item = &items[i + j];
+			testAdd(table, item->a, item->b, item->c);
+		}
+		if(!firstInsert.snapshot) {
+			firstInsert = GetSnapshot(table);
+		}
+		else {
+			//printf("compare\n");
+			if (CompareSnapshot(firstInsert)) {
+				printf("\tat i=%llu\n", i);
+				break;
+			}
+		}
+		
+		for (int j = 0; j < stride; j++) {
+			Item* item = &items[i + j];
+			//AssertEqual(testGetSome(table, item).c, item->c);
+		}
+		for (int j = 0; j < stride; j++) {
+			Item* item = &items[i + j];
+			testRemove(table, item);
+		}
+	}
+
+	AtomicHashTable_dtor(&table);
+	CompareSnapshot(zeroState);
+}
+void testHashChurn() {
+	testHashChurnVar(0);
+	testHashChurnVar(1);
+}
+
+
+
+#include "Timing.h"
+#include "TimingDebug.h"
+
+void testSizingVar(int variation) {
+	uint64_t factor = 1;
+	uint64_t itemCount;
+	
+	if (variation == 0) {
+		itemCount = 1000;
+	}
+	else if(variation == 1) {
+		itemCount = 30000;
+		factor = 30000;
+		itemCount = itemCount / factor;
+	}
+	else if(variation == 2) {
+		itemCount = (1ll << 26);
+	}
+	else {
+		itemCount = (1ll << 17);
+	}
+
+
+	AtomicHashTable table = { 0 };
+
+	TableSnapshot zeroState;
+	if (variation == 0 || variation == 1 || variation == 3) {
+		zeroState = GetSnapshot(table);
+	}
+
+	if (variation == 2 || variation == 3) {
+		printf("insert + 2 gets + remove + dtor timing\n");
+		Timing_StartRoot(&rootTimer);
+	}
+
+	for (uint64_t i = 0; i < itemCount; i++) {
+		testAdd(table, i, i, i);
+
+		if (variation == 2) {
+			if (i % (itemCount / 100) == 0) {
+				auto props = DebugAtomicHashTable_properties(&table);
+				uint64_t count = props.currentFillCount;
+				uint64_t maxCount = 1ll << (props.currentAllocationLog - 1);
+				printf("Add at %f%% %llu/%llu\n", (double)(i + 1) / itemCount * 100, count, maxCount);
+			}
+		}
+
+		if (variation == 0) {
+			for (uint64_t j = 0; j <= i; j++) {
+				uint64_t count = testGetCount(table, j, j);
+				AssertEqual(count, 1);
+			}
+		}
+	}
+
+	if (variation == 0 || variation == 2 || variation == 3) {
+		for (uint64_t j = 0; j < itemCount; j++) {
+			if (variation == 2) {
+				if (j % (itemCount / 100) == 0) {
+					auto props = DebugAtomicHashTable_properties(&table);
+					uint64_t count = props.currentFillCount;
+					uint64_t maxCount = 1ll << (props.currentAllocationLog - 1);
+					printf("Check at %f%% %llu/%llu\n", (double)(j + 1) / itemCount * 100, count, maxCount);
+				}
+			}
+
+			{
+				uint64_t count = testGetCount(table, j + itemCount, j + itemCount);
+				AssertEqual(count, 0);
+			}
+			{
+				uint64_t count = testGetCount(table, j, j);
+				AssertEqual(count, 1);
+			}
+		}
+	}
+	else {
+		printf("no matches:\n");
+		Timing_StartRoot(&rootTimer);
+		for (uint64_t k = 0; k < factor; k++) {
+			for (uint64_t j = 0; j < itemCount; j++) {
+				TimeBlock(gets,
+					uint64_t count = testGetCount(table, j + itemCount, j + itemCount);
+				AssertEqual(count, 0);
+				);
+			}
+		}
+		Timing_EndRootPrint(&rootTimer, itemCount * factor);
+
+		printf("all matches:\n");
+		Timing_StartRoot(&rootTimer);
+		for (uint64_t k = 0; k < factor; k++) {
+			for (uint64_t j = 0; j < itemCount; j++) {
+				TimeBlock(gets,
+					uint64_t count = testGetCount(table, j, j);
+				AssertEqual(count, 1);
+				);
+			}
+		}
+		Timing_EndRootPrint(&rootTimer, itemCount * factor);
+	}
+
+
+	for (uint64_t i = 0; i < itemCount; i++) {
+		if (variation == 2) {
+			if (i % (itemCount / 100) == 0) {
+				auto props = DebugAtomicHashTable_properties(&table);
+				uint64_t count = props.currentFillCount;
+				uint64_t maxCount = 1ll << (props.currentAllocationLog - 1);
+				printf("Remove at %f%% %llu/%llu\n", (double)(i + 1) / itemCount * 100, count, maxCount);
+			}
+		}
+
+		Item item = { 0 };
+		item.a = i;
+		item.b = i;
+		item.c = i;
+		testRemove(table, &item);
+
+		if (variation == 0) {
+			for (uint64_t j = 0; j <= i; j++) {
+				AssertEqual(testGetCount(table, j, j), 0);
+			}
+			for (uint64_t j = i + 1; j < itemCount; j++) {
+				AssertEqual(testGetCount(table, j, j), 1);
+			}
+		}
+	}
+
+	AtomicHashTable_dtor(&table);
+	if (variation == 0 || variation == 1 || variation == 3) {
+		CompareSnapshot(zeroState);
+	}
+
+	if (variation == 2 || variation == 3) {
+		Timing_EndRootPrint(&rootTimer, itemCount * factor);
+	}
+}
+void testSizing() {
+	testSizingVar(0);
+	testSizingVar(1);
+	//testSizingVar(2);
+	testSizingVar(3);
+}
+
+#include <vector>
+void testHashChurn2Var(int variation) {
+
+	uint64_t itemCount = 1000;
+	uint64_t iterationCount = itemCount * 10;
+
+
+	int16_t* randomChoices = (int16_t*)malloc(iterationCount * sizeof(int16_t));
+	int64_t* randomIndexes = (int64_t*)malloc(iterationCount * sizeof(int64_t));
+	Item* items = (Item*)malloc(itemCount * sizeof(Item));
+
+
+	if (variation == 0) {
+		randomBytes((unsigned char*)randomChoices, (int)(iterationCount * sizeof(int16_t)), 0x7cdd44b);
+		randomBytes((unsigned char*)randomIndexes, (int)(iterationCount * sizeof(int64_t)), 0x7cdd44b);
+
+		for (uint64_t i = 0; i < itemCount; i++) {
+			items[i].a = i + 1;
+			items[i].b = i * 2;
+			items[i].c = i;
+		}
+	}
+	else {
+		randomBytesSecure((unsigned char*)randomChoices, (int)(iterationCount * sizeof(int16_t)));
+		randomBytesSecure((unsigned char*)randomIndexes, (int)(iterationCount * sizeof(int64_t)));
+		randomBytesSecure((unsigned char*)items, (int)(itemCount * sizeof(Item)));
+	}
+
+
+	AtomicHashTable table = { 0 };
+
+	// Cause an allocation, to get the "empty, but has had data before" state (see the final zeroSnapshot check comment for why this matters)
+	testAdd(table, 1, 1, 1);
+	Item item = { 0 };
+	item.a = 1;
+	item.b = 1;
+	item.c = 1;
+	testRemove(table, &item);
+
+	auto zeroSnapshot = GetSnapshot(table);
+
+
+	std::vector<Item> itemsNotAdded(items, items + itemCount);
+	std::vector<Item> itemsAdded;
+
+	int16_t decision = 0;
+
+	for(uint64_t i = 0; i < iterationCount; i++) {
+		if (i == 5486) {
+			int here = 0;
+		}
+
+		int64_t index = randomIndexes[i];
+		if((decision >= 0 || itemsAdded.size() == 0) && itemsNotAdded.size() > 0) {
+			index = index % itemsNotAdded.size();
+			Item item = itemsNotAdded.at(index);
+			if (item.c == 981) {
+				int here = 0;
+			}
+			testAdd(table, item.a, item.b, item.c);
+			AssertEqual(testGetCount(table, item.a, item.b), 1);
+			AssertEqual(testGetSome(table, &item).c, item.c);
+			itemsNotAdded.erase(itemsNotAdded.begin() + index);
+			itemsAdded.push_back(item);
+		} else {
+			index = index % itemsAdded.size();
+			Item item = itemsAdded.at(index);
+			if (item.c == 981) {
+				int here = 0;
+			}
+			uint64_t count = testRemove(table, &item);
+
+			AssertEqual(count, 1);
+
+			itemsAdded.erase(itemsAdded.begin() + index);
+			itemsNotAdded.push_back(item);
+		}
+		decision += randomChoices[i] / 256;
+
+		//if (i == 5486)
+		{
+			for (uint64_t j = 0; j < itemsAdded.size(); j++) {
+				Item item = itemsAdded.at(j);
+				if (j == 174) {
+					int here = 0;
+				}
+				AssertEqual(testGetCount(table, item.a, item.b), 1);
+			}
+			for (uint64_t j = 0; j < itemsNotAdded.size(); j++) {
+				Item item = itemsNotAdded.at(j);
+				AssertEqual(testGetCount(table, item.a, item.b), 0);
+			}
+		}
+	}
+
+	for(uint64_t i = 0; i < itemsAdded.size(); i++) {
+		Item item = itemsAdded.at(i);
+		AssertEqual(testGetCount(table, item.a, item.b), 1);
+	}
+
+	for(uint64_t i = 0; i < itemsAdded.size(); i++) {
+		if (i + 1 == itemsAdded.size()) {
+			int here = 0;
+		}
+		Item item = itemsAdded.at(i);
+		uint64_t count = testRemove(table, &item);
+		AssertEqual(count, 1);
+	}
+
+	// So, the snapshot should be equal, with the only allocation the initial minimal allocation (this verifies that we deallocate down to
+	//	the minimum allocation... which may not be what we want, so if this starts failing... maybe just change this test...)
+	CompareSnapshot(zeroSnapshot);
+}
+
+void testHashChurn2() {
+	testHashChurn2Var(0);
+	testHashChurn2Var(1);
+}
+
+
+
+
+void runAtomicHashTableTest() {
+	testHashLeaksRefs();
+
+	testHashChurn();
+	testSizing();
+	testHashChurn2();
+
+	todonext
+	// I think this works... Now... get it building in the kernel, then running for a toy example in the kernel, and then...
+	//	start using it to dynamically measure network traffic, and then dynamically filter/control network traffic.
+}
+
 int main() {
 	try {
-		runRefTest2();
+		runAtomicHashTableTest();
 	}
 	catch (...) {
 		printf("error main\n");

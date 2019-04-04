@@ -179,21 +179,26 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="AtomicHashTable.c" />
+    <ClCompile Include="AtomicHashTableDebug.cpp" />
     <ClCompile Include="AtomicHelpers.c" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="mersenne-twister.c" />
     <ClCompile Include="ReferenceCounter.c" />
     <ClCompile Include="simple_table.c" />
+    <ClCompile Include="Timing.c" />
+    <ClCompile Include="TimingDebug.cpp" />
     <ClCompile Include="TransactionQueue.c" />
     <ClCompile Include="TransactionQueueHelpers.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AtomicHashTable.h" />
+    <ClInclude Include="AtomicHashTableDebug.h" />
     <ClInclude Include="AtomicHelpers.h" />
     <ClInclude Include="mersenne-twister.h" />
     <ClInclude Include="ReferenceCounter.h" />
     <ClInclude Include="simple_table.h" />
     <ClInclude Include="environment.h" />
+    <ClInclude Include="Timing.h" />
     <ClInclude Include="TransactionQueue.h" />
     <ClInclude Include="TransactionQueueHelpers.h" />
   </ItemGroup>

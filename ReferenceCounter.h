@@ -44,6 +44,17 @@ typedef __declspec(align(16)) struct {
 #pragma pack(pop)
 CASSERT(sizeof(SmallPointerEntry) == 16);
 
+#pragma pack(push, 1)
+typedef __declspec(align(16)) struct {
+	void* pointer;
+	uint64_t referenceCount;
+	uint64_t size;
+	const char* fileName;
+	uint64_t line;
+	uint64_t smallPointerNumber;
+} SmallPointerEntry_Extended;
+#pragma pack(pop)
+
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
@@ -71,7 +82,7 @@ typedef __declspec(align(16)) struct {
 	//	(we never deallocate these)
 	//	(each size is 1 << index, and because we never deallocate, we use every allocation, using the requested index
 	//		to find which allocation that index is in).
-	SmallPointerEntry* allocations[BITS_IN_SMALL_POINTER];
+	SmallPointerEntry_Extended* allocations[BITS_IN_SMALL_POINTER];
 
 	// Used to iterate when searching for empty allocations.
 	volatile uint64_t searchIterations;
@@ -86,10 +97,12 @@ typedef __declspec(align(16)) struct {
 
 SmallPointerTable* debug_getPointerTable();
 
+#define AllocateAsSmallPointer(size, pointerOut) AllocateAsSmallPointerRaw(size, pointerOut, __FILE__, __LINE__)
+
 // We are not going to expose as "ConvertToSmallPointer". That would require having the caller guarantee they don't pass a pointer
 //	twice, as if they were to pass the same pointer twice, it would guarantee a double free.
 // Returns 0 only on error.
-uint64_t AllocateAsSmallPointer(uint64_t size, void** pointerOut);
+uint64_t AllocateAsSmallPointerRaw(uint64_t size, void** pointerOut, const char* file, uint64_t line);
 
 
 // These leverage an interesting reality of pointers. While observing a pointer in a shared memory location it may
@@ -108,6 +121,28 @@ void* SafeReferenceSmallPointer32(uint32_t* smallPointer);
 //void* ReferenceSmallPointer(uint64_t smallPointer);
 
 void DereferenceSmallPointer(uint64_t smallPointer);
+
+uint64_t Debug_GetAllReferenceCounts();
+SmallPointerTable* Debug_GetSmallPointerTable();
+
+typedef struct {
+	SmallPointerEntry_Extended* entries;
+	uint64_t entryCount;
+} PointersSnapshot;
+
+PointersSnapshot* Debug_GetPointersSnapshot();
+
+typedef struct {
+	// 0 = no change
+	// 1 = removed
+	// 2 = added
+	// 3 = changed ref count ()
+	int changeType;
+	SmallPointerEntry_Extended entry;
+	int64_t refCountDelta; // (currrent - previous)
+} PointersSnapshotDelta;
+PointersSnapshotDelta Debug_ComparePointersSnapshot(PointersSnapshot* info);
+void Debug_DeallocatePointersSnapshot(PointersSnapshot* info);
 
 
 #ifdef __cplusplus

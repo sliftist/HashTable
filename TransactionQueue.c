@@ -1,6 +1,9 @@
+
 #include "TransactionQueue.h"
 #include "AtomicHelpers.h"
 #include <intrin.h>
+
+#include "Timing.h"
 
 // Returns true on success
 bool MutateTransactionState(
@@ -272,7 +275,7 @@ void finishTime(CallTimes* times, unsigned int* pcpuid, uint64_t* pticks) {
 	if (!ticks) {
 		int zero = 0;
 		// finishTime called multiple times
-		zero = 1 / zero;
+		OnError(3);
 	}
 
 	unsigned int cpuid2;
@@ -467,7 +470,7 @@ int transactionQueue_startRetryLoop(
 	}
 }
 
-int TransactionQueue_RunGetter(
+int TransactionQueue_RunGetterInner(
 	TransactionQueue* this,
 	void* getterContext,
 	// On non-zero returns, returns non-zero from our getter
@@ -498,7 +501,9 @@ int TransactionQueue_RunGetter(
 		}
 		// 0 means we checked, and there are no more transactions that can be applied.
 
-		result = getter(getterContext);
+		TimeBlock(transactionsGetCallback, {
+			result = getter(getterContext);
+		});
 
 		// If the getter failed, it likely means there was some contention during list resizing or something like that...
 		//	so better go try to apply more transactions.
@@ -521,16 +526,35 @@ int TransactionQueue_RunGetter(
 	return 0;
 }
 
-//#pragma pack(push, 1)
+int TransactionQueue_RunGetter(
+	TransactionQueue* this,
+	void* getterContext,
+	int(*getter)(void* getterContext),
+	void* applyContext,
+	int(*applyChange)(void* applyContext, TransactionChange change)
+) {
+	TimeBlock(transactionsGets,
+	int result = TransactionQueue_RunGetterInner(this, getterContext, getter, applyContext, applyChange);
+	);
+
+	return result;
+}
+
+#pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
 	TransactionQueue* queue;
 	uint64_t transactionId;
 	TransactionQueueState state;
 	bool finishCalled;
 } ApplyWriteState;
-//#pragma pack(pop)
+#pragma pack(pop)
+
+
+uint64_t AtomicChangeCount = 0;
 
 int TransactionQueue_applyWrite_insertWriteCallbackBase(ApplyWriteState* this, TransactionChange change, bool isEnd) {
+	InterlockedIncrement64(&AtomicChangeCount);
+
 	change.isEnd = isEnd ? 1 : 0;
 	change.transactionId = this->transactionId;
 
@@ -590,7 +614,11 @@ int TransactionQueue_applyWrite_insertWriteCallbackBase(ApplyWriteState* this, T
 	return 0;
 }
 int TransactionQueue_applyWrite_insertWriteCallback(ApplyWriteState* this, TransactionChange change) {
-	return TransactionQueue_applyWrite_insertWriteCallbackBase(this, change, 0);
+	TimeBlock(transactionWriteInsertCallback,
+	int result = TransactionQueue_applyWrite_insertWriteCallbackBase(this, change, 0);
+	);
+
+	return result;
 }
 
 int TransactionQueue_applyWrite_finish(ApplyWriteState* this) {
@@ -599,13 +627,12 @@ int TransactionQueue_applyWrite_finish(ApplyWriteState* this) {
 	return TransactionQueue_applyWrite_insertWriteCallbackBase(this, change, true);
 }
 
-
 // TODO: Add checks for multiple writes to the same location within a transaction. If that happens
 //	it is possible for earlier writes to be the final writes applied... so... that is bad.
 //	(although, the only way I can think of checking will also make the creation of writes quadratic in speed, which is bad)
 // TODO: Add a warning if a write tries to write more values than PENDING_TRANSACTION_MAX. Currently if it does,
 //	we will basically just (silently) drop the first entries that were added, only applies last entries that fit.
-int TransactionQueue_ApplyWrite(
+int TransactionQueue_ApplyWriteInner(
 	TransactionQueue* this,
 	void* writeContext,
 	int(*write)(
@@ -671,7 +698,11 @@ int TransactionQueue_ApplyWrite(
 		writeState.state = state;
 		writeState.finishCalled = false;
 
+		TimeBlock(transactionWriteInnerFnc,
 		result = write(writeContext, &writeState, TransactionQueue_applyWrite_insertWriteCallback, TransactionQueue_applyWrite_finish);
+		);
+
+
 		if (result == 1) continue;
 		if (result > 1) {
 			InterlockedIncrement64(&this->hardFails);
@@ -685,11 +716,10 @@ int TransactionQueue_ApplyWrite(
 		break;
 	} while (true);
 
-
 	finishTime(&this->writeRecordCalls, &cpuid, &ticks);
 	startTime(&cpuid, &ticks);
 
-
+	//*
 	// And then, apply the changes
 	do {
 		TransactionQueueState state;
@@ -702,8 +732,33 @@ int TransactionQueue_ApplyWrite(
 		}
 		break;
 	} while (true);
+	//*/
 
 	finishTime(&this->writeApplyCalls, &cpuid, &ticks);
 
 	return 0;
+}
+
+
+TimeTracker transactionWrites = { 0 };
+int TransactionQueue_ApplyWrite(
+	TransactionQueue* this,
+	void* writeContext,
+	int(*write)(
+		void* writeContext,
+		void* insertWriteContext,
+		int(*insertWrite)(
+			void* insertWriteContext,
+			TransactionChange change
+		),
+		int(*finish)(void* insertWriteContext)
+	),
+	void* applyContext,
+	int(*applyChange)(void* applyContext, TransactionChange change)
+) {
+	TimeBlock(transactionWrites,
+	int result = TransactionQueue_ApplyWriteInner(this, writeContext, write, applyContext, applyChange);
+	);
+
+	return result;
 }

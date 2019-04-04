@@ -94,6 +94,8 @@ extern "C" {
 
 #define BITS_IN_DATA_INDEX 40
 
+extern uint64_t AtomicChangeCount;
+
 // Transaction guarantees
 //	- Transactions will be applied only when the writes are based on a consistent and fresh state of the data,
 //		and applyChange will be called for every part of the transaction, as many times as necessary until applyChange
@@ -133,11 +135,11 @@ typedef __declspec(align(16)) struct {
 CASSERT(sizeof(TransactionChange) == 16);
 
 #define TransactionChange_set_dataIndex(x, value) { \
-	(x)->dataIndexHigh = value >> 24; \
+	(x)->dataIndexHigh = value >> 32; \
 	(x)->dataIndexLow = value; \
 }
 
-#define TransactionChange_get_dataIndex(x) (((x)->dataIndexHigh << 24) | ((x)->dataIndexLow))
+#define TransactionChange_get_dataIndex(x) (((x)->dataIndexHigh << 32) | ((x)->dataIndexLow))
 
 // Where the end transaction marks counts as 1, so only this - 1 writes are allowed.
 #define MAX_TRANSACTION_SIZE 256
@@ -223,11 +225,14 @@ typedef struct {
 } CancelInfo;
 
 
-#define CANCEL_TIMES_BUFFER_SIZE 256
+#define CANCEL_TIMES_BUFFER_SIZE 128
+
+#pragma pack(push, 1)
 typedef struct {
 	uint64_t id;
 	uint64_t cancelledAtTicks;
 } CancelTimeEntry;
+#pragma pack(pop)
 
 typedef struct {
 	uint64_t currentId;

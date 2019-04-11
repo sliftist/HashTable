@@ -31,8 +31,8 @@ Timing_StartInner(&rootTimer, &TRACKER##name, #name); \
 code \
 Timing_End(&TRACKER##name);
 
-#undef TimeBlock
-#define TimeBlock(name, code) code
+//#undef TimeBlock
+//#define TimeBlock(name, code) code
 
 //#define FAST_UNSAFE_CHANGES 1
 

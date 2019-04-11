@@ -179,28 +179,34 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="AtomicHashTable.c" />
+    <ClCompile Include="AtomicHashTable3.c" />
     <ClCompile Include="AtomicHashTableDebug.cpp" />
     <ClCompile Include="AtomicHelpers.c" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="mersenne-twister.c" />
+    <ClCompile Include="RefCount.c" />
     <ClCompile Include="ReferenceCounter.c" />
     <ClCompile Include="simple_table.c" />
     <ClCompile Include="Timing.c" />
     <ClCompile Include="TimingDebug.cpp" />
     <ClCompile Include="TransactionQueue.c" />
     <ClCompile Include="TransactionQueueHelpers.c" />
+    <ClCompile Include="TransApply.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AtomicHashTable.h" />
+    <ClInclude Include="AtomicHashTable3.h" />
     <ClInclude Include="AtomicHashTableDebug.h" />
     <ClInclude Include="AtomicHelpers.h" />
     <ClInclude Include="mersenne-twister.h" />
+    <ClInclude Include="RefCount.h" />
     <ClInclude Include="ReferenceCounter.h" />
     <ClInclude Include="simple_table.h" />
     <ClInclude Include="environment.h" />
     <ClInclude Include="Timing.h" />
     <ClInclude Include="TransactionQueue.h" />
     <ClInclude Include="TransactionQueueHelpers.h" />
+    <ClInclude Include="TransApply.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

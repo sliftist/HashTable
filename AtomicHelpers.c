@@ -1,7 +1,6 @@
 #include "environment.h"
 
-bool InterlockedCompareExchangeStruct128
-(
+bool InterlockedCompareExchangeStruct128(
 	void* structAddress,
 	void* structOriginal,
 	void* structNew

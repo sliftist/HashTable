@@ -16,29 +16,36 @@ uint64_t log2(uint64_t v) {
 	unsigned r;
 	uint64_t t, tt, ttt;
 
-	if (ttt = v >> 32) {
-		if (tt = ttt >> 16) {
-			if (t = tt >> 8) {
+	ttt = v >> 32;
+	if (ttt) {
+		tt = ttt >> 16;
+		if (tt) {
+			t = tt >> 8;
+			if (t) {
 				r = 56 + LogTable256[t];
 			} else {
 				r = 48 + LogTable256[tt];
 			}
 		} else {
-			if (t = ttt >> 8) {
+			t = ttt >> 8;
+			if (t) {
 				r = 40 + LogTable256[t];
 			} else {
 				r = 32 + LogTable256[ttt];
 			}
 		}
 	} else {
-		if (tt = v >> 16) {
-			if (t = tt >> 8) {
+		tt = v >> 16;
+		if (tt) {
+			t = tt >> 8;
+			if (t) {
 				r = 24 + LogTable256[t];
 			} else {
 				r = 16 + LogTable256[tt];
 			}
 		} else {
-			if (t = v >> 8) {
+			t = v >> 8;
+			if (t) {
 				r = 8 + LogTable256[t];
 			} else {
 				r = LogTable256[v];
@@ -111,9 +118,9 @@ bool incrementFilledCount() {
 	}
 
 	while (true) {
-		uint64_t allocationsCreated = this.allocationsCreated;
+		allocationsCreated = this.allocationsCreated;
 		if (allocationsCreated >= requiredAllocations) return true;
-		if (InterlockedCompareExchange64(&this.allocationsCreated, requiredAllocations, allocationsCreated) == allocationsCreated) {
+		if ((uint64_t)InterlockedCompareExchange64(&this.allocationsCreated, requiredAllocations, allocationsCreated) == allocationsCreated) {
 			return true;
 		}
 	}
@@ -255,7 +262,6 @@ void* ReferenceSmallPointerInner(uint64_t smallPointer) {
 		if (!value.pointer) {
 			// Should be impossible, it means it has been freed. This is a bad case, as someone else could
 			//	have reused the entry before we got here, resulting in them referencing a random pointer...
-			OnError(3);
 			return nullptr;
 		}
 		SmallPointerEntry newValue = value;
@@ -346,9 +352,6 @@ void DereferenceSmallPointerInner(uint64_t smallPointer) {
 		)) {
 			// We WILL leak the pointer here, if our thread dies.
 			if (value.referenceCount == 1) {
-				if (smallPointer == 2003) {
-					int here = 0;
-				}
 				//printf("free %llu\n", smallPointer);
 				free(value.pointer);
 			}

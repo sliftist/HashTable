@@ -1,36 +1,68 @@
 #pragma once
 
-#include <Windows.h>
-#include <stdint.h>
+#ifdef KERNEL
 
-#define PAGE_SIZE 4096
+	#include <stdint.h>
 
-// malloc
-// free
-// nullptr
-// bool, true, false
+	#define CASSERT(predicate) typedef char C_STATIC_ASSERT_blah [2*!!(predicate)-1];
 
-#define bool int
-#define true 1
-#define false 0
+	#ifdef __cplusplus
+	extern "C" {
+	#endif
 
-#define nullptr 0
+		void OnErrorInner(int code, const char* name, unsigned long long line);
+	#define OnError(code) OnErrorInner(code, __FILE__, __LINE__)
 
-#define CASSERT(predicate) typedef char C_STATIC_ASSERT_blah [2*!!(predicate)-1];
+	#define ErrorTop(statement) { int errorTopResult = statement; if(errorTopResult != 0) OnError(errorTopResult); }
 
-// InterlockedCompareExchange
-// InterlockedCompareExchange16
-// InterlockedIncrement
+	#ifdef __cplusplus
+	}
+	#endif
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+	#undef InterlockedIncrement64
+	#define InterlockedIncrement64(x) _InterlockedIncrement64((LONG64*)x)
 
-void OnErrorInner(int code, const char* name, unsigned long long line);
-#define OnError(code) OnErrorInner(code, __FILE__, __LINE__)
+	#undef InterlockedCompareExchange64
+	#define InterlockedCompareExchange64(x, y, z) _InterlockedCompareExchange64((LONG64*)(x), y, z)
 
-#define ErrorTop(statement) { int errorTopResult = statement; if(errorTopResult != 0) OnError(errorTopResult); }
+	#undef nullptr
+	#define nullptr 0
 
-#ifdef __cplusplus
-}
+#else
+
+	#include <Windows.h>
+	#include <stdint.h>
+
+	#define PAGE_SIZE 4096
+
+	// malloc
+	// free
+	// nullptr
+	// bool, true, false
+
+	#define bool int
+	#define true 1
+	#define false 0
+
+	#define nullptr 0
+
+	#define CASSERT(predicate) typedef char C_STATIC_ASSERT_blah [2*!!(predicate)-1];
+
+	// InterlockedCompareExchange
+	// InterlockedCompareExchange16
+	// InterlockedIncrement
+
+	#ifdef __cplusplus
+	extern "C" {
+	#endif
+
+		void OnErrorInner(int code, const char* name, unsigned long long line);
+	#define OnError(code) OnErrorInner(code, __FILE__, __LINE__)
+
+	#define ErrorTop(statement) { int errorTopResult = statement; if(errorTopResult != 0) OnError(errorTopResult); }
+
+	#ifdef __cplusplus
+	}
+	#endif
+
 #endif

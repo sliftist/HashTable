@@ -241,7 +241,7 @@ typedef struct {
 
 	uint64_t ticksToWait;
 
-	uint64_t prevId;
+	volatile uint64_t prevId;
 
 	// If we use this up, we just wrap around.
 	CancelTimeEntry cancelEntries[CANCEL_TIMES_BUFFER_SIZE];

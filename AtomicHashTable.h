@@ -29,17 +29,18 @@ typedef __declspec(align(16)) struct {
 
 	// size of pointers is 1 << (log - 1), so 1 with log 1 (and hardcoded 0 with log 0),
 	//	where log 1 is at index 0.
+	// HashSlot*
 	uint32_t allocations[ALLOCATION_COUNT];
 
 } TransactionProperties;
 #pragma pack(pop)
 
-
 #pragma pack(push, 1)
 typedef struct {
 	uint64_t hash;
-	uint64_t value : BITS_IN_SMALL_POINTER;
-	uint64_t nextEntry : BITS_IN_SMALL_POINTER;
+	// Value must be a concrete value, for interlocked exchanges
+	uint32_t value;// : BITS_IN_SMALL_POINTER;
+	uint32_t nextEntry;// : BITS_IN_SMALL_POINTER;
 } HashEntry;
 #pragma pack(pop)
 
@@ -84,7 +85,12 @@ extern "C" {
 int AtomicHashTable_dtor(AtomicHashTable* self);
 
 // hash must have all bits filled, as we may use only the top bits, or only the low bits.
-int AtomicHashTable_insert(AtomicHashTable* self, uint64_t hash, uint64_t valueSmallPointer);
+// REMEMBER! A pointer may only be added once. We take ownership of a pointer when it is added,
+//	and free it upon removal of the value (this makes freeing pointers easier, as otherwise we would
+//	need to allocate some memory to let us atomically return removes values, like we do with find,
+//	which is slightly bad, as we should have to allocate more memory to free some memory).
+//	So if something is added multiple times, on removal, we WILL double free it.
+int AtomicHashTable_insert(AtomicHashTable* self, uint64_t hash, uint32_t valueSmallPointer);
 int AtomicHashTable_find(
 	AtomicHashTable* self,
 	uint64_t hash,

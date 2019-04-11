@@ -41,30 +41,30 @@ int Set_Bytes(
 	void* insertWriteContext,
 	int(*insertWrite)(void* context, TransactionChange change),
 	AtomicUnit* units,
-	void* offset,
+	void* pOffset,
 	unsigned char* values,
 	uint64_t valuesCount
 ) {
 	// We could change this to work with different amounts of bytes, but we would have to change it from uint32_t.
 	CASSERT(BYTES_PER_TRANSACTION == 4);
 
-	uint64_t bytesOffset = (uint64_t)offset - (uint64_t)units;
+	uint64_t bytesOffset = (uint64_t)pOffset - (uint64_t)units;
 
 	uint64_t alignedOffsetStart = bytesOffset / 4 * 4;
 	uint64_t alignedOffsetEnd = (bytesOffset + valuesCount + 3) / 4 * 4;
 
 	for (uint64_t pos = alignedOffsetStart; pos < alignedOffsetEnd; pos += 4) {
 
-		uint64_t valuesIndexStart = pos - bytesOffset;
+		int64_t valuesIndexStart = pos - bytesOffset;
 		
 		// TODO: For all but the last and first iteration this can be simplified to
 		//uint32_t value = *(uint32_t*)(values + valuesIndexStart);
 
 		uint32_t value = (uint32_t)units[pos / 4].value;
 		for (int offset = 0; offset < 4; offset++) {
-			uint64_t valuesIndex = valuesIndexStart + offset;
+			int64_t valuesIndex = valuesIndexStart + offset;
 			if (valuesIndex < 0) continue;
-			if (valuesIndex >= valuesCount) continue;
+			if (valuesIndex >= (int64_t)valuesCount) continue;
 			unsigned char byte = values[valuesIndex];
 
 			value = value & ~(0xFF << (offset * 8)) | (byte << (offset * 8));
@@ -74,9 +74,9 @@ int Set_Bytes(
 		TransactionChange_set_dataIndex(&change, pos / 4);
 		change.newValue = value;
 
-		int offset = insertWrite(insertWriteContext, change);
-		if (offset != 0) {
-			return offset;
+		int result = insertWrite(insertWriteContext, change);
+		if (result != 0) {
+			return result;
 		}
 	}
 	return 0;
@@ -84,7 +84,7 @@ int Set_Bytes(
 
 void Get_Bytes(
 	AtomicUnit* units,
-	void* offset,
+	void* pOffset,
 	unsigned char* values,
 	uint64_t valuesCount
 ) {
@@ -92,23 +92,23 @@ void Get_Bytes(
 	/* We could change this to work with different amounts of bytes, but we would have to change it from uint32_t. */
 	CASSERT(BYTES_PER_TRANSACTION == 4);
 
-	uint64_t bytesOffset = (uint64_t)offset - (uint64_t)units;
+	uint64_t bytesOffset = (uint64_t)pOffset - (uint64_t)units;
 
 	uint64_t alignedOffsetStart = bytesOffset / 4 * 4;
 	uint64_t alignedOffsetEnd = (bytesOffset + valuesCount + 3) / 4 * 4;
 
 	for (uint64_t pos = alignedOffsetStart; pos < alignedOffsetEnd; pos += 4) {
 
-		uint64_t valuesIndexStart = pos - bytesOffset;
+		int64_t valuesIndexStart = pos - bytesOffset;
 		uint32_t value = (uint32_t)units[pos / 4].value;
 
 		/*TODO: For all but the last and first iteration this can be simplified to
 		*(uint32_t*)(values + valuesIndexStart) = value;*/
 
 		for (int offset = 0; offset < 4; offset++) {
-			uint64_t valuesIndex = valuesIndexStart + offset;
+			int64_t valuesIndex = valuesIndexStart + offset;
 			if (valuesIndex < 0) continue;
-			if (valuesIndex >= valuesCount) continue;
+			if (valuesIndex >= (int64_t)valuesCount) continue;
 
 			unsigned char byte = (value >> (offset * 8)) & 0xFF;
 			values[valuesIndex] = byte;

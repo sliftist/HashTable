@@ -634,7 +634,7 @@ typedef struct {
 } Item;
 void testAdd(AtomicHashTable& table, uint64_t a, uint64_t b, uint64_t c) {
 	Item* item;
-	uint64_t itemSmallPointer = AllocateAsSmallPointer(sizeof(Item), (void**)&item);
+	uint32_t itemSmallPointer = (uint32_t)AllocateAsSmallPointer(sizeof(Item), (void**)&item);
 	item->a = a;
 	item->b = b;
 	item->c = c;
@@ -702,10 +702,15 @@ uint64_t testGetCount(AtomicHashTable& table, uint64_t a, uint64_t b) {
 	return context.count;
 }
 
-void AssertEqual(uint64_t correct, uint64_t test) {
+//#define AssertEqual(correct, test) AssertEqualInner(correct, test, __FILE__, __LINE__)
+#define AssertEqual(correct, test) !AssertEqualInner(correct, test, __FILE__, __LINE__) && !AssertEqualInner(correct, test, "repeat fail", __LINE__)
+
+bool AssertEqualInner(uint64_t test, uint64_t correct, const char* file, unsigned long long line) {
 	if(correct != test) {
-		printf("Error. Correct %llu was %llu\n", correct, test);
+		printf("Error. Was %llu correct is %llu at %s:%llu\n", test, correct, file, line);
+		return false;
 	}
+	return true;
 }
 
 void runAtomicHashTableTestInner(AtomicHashTable& table) {
@@ -810,7 +815,7 @@ void testHashChurnVar(int variation) {
 		
 		for (int j = 0; j < stride; j++) {
 			Item* item = &items[i + j];
-			//AssertEqual(testGetSome(table, item).c, item->c);
+			AssertEqual(testGetSome(table, item).c, item->c);
 		}
 		for (int j = 0; j < stride; j++) {
 			Item* item = &items[i + j];
@@ -830,6 +835,48 @@ void testHashChurn() {
 
 #include "Timing.h"
 #include "TimingDebug.h"
+
+
+typedef struct {
+	AtomicHashTable* table;
+	int variation;
+	int threadIndex;
+	HANDLE thread;
+} TableMultiThreadsContext;
+void testTableMultiThreads(
+	int count,
+	int variationStart,
+	int variationCount,
+	DWORD(*runThread)(TableMultiThreadsContext*)
+) {
+	for(int v = variationStart; v < variationStart + variationCount; v++) {
+		AtomicHashTable table = { 0 };
+
+		TableMultiThreadsContext* threads = new TableMultiThreadsContext[count];
+
+		printf("Starting %d threads\n", count);
+
+		memset(threads, 0, sizeof(HANDLE) * count);
+		for (int i = 0; i < count; i++) {
+			TableMultiThreadsContext* context = &threads[i];
+			context->table = &table;
+			context->variation = v;
+			context->threadIndex = i;
+			SpawnThread(
+				&context->thread,
+				context,
+				(DWORD(*)(void*))runThread
+			);
+		}
+
+		// WaitForMultipleObjects is garbage as it has a max of 64, so... don't use it.
+		for (int i = 0; i < count; i++) {
+			WaitForSingleObject(threads[i].thread, INFINITE);
+			printf("Finished thread %d\n", i);
+		}
+	}
+}
+
 
 void testSizingVar(int variation) {
 	uint64_t factor = 1;
@@ -905,7 +952,7 @@ void testSizingVar(int variation) {
 		}
 	}
 	else {
-		printf("no matches:\n");
+		printf("get no matches:\n");
 		Timing_StartRoot(&rootTimer);
 		for (uint64_t k = 0; k < factor; k++) {
 			for (uint64_t j = 0; j < itemCount; j++) {
@@ -917,7 +964,7 @@ void testSizingVar(int variation) {
 		}
 		Timing_EndRootPrint(&rootTimer, itemCount * factor);
 
-		printf("all matches:\n");
+		printf("get all matches:\n");
 		Timing_StartRoot(&rootTimer);
 		for (uint64_t k = 0; k < factor; k++) {
 			for (uint64_t j = 0; j < itemCount; j++) {
@@ -969,14 +1016,16 @@ void testSizingVar(int variation) {
 void testSizing() {
 	testSizingVar(0);
 	testSizingVar(1);
-	//testSizingVar(2);
 	testSizingVar(3);
+
+	// Tests to make sure we can scale large
+	//testSizingVar(2);
 }
 
 #include <vector>
-void testHashChurn2Var(int variation) {
+void testHashChurn2VarInner(AtomicHashTable& table, int variation) {
 
-	uint64_t itemCount = 1000;
+	uint64_t itemCount = 10;
 	uint64_t iterationCount = itemCount * 10;
 
 
@@ -1002,17 +1051,7 @@ void testHashChurn2Var(int variation) {
 	}
 
 
-	AtomicHashTable table = { 0 };
-
-	// Cause an allocation, to get the "empty, but has had data before" state (see the final zeroSnapshot check comment for why this matters)
-	testAdd(table, 1, 1, 1);
-	Item item = { 0 };
-	item.a = 1;
-	item.b = 1;
-	item.c = 1;
-	testRemove(table, &item);
-
-	auto zeroSnapshot = GetSnapshot(table);
+	
 
 
 	std::vector<Item> itemsNotAdded(items, items + itemCount);
@@ -1021,17 +1060,10 @@ void testHashChurn2Var(int variation) {
 	int16_t decision = 0;
 
 	for(uint64_t i = 0; i < iterationCount; i++) {
-		if (i == 5486) {
-			int here = 0;
-		}
-
 		int64_t index = randomIndexes[i];
 		if((decision >= 0 || itemsAdded.size() == 0) && itemsNotAdded.size() > 0) {
 			index = index % itemsNotAdded.size();
 			Item item = itemsNotAdded.at(index);
-			if (item.c == 981) {
-				int here = 0;
-			}
 			testAdd(table, item.a, item.b, item.c);
 			AssertEqual(testGetCount(table, item.a, item.b), 1);
 			AssertEqual(testGetSome(table, &item).c, item.c);
@@ -1040,9 +1072,6 @@ void testHashChurn2Var(int variation) {
 		} else {
 			index = index % itemsAdded.size();
 			Item item = itemsAdded.at(index);
-			if (item.c == 981) {
-				int here = 0;
-			}
 			uint64_t count = testRemove(table, &item);
 
 			AssertEqual(count, 1);
@@ -1052,13 +1081,9 @@ void testHashChurn2Var(int variation) {
 		}
 		decision += randomChoices[i] / 256;
 
-		//if (i == 5486)
 		{
 			for (uint64_t j = 0; j < itemsAdded.size(); j++) {
 				Item item = itemsAdded.at(j);
-				if (j == 174) {
-					int here = 0;
-				}
 				AssertEqual(testGetCount(table, item.a, item.b), 1);
 			}
 			for (uint64_t j = 0; j < itemsNotAdded.size(); j++) {
@@ -1074,17 +1099,41 @@ void testHashChurn2Var(int variation) {
 	}
 
 	for(uint64_t i = 0; i < itemsAdded.size(); i++) {
-		if (i + 1 == itemsAdded.size()) {
-			int here = 0;
-		}
 		Item item = itemsAdded.at(i);
 		uint64_t count = testRemove(table, &item);
 		AssertEqual(count, 1);
 	}
 
+	
+}
+
+void testHashChurn2Var(int variation) {
+	AtomicHashTable table = { 0 };
+
+	// Cause an allocation, to get the "empty, but has had data before" state (see the final zeroSnapshot check comment for why this matters)
+	testAdd(table, 1, 1, 1);
+	Item item = { 0 };
+	item.a = 1;
+	item.b = 1;
+	item.c = 1;
+	testRemove(table, &item);
+
+	auto zeroSnapshot = GetSnapshot(table);
+
+	testHashChurn2VarInner(table, variation);
+
 	// So, the snapshot should be equal, with the only allocation the initial minimal allocation (this verifies that we deallocate down to
 	//	the minimum allocation... which may not be what we want, so if this starts failing... maybe just change this test...)
 	CompareSnapshot(zeroSnapshot);
+}
+
+DWORD threadedChurn(TableMultiThreadsContext* context) {
+	auto table = context->table;
+	auto variation = context->variation;
+
+	testHashChurn2VarInner(*table, variation);
+
+	return 0;
 }
 
 void testHashChurn2() {
@@ -1095,21 +1144,332 @@ void testHashChurn2() {
 
 
 
-void runAtomicHashTableTest() {
-	testHashLeaksRefs();
 
+
+
+void runAtomicHashTableTest() {
+	/*
+	testHashLeaksRefs();
 	testHashChurn();
 	testSizing();
 	testHashChurn2();
+	*/
 
-	todonext
-	// I think this works... Now... get it building in the kernel, then running for a toy example in the kernel, and then...
-	//	start using it to dynamically measure network traffic, and then dynamically filter/control network traffic.
+	testTableMultiThreads(4, 1, 1, threadedChurn);
+
+	//todonext
+	// Oh, test with multiple threads... obviously...
+}
+
+
+void benchmarkCompareExchanges() {
+	uint64_t count = 1000 * 1000 * 10;
+
+	// TimeBlock(gets, uint64_t count = testGetCount(table, j + itemCount, j + itemCount);
+
+
+	printf("64 bit:\n");
+	{
+		Timing_StartRoot(&rootTimer);
+		volatile int64_t value = 0;
+		for (uint64_t i = 0; i < count; i++) {
+			InterlockedCompareExchange64(&value, value + 1, value);
+		}
+		Timing_EndRootPrint(&rootTimer, count);
+	}
+
+	printf("128 bit:\n");
+	{
+		Timing_StartRoot(&rootTimer);
+		volatile __declspec(align(16)) LONG64 value[2] = { 0 };
+		for (uint64_t i = 0; i < count; i++) {
+			volatile __declspec(align(16)) LONG64 prevValue[2] = { value[0], value[1] };
+			InterlockedCompareExchange128(value, value[1], value[0] + 1, (LONG64*)prevValue);
+		}
+		Timing_EndRootPrint(&rootTimer, count);
+	}
+}
+
+/*
+struct LinkedList {
+	LinkedList* next;
+};
+
+
+#define BITS_IN_ADDRESS_SPACE 48
+
+#pragma pack(push, 1)
+struct PackedPointer {
+	uint64_t pointerClipped: BITS_IN_ADDRESS_SPACE;
+	uint64_t value : 64 - BITS_IN_ADDRESS_SPACE;
+};
+#pragma pack(pop)
+
+#define RECOVER_POINTER(p) (((p) & (1ull << 47)) ? ((p) | 0xFFFF000000000000ull) : ((p) & 0x0000FFFFFFFFFFFFull))
+
+struct LinkedList2 {
+	PackedPointer next;
+};
+
+void benchmarkObfuscatedPointers() {
+	uint64_t listSize = 1000;
+	uint64_t iterationCount = 100000000ull / listSize;
+
+	{
+		LinkedList head = { 0 };
+		{
+			LinkedList* cur = &head;
+			for (int i = 0; i < listSize - 1; i++) {
+				auto p = new LinkedList();
+				p->next = nullptr;
+				cur->next = p;
+				cur = p;
+			}
+		}
+
+		printf("normal:\n");
+		Timing_StartRoot(&rootTimer);
+		for (int i = 0; i < iterationCount; i++) {
+			LinkedList* cur = &head;
+			int count = 0;
+			while (cur) {
+				count++;
+				cur = cur->next;
+			}
+			if (count != listSize) {
+				throw "wrong";
+			}
+		}
+		Timing_EndRootPrint(&rootTimer, iterationCount * listSize);
+	}
+
+
+	{
+		LinkedList head = { 0 };
+		{
+			LinkedList* cur = &head;
+			for (int i = 0; i < listSize - 1; i++) {
+				auto p = new LinkedList();
+				p->next = nullptr;
+				cur->next = (LinkedList*)((uint64_t)p & 0xFFFFFFFFFFFFull | (uint64_t)i << 48);
+				cur = p;
+			}
+		}
+
+		printf("funny pointers:\n");
+		Timing_StartRoot(&rootTimer);
+		for (int i = 0; i < iterationCount; i++) {
+			LinkedList* cur = &head;
+			int count = 0;
+			while (cur) {
+				count++;
+				uint64_t p = (uint64_t)cur->next;
+				LinkedList* next = (LinkedList*)((p & (1ull << 47)) ? (p | 0xFFFF000000000000ull) : (p & 0x0000FFFFFFFFFFFFull));
+				cur = next;
+			}
+			if (count != listSize) {
+				throw "wrong";
+			}
+		}
+		Timing_EndRootPrint(&rootTimer, iterationCount * listSize);
+	}
+
+	{
+		LinkedList2 head = { 0 };
+		{
+			LinkedList2* cur = &head;
+			for (int i = 0; i < listSize - 1; i++) {
+				auto p = new LinkedList2();
+				p->next.pointerClipped = 0;
+				cur->next.pointerClipped = (uint64_t)p;
+				cur = p;
+			}
+		}
+
+		printf("funny pointers 2:\n");
+		Timing_StartRoot(&rootTimer);
+		for (int i = 0; i < iterationCount; i++) {
+			LinkedList2* cur = &head;
+			int count = 0;
+			while (cur) {
+				count++;
+				uint64_t p = cur->next.pointerClipped;
+				LinkedList2* next = (LinkedList2*)RECOVER_POINTER(p);
+				cur = next;
+			}
+			if (count != listSize) {
+				throw "wrong";
+			}
+		}
+		Timing_EndRootPrint(&rootTimer, iterationCount * listSize);
+	}
+}
+*/
+
+#include "RefCount.h"
+
+// void Reference_Allocate(uint64_t size, OutsideReference* outRef, void** outPointer)
+
+/*
+void testTableMultiThreads(
+	int count,
+	int variationStart,
+	int variationCount,
+	DWORD(*runThread)(TableMultiThreadsContext*)
+) {
+*/
+
+#include <functional>
+
+// 800kb... but it's just static memory, so that's nothing...
+HANDLE threads[1000 * 100] = { 0 };
+volatile LONG64 curThreadIndex = -1;
+
+void SpawnThread(
+	std::function<void()>* fnc
+) {
+	threads[InterlockedIncrement64(&curThreadIndex)] = CreateThread(
+		0,
+		0,
+		// DWORD(*main)(void*)
+		[](void* param) -> DWORD {
+			auto fnc = (std::function<void()>*)param;
+			(*fnc)();
+			return 0;
+		},
+		fnc,
+		0,
+		0
+	);
+}
+void WaitForAllThreads() {
+	LONG64 threadIndex = 0;
+	while (threadIndex <= curThreadIndex) {
+		//printf("Waiting for thread %lld\n", threadIndex);
+		DWORD error = WaitForSingleObject(threads[threadIndex], INFINITE);
+		if (error) {
+			printf("Wait error %d\n", GetLastError());
+		}
+		//printf("Finished thread %lld\n", threadIndex);
+		threadIndex++;
+	}
+}
+
+
+#pragma pack(push, 1)
+typedef struct {
+	union {
+		uint64_t test;
+		struct {
+			int x;
+			int y;
+		};
+	};
+} Test;
+#pragma pack(pop)
+
+
+void runRefCountTests() {	
+	Test test = { 0 };
+
+
+
+	uint64_t totalCount = 10000;
+	uint64_t itemCount = 1;
+	uint64_t iterationCount = totalCount / itemCount;
+	uint64_t threadCount = 10;
+
+	//todonext
+	// Eh... I don't know. Something with iteration and lots of allocations, and removes values from slots.
+
+	typedef struct {
+		uint64_t value;
+		int64_t thread;
+	} Value;
+
+	Timing_StartRoot(&rootTimer);
+
+	OutsideReference* sharedValues = new OutsideReference[itemCount];
+	memset(sharedValues, 0, itemCount * sizeof(OutsideReference));
+	for (int t = 0; t < threadCount; t++) {
+		SpawnThread(new std::function<void()>([=]() {
+			OutsideReference* values = new OutsideReference[itemCount];
+			memset(values, 0, itemCount * sizeof(OutsideReference));
+			for (int i = 0; i < itemCount; i++) {
+				Value* value;
+				Reference_Allocate(sizeof(Value), &values[i], (void**)&value);
+				value->value = 0;
+				value->thread = t;
+			}
+
+			for (int k = 0; k < iterationCount; k++) {
+				// Set all sharedvalues to our values
+				for (int i = 0; i < itemCount; i++) {
+					InsideReference* ourValue = Reference_Acquire(&values[i]);
+					// ourValue has to exist, as nothing frees from the values array but us...
+
+					InsideReference* value = Reference_Acquire(&sharedValues[i]);
+					if (value) {
+						Reference_DestroyOutside(&sharedValues[i], value, nullptr);
+						Reference_Release(&sharedValues[i], value, nullptr);
+					}
+					
+					Reference_SetOutside(&sharedValues[i], ourValue, nullptr);
+					Reference_Release(&values[i], ourValue, nullptr);
+				}
+
+				// For all of our values which are still in the shared values, increment their value
+				for (int i = 0; i < itemCount; i++) {
+					InsideReference* value = Reference_Acquire(&sharedValues[i]);
+					if (value) {
+						Value* v = (Value*)PACKED_POINTER_GET_POINTER(*value);
+						if (v->thread == t) {
+							v->value++;
+						}
+						Reference_Release(&sharedValues[i], value, nullptr);
+					}
+				}
+
+				// Remove all of our values from the shared values
+				for (int i = 0; i < itemCount; i++) {
+					InsideReference* value = Reference_Acquire(&sharedValues[i]);
+					if (value) {
+						Value* v = (Value*)PACKED_POINTER_GET_POINTER(*value);
+						if (v->thread == t) {
+							Reference_DestroyOutside(&sharedValues[i], value, nullptr);
+						}
+						Reference_Release(&sharedValues[i], value, nullptr);
+					}
+				}
+			}
+
+			uint64_t totalCount = 0;
+			for (int i = 0; i < itemCount; i++) {
+				InsideReference* value = Reference_Acquire(&values[i]);
+				Value* v = (Value*)PACKED_POINTER_GET_POINTER(*value);
+				
+				totalCount += v->value;
+
+				Reference_DestroyOutside(&values[i], value, nullptr);
+				Reference_Release(&values[i], value, nullptr);
+			}
+
+			printf("sum(value[%d])=%lld\n", t, totalCount);
+		}));
+	}
+
+
+	WaitForAllThreads();
+
+	Timing_EndRootPrint(&rootTimer, totalCount * threadCount);
 }
 
 int main() {
 	try {
-		runAtomicHashTableTest();
+		//runAtomicHashTableTest();
+		//benchmarkCompareExchanges();
+		//benchmarkObfuscatedPointers();
+		runRefCountTests();
 	}
 	catch (...) {
 		printf("error main\n");

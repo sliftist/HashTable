@@ -1,7 +1,8 @@
+//#include <intrin.h>
+
 
 #include "TransactionQueue.h"
 #include "AtomicHelpers.h"
-#include <intrin.h>
 
 #include "Timing.h"
 
@@ -30,7 +31,7 @@ bool MutateChangeState(
 	);
 }
 
-uint64_t time() {
+uint64_t getTime() {
 	unsigned int cpuid;
 	return __rdtscp(&cpuid);
 }
@@ -131,7 +132,7 @@ void OnFinish(
 	CancellableLock* lock,
 	CancelInfo* info
 ) {
-	uint64_t finishTime = time();
+	uint64_t finishTime = getTime();
 
 	uint64_t workTime = finishTime - info->startTicks;
 	uint64_t blockedTime = info->startTicks - info->firstWaitTicks;
@@ -147,11 +148,11 @@ void OnFinish(
 }
 
 
-void ClaimLockx(CancellableLock* lock, CancelInfo* claimer) { }
+//void ClaimLockx(CancellableLock* lock, CancelInfo* claimer) { }
 void ClaimLock(CancellableLock* lock, CancelInfo* claimer) {
 	if (!claimer->id) {
 		claimer->id = InterlockedIncrement64(&lock->prevId);
-		claimer->firstWaitTicks = time();
+		claimer->firstWaitTicks = getTime();
 	}
 
 	if (lock->currentId == claimer->id) {
@@ -162,7 +163,7 @@ void ClaimLock(CancellableLock* lock, CancelInfo* claimer) {
 	}
 
 	if (claimer->startTicks) {
-		uint64_t currentTicks = time();
+		uint64_t currentTicks = getTime();
 
 		// If we have previous started, and are back, that means we must have been cancelled.
 		claimer->cancelCount++;
@@ -201,7 +202,7 @@ void ClaimLock(CancellableLock* lock, CancelInfo* claimer) {
 		if (InterlockedCompareExchange64(&lock->currentId, claimer->id, 0) == 0) {
 			// Got the lock safely
 			lock->currentCancelCount = claimer->cancelCount;
-			lock->currentStartTime = claimer->startTicks = time();
+			lock->currentStartTime = claimer->startTicks = getTime();
 			break;
 		}
 
@@ -213,19 +214,19 @@ void ClaimLock(CancellableLock* lock, CancelInfo* claimer) {
 			currentId = lock->currentId;
 			currentCancelCount = lock->currentCancelCount;
 			currentStartTime = lock->currentStartTime;
-			startWaitTicks = time();
+			startWaitTicks = getTime();
 		}
 
 		// It was just freed, so try to get it again
 		if (!currentId) continue;
 
-		uint64_t currentWaitTicks = time();
+		uint64_t currentWaitTicks = getTime();
 
 		uint64_t waitingTime = currentWaitTicks - startWaitTicks;
 		if (waitingTime > lock->ticksToWait) {
 			// We have waited long enough, now we want to hold the lock
 
-			if (InterlockedCompareExchange64(&lock->currentId, claimer->id, currentId) == currentId) {
+			if ((uint64_t)InterlockedCompareExchange64(&lock->currentId, claimer->id, currentId) == currentId) {
 				// We stole the lock.
 				lock->currentCancelCount = claimer->cancelCount;
 				lock->currentStartTime = claimer->startTicks = currentWaitTicks;
@@ -251,7 +252,7 @@ void ClaimLock(CancellableLock* lock, CancelInfo* claimer) {
 }
 
 void ReleaseLock(CancellableLock* lock, CancelInfo* claimer) {
-	if (InterlockedCompareExchange64(&lock->currentId, nullptr, claimer->id) != claimer->id) {
+	if ((uint64_t)InterlockedCompareExchange64(&lock->currentId, nullptr, claimer->id) != claimer->id) {
 		// There was probably an attempt to cancel us, but we actually finished. This can happen if we win the contention race, or
 		//	are already so close to finishing when they cancel us.
 		InterlockedIncrement64(&lock->unneededCancels);
@@ -273,7 +274,6 @@ void finishTime(CallTimes* times, unsigned int* pcpuid, uint64_t* pticks) {
 	uint64_t ticks = *pticks;
 
 	if (!ticks) {
-		int zero = 0;
 		// finishTime called multiple times
 		OnError(3);
 	}
@@ -440,6 +440,7 @@ int transactionQueue_startRetryLoop(
 	void* applyContext,
 	int(*applyChange)(void* applyContext, TransactionChange change)
 ) {
+	int retryCount = 0;
 	// We claim the lock in the outer loop, even though this makes the time we lock variable, which could hurt performance during contention.
 	//	However, this improves performance when we don't have contention... which is really more important.
 	CancelInfo info = { 0 };
@@ -490,7 +491,16 @@ int TransactionQueue_RunGetterInner(
 	uint64_t ticks;
 	startTime(&cpuid, &ticks);
 
+	int retryCount = 0;
+
 	do {
+		retryCount++;
+		if (retryCount > 1000 * 100) {
+			// Avoid infinite retries
+			OnError(9);
+			return 9;
+		}
+
 		TransactionQueueState state;
 		int result = transactionQueue_startRetryLoop(this, &state, applyContext, applyChange);
 

@@ -16,7 +16,6 @@ extern "C" {
 //  from it's original storage location we move its references to the inside reference.
 
 
-// TODO: Maybe use packing to get 64 bit underlying values?
 // We use the fact that 64 processors only use some bits in the 64 bits to store the reference counts
 //  in the extra data. This allows us to do 64 bit compare and swaps, which eliminates all need for
 //  128 bit (16 byte) alignment, and should be a lot faster, as on my machine
@@ -27,6 +26,21 @@ extern "C" {
 //      least one operation more).
 //      (My benchmarks showed 7ns for a 64 bit CAS, and 10ns for a 128 bit CAS, while messing with the pointer
 //          took a dereference from 0.9ns to 1.8ns.)
+
+
+// TODO: Change the InsideReference to not be packed, and not use compare exchange (it still needs an interlocked instruction
+//  though).
+//  - Then we can change the OuterReference to move its references to the InsideReference inside of rolling over.
+//  - And then, we can also change the OuterReference to use the bottom bits (and enforce pointers being 8 byte aligned),
+//      which reduces the bits we have to 3, BUT, it also works regardless of the processor, AND it removes the conditional
+//      in getting the pointer address from the packed address.
+//      (And if we added a 4 byte alignment option this would even make it work for 32 bit processors)
+//      (AND as we allocate the InsideReference, we could even do some craziness to overallocate it, and then use
+//          a pointer for it which is always allocated align to 8 bytes, and then have more data to say the original
+//          address allocated, allowing us to free the memory too).
+//      - ALTHOUGH! Trying to move the bottom bits from the outside reference to the inside reference is actually quite dangerous.
+//          While we are doing it we don't have any references to the inside reference, but we have to go into its memory to
+//          increment inside references, and during this time, we could be freed, and then crash... So... maybe don't use the bottom bits...
 
 
 #define BITS_IN_ADDRESS_SPACE 48
@@ -81,6 +95,9 @@ CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
 // (May set outPointer to nullptr if the allocation fails)
 void Reference_Allocate(uint64_t size, OutsideReference* outRef, void** outPointer);
 
+// The emptyAllocation must be size + sizeof(InsideReference)
+void Reference_RecycleAllocate(void* emptyAllocation, uint64_t size, OutsideReference* outRef, void** outPointer);
+
 
 // pointer should be directly used inside of InsideReference. The only reason a raw pointer isn't returned is
 //  to ensure that random pointers aren't passed back.
@@ -92,7 +109,10 @@ InsideReference* Reference_Acquire(OutsideReference* ref);
 
 // Outside reference may be knowingly wiped out, we will just ignore it and then
 //  release the inside reference.
-void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef, InsideReference** pointerToFree);
+// If dontFree, and this is the last reference, then we don't free it.
+// Returns true if this was the last reference (so if dontFree is passed, it is up to the caller
+//  to call free on insideRef).
+bool Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef, bool dontFree);
 
 
 
@@ -100,12 +120,17 @@ void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef,
 //  in the inside ref being freed).
 // Must have an inside reference to be called, but does not free inside reference
 //  returns true on success
-bool Reference_DestroyOutside(OutsideReference* outsideRef, InsideReference* insideRef, InsideReference** pointerToFree);
+bool Reference_DestroyOutside(OutsideReference* outsideRef, InsideReference* insideRef);
+
+//  prevRef is optional, if passed outsideRef may be still in existence (and will be compared against prevRef) to verify
+//      we are replacing the correct reference.
+//  insideRef is optional, if not passed we just call Reference_DestroyOutside
+bool Reference_ReplaceOutside(OutsideReference* outsideRef, InsideReference* prevRef, InsideReference* insideRef);
 
 // dest must be zeroed out, OR previously an outside ref destroyed by DestroyReference
 // Must have an inside reference to be called, and does not free inside reference
 //  returns true on success
-bool Reference_SetOutside(OutsideReference* outsideRef, InsideReference* insideRef, InsideReference** pointerToFree);
+bool Reference_SetOutside(OutsideReference* outsideRef, InsideReference* insideRef);
 
 
 #ifdef __cplusplus

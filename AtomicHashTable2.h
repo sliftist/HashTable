@@ -1,68 +1,107 @@
-//todonext
-// Alright, 3rd try. So... allocate for transactions, swap them to a global "currentTransaction" (which can be 64 bit if we never
-//  free transactions, and just reuse them).
-
-// So... even with this, we still need to increment reference counts... Crap... Maybe...
-//  Eh... maybe densely populate it, then we only need to ref count the big allocations?
-
-// So... densely populated
-
-// When removing something, swap a value down.
-//  Take the farthest away value that can be swapped without putting it past its start.
-//      (If there is no value that can do this, it means we are done, and the hole is fine)
-//      - We could iterate from both far and close at the same time... but... whatever, we should just make
-//          sure the table doesn't get very dense, and it will be fine...
-//  Then, after we move this value, do the same thing to the new hole we created
-// All of these changes get put in the transaction, and so it might be as big as the entire array...
-
-
-// So... reference counts with the allocation tables, fairly vanilla reference counting... and if something leaks we just reuse that
-//  allocation when we encounter it in the future... (and we start references at 1, and deallocate by freeing that first reference)
-
-// Transactions should have a reference count beside the global one, and an internal one. They should get the global reference first,
-//  and then the internal one, and when the global transaction is removed that thread should decrement that value from
-//  the internal reference count...
-
-// Wait... doesn't this recover our linked list concept? Which we could use with our hash table, to make hash table inserts
-//  no longer require arbitrary length transactions, and probably make transactions faster...
-
-// So... we need both the concept of external/internal reference counting AND write transaction queues
-
-// Also... let's just go back to linked lists? Because... we are going to need to get a reference (CAS) to the memory allocation
-//  regardless of how we implement it... and so if the first entry of the linked list is inline... then single entry
-//  linked lists will be just as fast as without linked lists, and more entries will just multiple the number of
-//  compare and swaps, which isn't that bad...
-
-// So... if values are tied with an enty (or even allocated just with that entry), and never moved between
-//  entries (even though entries can be moved around), then:
-//  A -> B -> C
-//  If we have a reference to all entries, and then try to swap A.next from B to C, this is safe. Because...
-//  B won't/can't be reused (as we have a reference to it, it's value has been removed, and we never change
-//  entry values), so either the change hasn't happened, or it has, and then A.next will never be B again.
-
-// So... transactions... will have to have references to values, AND anything trying to fulfill the transaction
-//  has to add references to the outer reference in the transaction, as well as an outer reference to the transaction
-//  itself.
-
 #include "TransApply.h"
 #include "RefCount.h"
+#include "MemoryPool.h"
+
+
+// Values rounded up to 64 bit increments, as we can't really store less
+#define AtomicHashTableSlotSize(VALUE_SIZE) (sizeof(AtomicSlot) - sizeof(AtomicUnit2) + ((VALUE_SIZE) + sizeof(uint64_t) - 1) / sizeof(uint64_t) * sizeof(uint64_t) * 2)
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
+    // (our move code has hardcoded assumptions that this only contains AtomicUnits, so... keep it that way, or change the move code)
+    //  (also, it depends on ref being first, and valueUniqueId being second)
+    OutsideReferenceAtomic ref;
+
+    // This is a unique number created on insert of the value. This allows us to store duplicate values and then
+    //  dedupe them before we return them, which allows inserts to be broken up into many transactions,
+    //  which then lets each transactions have a fixed number of writes, which... makes memory reuse much easier.
+    // 0 means there is no value
+    // 1 means this should be skipped when searching (but searching shouldn't stop), and skipped when moving (don't move this).
+    //  - If set to 1, ref should be destroyed.
+    //  - We set this to 1 when we swap a value down during a deletion. We will keep swapping down
+    //      to eventually actually delete a block (and so set this to 0), but to make sure each transaction
+    //      has a constant amount of writes, we can't do the swaps in one transaction, so we need to
+    //      just set the slot to a temporary "non use and non empty" state.
+
+    // TODO: Oh, my idea about making this a unique number... I don't think it works. A value could be swapped, and then replaced,
+    //  or a hole could appear below it. Either way, we need to retry on version changes, so... what is the point of this?
+    //  So... move its two flags to hash, and reserve those hash values, increasing them to the next number.
+    AtomicUnit2 valueUniqueId;
+
+    AtomicUnit2 hash;
+
+    // The values are variable size, depending on AtomicHashTableSlotSize/AtomicHashTable2.VALUE_SIZE
+    AtomicUnit2 valueUnits;
+} AtomicSlot;
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+typedef __declspec(align(16)) struct {
+    // slotsCount is immutable (obviously)
+    uint64_t slotsCount;
+    // Because slots must be 16 byte aligned, and at the end
+    uint64_t padding;
+
+    // The class is allocated larger than AtomicHashTableBase, so &slots can be used as an array of slots, slotsCount in length.
+    byte* slots;
+} AtomicHashTableBase;
+#pragma pack(pop)
+
+
+// TODO: Make reference counting optional, as sometimes we won't even need it
+
+
+// Should be initialized as:
+//  AtomicHashTable2 table = AtomicHashTableDefault(VALUE_SIZE, void (*deleteValue)(void* value));
+
+#define AtomicHashTableDefault(VALUE_SIZE, deleteValue) { VALUE_SIZE, deleteValue, TransApplyDefault(), { AtomicHashTableSlotSize(VALUE_SIZE) + sizeof(InsideReference) }, { VALUE_SIZE } }
+
+
+#pragma pack(push, 1)
+typedef __declspec(align(16)) struct {
+    // (in bytes)
+    uint64_t VALUE_SIZE;
+
+    void (*deleteValue)(void* value);
+
     TransApply transaction;
 
-    union {
-        OutsideReference transactionToApply;
-        AtomicUnit2 transactionToApplyUnit;
-    };
+    MemoryPool valueInsertPool;
+    MemoryPool valueFindPool;
+
+
+    // Gain references to these and use Reference_ReplaceOutside when dealing with them
+    OutsideReferenceAtomic currentAllocation;
+    OutsideReferenceAtomic newAllocation;
+
+    // index of the next slot in currentAllocation to move to newAllocation (if newAllocation has a value)
+    AtomicUnit2 nextMoveSlot;
+
+    uint64_t slotsReserved;
+    // next unique value is this, +2
+    uint64_t nextValueUniqueIdMinus2;
+
 } AtomicHashTable2;
 #pragma pack(pop)
+
+
+
+
+
 
 // We take ownership of value on insertion, and free it on removing it from the hashtable. So...
 //  if it is added twice, or used after removal, there will be a problem. You can try to remove
 //  it multiple times though, we will reference count it internally.
 // Returns 0 on success, and > 0 on failure
 int AtomicHashTable2_insert(AtomicHashTable2* self, uint64_t hash, void* value);
+
+int AtomicHashTable_remove(
+	AtomicHashTable2* self,
+	uint64_t hash,
+	void* callbackContext,
+	// On true, removes the value from the table
+	bool(*callback)(void* callbackContext, void* value)
+);
 
 int AtomicHashTable2_find(
     AtomicHashTable2* self,
@@ -73,12 +112,4 @@ int AtomicHashTable2_find(
 	// (and obviously, may call this callback multiple times for one call, but not more than one time per call
     //  for the same value, assuming no value is added to the table more than once).
     void(*callback)(void* callbackContext, void* value)
-);
-
-int AtomicHashTable_remove(
-	AtomicHashTable2* self,
-	uint64_t hash,
-	void* callbackContext,
-	// On true, removes the value from the table
-	bool(*callback)(void* callbackContext, void* value)
 );

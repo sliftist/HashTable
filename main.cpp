@@ -1410,11 +1410,11 @@ void runRefCountTests() {
 
 					InsideReference* value = Reference_Acquire(&sharedValues[i]);
 					if (value) {
-						Reference_DestroyOutside(&sharedValues[i], value, nullptr);
+						Reference_DestroyOutside(&sharedValues[i], value);
 						Reference_Release(&sharedValues[i], value, nullptr);
 					}
 					
-					Reference_SetOutside(&sharedValues[i], ourValue, nullptr);
+					Reference_SetOutside(&sharedValues[i], ourValue);
 					Reference_Release(&values[i], ourValue, nullptr);
 				}
 
@@ -1436,7 +1436,7 @@ void runRefCountTests() {
 					if (value) {
 						Value* v = (Value*)PACKED_POINTER_GET_POINTER(*value);
 						if (v->thread == t) {
-							Reference_DestroyOutside(&sharedValues[i], value, nullptr);
+							Reference_DestroyOutside(&sharedValues[i], value);
 						}
 						Reference_Release(&sharedValues[i], value, nullptr);
 					}
@@ -1450,7 +1450,7 @@ void runRefCountTests() {
 				
 				totalCount += v->value;
 
-				Reference_DestroyOutside(&values[i], value, nullptr);
+				Reference_DestroyOutside(&values[i], value);
 				Reference_Release(&values[i], value, nullptr);
 			}
 

@@ -1,23 +1,10 @@
 #pragma once
 
+#define CASSERT(predicate) typedef char C_STATIC_ASSERT_blah [2*!!(predicate)-1];
+
 #ifdef KERNEL
 
 	#include <stdint.h>
-
-	#define CASSERT(predicate) typedef char C_STATIC_ASSERT_blah [2*!!(predicate)-1];
-
-	#ifdef __cplusplus
-	extern "C" {
-	#endif
-
-		void OnErrorInner(int code, const char* name, unsigned long long line);
-	#define OnError(code) OnErrorInner(code, __FILE__, __LINE__)
-
-	#define ErrorTop(statement) { int errorTopResult = statement; if(errorTopResult != 0) OnError(errorTopResult); }
-
-	#ifdef __cplusplus
-	}
-	#endif
 
 	#undef InterlockedIncrement64
 	#define InterlockedIncrement64(x) _InterlockedIncrement64((LONG64*)x)
@@ -46,23 +33,24 @@
 
 	#define nullptr 0
 
-	#define CASSERT(predicate) typedef char C_STATIC_ASSERT_blah [2*!!(predicate)-1];
-
 	// InterlockedCompareExchange
 	// InterlockedCompareExchange16
 	// InterlockedIncrement
 
-	#ifdef __cplusplus
-	extern "C" {
-	#endif
+#endif
 
-		void OnErrorInner(int code, const char* name, unsigned long long line);
-	#define OnError(code) OnErrorInner(code, __FILE__, __LINE__)
 
-	#define ErrorTop(statement) { int errorTopResult = statement; if(errorTopResult != 0) OnError(errorTopResult); }
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-	#ifdef __cplusplus
-	}
-	#endif
 
+void OnErrorInner(int code, const char* name, unsigned long long line);
+#define OnError(code) OnErrorInner(code, __FILE__, __LINE__)
+
+#define ErrorTop(statement) { int errorTopResult = statement; if(errorTopResult != 0) OnError(errorTopResult); }
+
+
+#ifdef __cplusplus
+}
 #endif

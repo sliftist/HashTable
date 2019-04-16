@@ -56,6 +56,13 @@ void Reference_Allocate(uint64_t size, OutsideReference* outRef, void** outPoint
         *outPointer = nullptr;
         return;
     }
+    
+    Reference_RecycleAllocate(insideRef, size, outRef, outPointer);
+}
+
+void Reference_RecycleAllocate(void* emptyAllocation, uint64_t size, OutsideReference* outRef, void** outPointer) {
+    InsideReference* insideRef = emptyAllocation;
+
     memset(insideRef, 0, size + sizeof(InsideReference));
     insideRef->pointerClipped = (uint64_t)((byte*)insideRef + sizeof(InsideReference));
 
@@ -76,6 +83,10 @@ InsideReference* Reference_Acquire(OutsideReference* pRef) {
         OutsideReference ref = *pRef;
         OutsideReference refOriginal = ref;
 
+        // This would need a memory fence if the caller had associated memory to indicate there was a reference
+        //  available, and had this memory exist on a per thread basis. But then... why are they even using
+        //  references? But more importantly... if they have memory on a per thread basis, they should know
+        //  to use memory fences themselves!
         if(!ref.pointerClipped) {
             return nullptr;
         }
@@ -102,12 +113,12 @@ InsideReference* Reference_Acquire(OutsideReference* pRef) {
     }
 }
 
-void releaseInsideReference(InsideReference* insideRef, InsideReference** pointerToFree) {
+bool releaseInsideReference(InsideReference* insideRef, bool dontFree) {
     while(true) {
         InsideReference ref = *insideRef;
         InsideReference refOriginal = ref;
 
-        if(IsInsideRefCorrupt(ref, insideRef)) return;
+        if(IsInsideRefCorrupt(ref, insideRef)) return false;
 
         ref.count--;
 
@@ -118,44 +129,50 @@ void releaseInsideReference(InsideReference* insideRef, InsideReference** pointe
             //  we were the last reference, so... free it.
             // (oh, and this is fine, we aren't going inside insideRef, we are using the actual pointer, where
             //  is an argument, so it is thread safe, and the actual pointer we want to free)
-            if(pointerToFree) {
-                *pointerToFree = insideRef;
-            } else {
+            if(!dontFree) {
                 free(insideRef);
             }
+            return true;
         }
-        return;
+        return false;
     }
 }
 
-void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef, InsideReference** pointerToFree) {
+bool Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef, bool dontFree) {
+    if(!insideRef) {
+        // This saves our cleanup code constantly null checking insideRef. Instead it can just unconditional
+        //  release it, we we can null check it.
+        return;
+    }
     // If our reference still exists in OutsideReference this is easy, just decrement the count.
     //  Of course, we may not be able to, even if OutsideReference is valid and correlates to our insideRef...
     //  because of stuff... but that is fine, if our reference isn't in the outside reference for any reason,
     //  it will have been moved to inside ref, and we can decrement it from there.
 
-    while(true) {
-        OutsideReference ref = *outsideRef;
-        OutsideReference refOriginal = ref;
+    if(outsideRef) {
+        while(true) {
+            OutsideReference ref = *outsideRef;
+            OutsideReference refOriginal = ref;
 
-        if(IsOutsideRefCorrupt(ref)) return;
+            if(IsOutsideRefCorrupt(ref)) return false;
 
-		// Break when the outside reference is dead
+            // Break when the outside reference is dead
 
-        // If the outer reference doesn't even refer to this inside reference, then our reference must have been moved
-        //  to the inner reference
-        if((void*)PACKED_POINTER_GET_POINTER(ref) != insideRef) break;
-        // If there is nothing to decrement in the outer reference, our reference must have been moved to the inner,
-        //  so... go release it there
-        if(ref.count == 0) break;
+            // If the outer reference doesn't even refer to this inside reference, then our reference must have been moved
+            //  to the inner reference
+            if((void*)PACKED_POINTER_GET_POINTER(ref) != insideRef) break;
+            // If there is nothing to decrement in the outer reference, our reference must have been moved to the inner,
+            //  so... go release it there
+            if(ref.count == 0) break;
 
-        ref.count--;
-        if(!XchgOutsideReference(outsideRef, &refOriginal, &ref)) continue;
+            ref.count--;
+            if(!XchgOutsideReference(outsideRef, &refOriginal, &ref)) continue;
 
-        // So... OutsideReference still exists. If/when it is destroyed, the inside reference might be freed,
-        //  but until then the inside reference has to stay alive (as the outside reference is still exposing it),
-        //  so... just return, nothing more to do.
-        return;
+            // So... OutsideReference still exists. If/when it is destroyed, the inside reference might be freed,
+            //  but until then the inside reference has to stay alive (as the outside reference is still exposing it),
+            //  so... just return, nothing more to do.
+            return false;
+        }
     }
 
     // The OutsideReference is dead. Our reference MUST be in the inside reference. References (counts) only
@@ -163,11 +180,11 @@ void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef,
     //  (while new references may be added to the outside reference, and it may be reused with the same pointer,
     //      meaning it is possible to retry to use the outside reference, we should always be able to dereference
     //      from the inside reference, as our reference had to go somewhere if it wasn't in the outside ref...)
-    releaseInsideReference(insideRef, pointerToFree);
+    return releaseInsideReference(insideRef, dontFree);
 }
 
 
-bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, InsideReference** pointerToFree) {
+bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
     // First move the references from outside ref to inside ref (causing them to be duplicated for a bit)
     //  (and which if removing from the outside ref fails may require removing from the inside ref)
     // Then try to make the outside ref wiped out
@@ -225,13 +242,20 @@ bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pI
 
         // Now that the outside ref is atomically gone, we can remove the outside's own ref to the inside ref
         //  (this is NOT the reference the caller has, this is the outside reference's own ref, completely different)
-        releaseInsideReference(pInsideRef, pointerToFree);
+        if(releaseInsideReference(pInsideRef, nullptr)) {
+            // If our reference's own reference was the last reference, that means the caller lied about
+            //  having a reference, and bad stuff is going to happen...
+            OnError(3);
+        }
         return true;
     }
     return false;
 }
 
-bool Reference_SetOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, InsideReference** pointerToFree) {
+bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* prevRef, InsideReference* pInsideRef) {
+    if(!pInsideRef) {
+        return Reference_DestroyOutside(pOutsideRef, prevRef);
+    }
     while(true) {
         OutsideReference outsideRef = *pOutsideRef;
         InsideReference insideRef = *pInsideRef;
@@ -239,8 +263,8 @@ bool Reference_SetOutside(OutsideReference* pOutsideRef, InsideReference* pInsid
         if(IsOutsideRefCorrupt(outsideRef)) return false;
         if(IsInsideRefCorrupt(insideRef, pInsideRef)) return false;
 
-        if((void*)PACKED_POINTER_GET_POINTER(outsideRef) != nullptr) return false;
-        if(outsideRef.count != 0) return false;
+        if((void*)PACKED_POINTER_GET_POINTER(outsideRef) != prevRef) return false;
+        if(!prevRef && outsideRef.count != 0) return false;
 
         // We must add the inside reference first, because as soon as we make the outside reference it is open to being destructed,
         //  which requires having an inside reference, or else the destruct will decrement our own inside reference, ruining everything!
@@ -255,10 +279,18 @@ bool Reference_SetOutside(OutsideReference* pOutsideRef, InsideReference* pInsid
         // So, going from {0, 0} to {0, pInsideRef}
         if(!XchgOutsideReference(pOutsideRef, &outsideRefOriginal, &outsideRef)) {
             // Failure means it is already being used. So, undo our inside ref increment, and abort
-            releaseInsideReference(pInsideRef, pointerToFree);
+            if(releaseInsideReference(pInsideRef, nullptr)) {
+                // If our reference's own reference was the last reference, that means the caller lied about
+                //  having a reference, and bad stuff is going to happen...
+                OnError(3);
+            }
             return false;
         }
         return true;
     }
     return false;
+}
+
+bool Reference_SetOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
+    return Reference_ReplaceOutside(pOutsideRef, (InsideReference*)nullptr, pInsideRef);
 }

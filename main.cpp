@@ -981,8 +981,8 @@ void testSizingVar(int variation) {
 		itemCount = 1000;
 	}
 	else if(variation == 1) {
-		itemCount = 1000 * 1000;
-		factor = 100 * 1000;
+		itemCount = 1000 * 1000 * 2;
+		factor = 1000 * 100 / 2;
 		itemCount = itemCount / factor;
 	}
 	else if(variation == 2) {
@@ -1042,6 +1042,42 @@ void testSizingVar(int variation) {
 		}
 	}
 	else {
+		printf("get no matches (fast caching):\n");
+
+		uint64_t* hashes = new uint64_t[itemCount];
+		for (uint64_t j = 0; j < itemCount; j++) {
+			hashes[j] = getHash(j + itemCount, j + itemCount);
+		}
+
+		Timing_StartRoot(&rootTimer);
+
+		
+
+		for (uint64_t k = 0; k < factor; k++) {
+			for (uint64_t j = 0; j < itemCount; j++) {
+				typedef struct {
+					Item item;
+					uint64_t count;
+				} Context;
+				Context context = { 0 };
+				context.item.a = j + itemCount;
+				context.item.b = j + itemCount;
+
+				uint64_t hash = hashes[j];
+				AtomicHashTable2_find(&table, hash, &context, [](void* contextAny, void* value) {
+					Context* context = (Context*)contextAny;
+					Item* item = (Item*)value;
+					if (context->item.a == item->a && context->item.b == item->b) {
+						context->count++;
+					}
+				});
+
+				AssertEqual(context.count, 0);
+			}
+		}
+		Timing_EndRootPrint(&rootTimer, itemCount * factor);
+
+		delete[] hashes;
 		printf("get no matches:\n");
 		Timing_StartRoot(&rootTimer);
 		for (uint64_t k = 0; k < factor; k++) {

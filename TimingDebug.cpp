@@ -56,7 +56,7 @@ void Timing_EndRootPrint(TimeTrackerRoot* root, uint64_t iterationCount) {
 
     uint64_t nsOverheadEstimate = nsPerTimeOverhead * allCounts;
 
-    printf("%f seconds, %f%% overhead, %lluns per, %lluns in per, time per operation %fns, count %llu\n",
+    printf("%f seconds, %f%% overhead, %lluns per, %lluns overhead in time per, time per operation %fns, count %llu\n",
         (double)nsDuration / (1000 * 1000 * 1000),
         (double)nsOverheadEstimate / nsDuration * 100,
         nsPerTimeOverhead,

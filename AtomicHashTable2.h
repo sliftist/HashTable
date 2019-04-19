@@ -2,6 +2,9 @@
 #include "RefCount.h"
 #include "MemoryPool.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // Values rounded up to 64 bit increments, as we can't really store less
 #define AtomicHashTableSlotSize(VALUE_SIZE) (sizeof(AtomicSlot) - sizeof(AtomicUnit2) + ((VALUE_SIZE) + sizeof(uint64_t) - 1) / sizeof(uint64_t) * sizeof(uint64_t) * 2)
@@ -39,11 +42,10 @@ typedef __declspec(align(16)) struct {
 typedef __declspec(align(16)) struct {
     // slotsCount is immutable (obviously)
     uint64_t slotsCount;
-    // Because slots must be 16 byte aligned, and at the end
-    uint64_t padding;
+    uint64_t logSlotsCount;
 
     // The class is allocated larger than AtomicHashTableBase, so &slots can be used as an array of slots, slotsCount in length.
-    byte* slots;
+    byte slots;
 } AtomicHashTableBase;
 #pragma pack(pop)
 
@@ -76,6 +78,7 @@ typedef __declspec(align(16)) struct {
 
     // index of the next slot in currentAllocation to move to newAllocation (if newAllocation has a value)
     AtomicUnit2 nextMoveSlot;
+    AtomicUnit2 nextDestSlot;
 
     uint64_t slotsReserved;
     // next unique value is this, +2
@@ -95,11 +98,12 @@ typedef __declspec(align(16)) struct {
 // Returns 0 on success, and > 0 on failure
 int AtomicHashTable2_insert(AtomicHashTable2* self, uint64_t hash, void* value);
 
-int AtomicHashTable_remove(
+int AtomicHashTable2_remove(
 	AtomicHashTable2* self,
 	uint64_t hash,
 	void* callbackContext,
 	// On true, removes the value from the table
+    //  May be called multiple times for the value for one call.
 	bool(*callback)(void* callbackContext, void* value)
 );
 
@@ -113,3 +117,10 @@ int AtomicHashTable2_find(
     //  for the same value, assuming no value is added to the table more than once).
     void(*callback)(void* callbackContext, void* value)
 );
+
+uint64_t DebugAtomicHashTable2_reservedSize(AtomicHashTable2* self);
+uint64_t DebugAtomicHashTable2_allocationSize(AtomicHashTable2* self);
+
+#ifdef __cplusplus
+}
+#endif

@@ -11,40 +11,52 @@ bool XchgOutsideReference(
 ) {
     return InterlockedCompareExchange64((LONG64*)structAddress, *(LONG64*)structNew, *(LONG64*)structOriginal) == *(LONG64*)structOriginal;
 }
-bool XchgInsideReference(
-	InsideReference* structAddress,
-	InsideReference* structOriginal,
-	InsideReference* structNew
-) {
-    return InterlockedCompareExchange64((LONG64*)structAddress, *(LONG64*)structNew, *(LONG64*)structOriginal) == *(LONG64*)structOriginal;
+
+#if !defined(NDEBUG) && defined(_DEBUG)
+#define DEBUG
+#endif
+
+#ifdef DEBUG
+#define IsInsideRefCorrupt(ref, pRef) IsInsideRefCorruptInner(ref, pRef)
+#define IsOutsideRefCorrupt(ref) IsOutsideRefCorruptInner(ref)
+#else
+#define IsInsideRefCorrupt(ref, pRef) false
+#define IsOutsideRefCorrupt(ref) false
+#endif
+
+bool IsInsideRefCorruptInner(InsideReference ref, InsideReference* pRef) {
+	if (!pRef) {
+		// nullptr passed as InsideReference...
+		OnError(3);
+		return true;
+	}
+	if (ref.count <= 0) {
+		// Something decremented our ref count more times than it held it... this is invalid...
+		//  Our outside references should store at least once reference, and if not the caller should have
+		//  a reference, or else accessing it is invalid.
+		OnError(3);
+		return true;
+	}
+	if ((uint64_t)ref.pointer != ((uint64_t)pRef + sizeof(InsideReference))) {
+		// The inside ref isn't pointing to itself, so it isn't an inside ref, and this is totally invalid!
+		OnError(11);
+		return true;
+	}
+	return false;
 }
-
-
-bool IsOutsideRefCorrupt(OutsideReference ref) {
+bool IsOutsideRefCorruptInner(OutsideReference ref) {
     if(ref.count < 0) {
         // Is the outside reference being used for memory other than an outside reference? If so... that's bad,
         //  because it could overlap with the previous outside ref... which will break everything.
         OnError(3);
         return true;
     }
-    return false;
-}
-bool IsInsideRefCorrupt(InsideReference ref, InsideReference* pRef) {
-    if(!pRef) {
-        // nullptr passed as InsideReference...
-        OnError(3);
-        return true;
-    }
-    if(ref.count <= 0) {
-        // Something decremented our ref count more times than it held it... this is invalid...
-        OnError(3);
-        return true;
-    }
-    if((uint64_t)PACKED_POINTER_GET_POINTER(ref) != ((uint64_t)pRef + sizeof(InsideReference))) {
-        // The inside ref isn't pointing to itself, so it isn't an inside ref, and this is totally invalid!
-        OnError(11);
-        return true;
-    }
+	if (ref.pointerClipped) {
+		InsideReference* insideRef = (void*)PACKED_POINTER_GET_POINTER(ref);
+        if(IsInsideRefCorrupt(*insideRef, insideRef)) {
+            return true;
+        }
+	}
     return false;
 }
 
@@ -64,7 +76,7 @@ void Reference_RecycleAllocate(void* emptyAllocation, uint64_t size, OutsideRefe
     InsideReference* insideRef = emptyAllocation;
 
     memset(insideRef, 0, size + sizeof(InsideReference));
-    insideRef->pointerClipped = (uint64_t)((byte*)insideRef + sizeof(InsideReference));
+    insideRef->pointer = (void*)((byte*)insideRef + sizeof(InsideReference));
 
     // 1, for the OutsideReference
     insideRef->count = 1;
@@ -75,32 +87,32 @@ void Reference_RecycleAllocate(void* emptyAllocation, uint64_t size, OutsideRefe
     outsideRef.count = 0;
 
     *outRef = outsideRef;
-    *outPointer = (void*)PACKED_POINTER_GET_POINTER(*insideRef);
+    *outPointer = insideRef->pointer;
 }
 
 InsideReference* Reference_Acquire(OutsideReference* pRef) {
     while(true) {
-        OutsideReference ref = *pRef;
-        OutsideReference refOriginal = ref;
-
-        // This would need a memory fence if the caller had associated memory to indicate there was a reference
-        //  available, and had this memory exist on a per thread basis. But then... why are they even using
-        //  references? But more importantly... if they have memory on a per thread basis, they should know
-        //  to use memory fences themselves!
+        if(!pRef->pointerClipped) {
+            return nullptr;
+        }
+        OutsideReference ref;
+        ref.value = InterlockedAdd64((LONG64*)pRef, 1ll << BITS_IN_ADDRESS_SPACE);
+        // Getting a reference to a nullptr can happen, but it is fine, we can just ignore it. It won't happen
+        //  enough to overrun the ref count, as only threads that have seen it have a value one will try this,
+        //  so it won't continue to build up over time.
         if(!ref.pointerClipped) {
             return nullptr;
         }
 
         if(IsOutsideRefCorrupt(ref)) return nullptr;
 
-        ref.count++;
+        #ifdef DEBUG
         if(ref.count > (1ull << (64 - BITS_IN_ADDRESS_SPACE - 3))) {
             // Getting close to running out of references...
             OnError(1);
             return nullptr;
         }
-
-        if(!XchgOutsideReference(pRef, &refOriginal, &ref)) continue;
+        #endif
 
         // We have a reference to the outside reference, which we verified has a real inside reference, and so
         //  even if the outside reference is destructed immediately, that will just move our reference to the inside
@@ -114,35 +126,28 @@ InsideReference* Reference_Acquire(OutsideReference* pRef) {
 }
 
 bool releaseInsideReference(InsideReference* insideRef, bool dontFree) {
-    while(true) {
-        InsideReference ref = *insideRef;
-        InsideReference refOriginal = ref;
+    if(IsInsideRefCorrupt(*insideRef, insideRef)) return false;
 
-        if(IsInsideRefCorrupt(ref, insideRef)) return false;
+    LONG64 decrementResult = InterlockedDecrement64((LONG64*)&insideRef->count);
 
-        ref.count--;
-
-        if(!XchgInsideReference(insideRef, &refOriginal, &ref)) continue;
-
-        if(ref.count == 0) {
-            // This means our OutsideReference must be gone, and in fact all ourside references are gone... and
-            //  we were the last reference, so... free it.
-            // (oh, and this is fine, we aren't going inside insideRef, we are using the actual pointer, where
-            //  is an argument, so it is thread safe, and the actual pointer we want to free)
-            if(!dontFree) {
-                free(insideRef);
-            }
-            return true;
+    if(decrementResult == 0) {
+        // This means our OutsideReference must be gone, and in fact all ourside references are gone... and
+        //  we were the last reference, so... free it.
+        // (oh, and this is fine, we aren't going inside insideRef, we are using the actual pointer, where
+        //  is an argument, so it is thread safe, and the actual pointer we want to free)
+        if(!dontFree) {
+            free(insideRef);
         }
-        return false;
+        return true;
     }
+    return false;
 }
 
 bool Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef, bool dontFree) {
     if(!insideRef) {
         // This saves our cleanup code constantly null checking insideRef. Instead it can just unconditional
         //  release it, we we can null check it.
-        return;
+        return false;
     }
     // If our reference still exists in OutsideReference this is easy, just decrement the count.
     //  Of course, we may not be able to, even if OutsideReference is valid and correlates to our insideRef...
@@ -195,39 +200,24 @@ bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pI
 
     while(true) {
 		OutsideReference outsideRef = *pOutsideRef;
-		InsideReference insideRef = *pInsideRef;
 
         if(IsOutsideRefCorrupt(outsideRef)) return false;
-        if(IsInsideRefCorrupt(insideRef, pInsideRef)) return false;
-
-        InsideReference insideRefOriginal = insideRef;
+        if(IsInsideRefCorrupt(*pInsideRef, pInsideRef)) return false;
         
         if((void*)PACKED_POINTER_GET_POINTER(outsideRef) != pInsideRef) {
 			if (insideRefDelta != 0) {
-				while (true) {
-					InsideReference insideRef2 = *pInsideRef;
-					InsideReference insideRef2Original = insideRef2;
-					insideRef2.count += insideRefDelta;
-					if (!XchgInsideReference(pInsideRef, &insideRef2Original, &insideRef2)) continue;
-					break;
-				}
+                InterlockedAdd64((LONG64*)&pInsideRef->count, (LONG64)insideRefDelta);
 			}
 			return false;
         }
 
 		int64_t amountAdded = outsideRef.count + insideRefDelta;
-        insideRef.count += amountAdded;
-        if(insideRef.count > (1ull << (64 - BITS_IN_ADDRESS_SPACE - 3))) {
+        InterlockedAdd64((LONG64*)&pInsideRef->count, (LONG64)amountAdded);
+        if(pInsideRef->count > (1ull << (64 - BITS_IN_ADDRESS_SPACE - 3))) {
             // Getting close to running out of references...
             OnError(1);
         }
-		
-        if(!XchgInsideReference(pInsideRef, &insideRefOriginal, &insideRef)) continue;
 
-        if((void*)PACKED_POINTER_GET_POINTER(outsideRef) != pInsideRef) {
-            // We just went this far to undo our inside reference changes, but we have nothing more to do now.
-            return false;
-        }
 
         // Now try to remove from outside ref. If we fail... we have to go fix insideRef before we retry
         OutsideReference outsideRefOriginal = outsideRef;
@@ -252,26 +242,23 @@ bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pI
     return false;
 }
 
-bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* prevRef, InsideReference* pInsideRef) {
-    if(!pInsideRef) {
-        return Reference_DestroyOutside(pOutsideRef, prevRef);
-    }
+// TODO: Before we expose this, we need to fix our retry loop to acknowledge replacing existing references
+//  prevRef is optional, if passed outsideRef may be still in existence (and will be compared against prevRef) to verify
+//      we are replacing the correct reference.
+//  insideRef is optional, if not passed we just call Reference_DestroyOutside
+bool Reference_SetOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
     while(true) {
         OutsideReference outsideRef = *pOutsideRef;
-        InsideReference insideRef = *pInsideRef;
 
         if(IsOutsideRefCorrupt(outsideRef)) return false;
-        if(IsInsideRefCorrupt(insideRef, pInsideRef)) return false;
+        if(IsInsideRefCorrupt(*pInsideRef, pInsideRef)) return false;
 
-        if((void*)PACKED_POINTER_GET_POINTER(outsideRef) != prevRef) return false;
-        if(!prevRef && outsideRef.count != 0) return false;
+        if((void*)PACKED_POINTER_GET_POINTER(outsideRef) != 0) return false;
+        // The ref count on a nullptr can be positive. We will never release this ref, so it doesn't matter,
+        //  just wipe it out
+        //if(outsideRef.count != 0) return false;
 
-        // We must add the inside reference first, because as soon as we make the outside reference it is open to being destructed,
-        //  which requires having an inside reference, or else the destruct will decrement our own inside reference, ruining everything!
-        InsideReference insideRefOriginal = insideRef;
-        insideRef.count++;
-        if(!XchgInsideReference(pInsideRef, &insideRefOriginal, &insideRef)) continue;
-
+        InterlockedIncrement64((LONG64*)&pInsideRef->count);
 
         OutsideReference outsideRefOriginal = outsideRef;
         outsideRef.count = 0;
@@ -289,8 +276,4 @@ bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pr
         return true;
     }
     return false;
-}
-
-bool Reference_SetOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
-    return Reference_ReplaceOutside(pOutsideRef, (InsideReference*)nullptr, pInsideRef);
 }

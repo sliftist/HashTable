@@ -7,8 +7,8 @@ void* MemoryPool_Allocate(MemoryPool* this) {
             if(InterlockedCompareExchange64(
                 (LONG64*)&this->values[i],
                 nullptr,
-                value
-            ) == value) {
+                (LONG64)value
+            ) == (LONG64)value) {
                 return value;
             }
         }
@@ -25,7 +25,7 @@ void MemoryPool_Free(MemoryPool* this, void* value) {
         if(!this->values[i]) {
             if(InterlockedCompareExchange64(
                 (LONG64*)&this->values[i],
-                value,
+                (LONG64)value,
                 nullptr
             ) == nullptr) {
                 return;

@@ -182,7 +182,9 @@
     <ClCompile Include="AtomicHashTable2.c" />
     <ClCompile Include="AtomicHashTableDebug.cpp" />
     <ClCompile Include="AtomicHelpers.c" />
+    <ClCompile Include="bittricks.c" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="MemoryPool.c" />
     <ClCompile Include="mersenne-twister.c" />
     <ClCompile Include="RefCount.c" />
     <ClCompile Include="ReferenceCounter.c" />
@@ -198,6 +200,7 @@
     <ClInclude Include="AtomicHashTable2.h" />
     <ClInclude Include="AtomicHashTableDebug.h" />
     <ClInclude Include="AtomicHelpers.h" />
+    <ClInclude Include="bittricks.h" />
     <ClInclude Include="mersenne-twister.h" />
     <ClInclude Include="RefCount.h" />
     <ClInclude Include="ReferenceCounter.h" />

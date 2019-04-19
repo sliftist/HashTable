@@ -28,16 +28,8 @@ extern "C" {
 //          took a dereference from 0.9ns to 1.8ns.)
 
 
-// TODO: Change the InsideReference to not be packed, and not use compare exchange (it still needs an interlocked instruction
-//  though).
-//  - Then we can change the OuterReference to move its references to the InsideReference inside of rolling over.
-//  - And then, we can also change the OuterReference to use the bottom bits (and enforce pointers being 8 byte aligned),
-//      which reduces the bits we have to 3, BUT, it also works regardless of the processor, AND it removes the conditional
-//      in getting the pointer address from the packed address.
-//      (And if we added a 4 byte alignment option this would even make it work for 32 bit processors)
-//      (AND as we allocate the InsideReference, we could even do some craziness to overallocate it, and then use
-//          a pointer for it which is always allocated align to 8 bytes, and then have more data to say the original
-//          address allocated, allowing us to free the memory too).
+// TODO:
+//  - Change the OuterReference to move its references to the InsideReference inside of rolling over.
 //      - ALTHOUGH! Trying to move the bottom bits from the outside reference to the inside reference is actually quite dangerous.
 //          While we are doing it we don't have any references to the inside reference, but we have to go into its memory to
 //          increment inside references, and during this time, we could be freed, and then crash... So... maybe don't use the bottom bits...
@@ -57,13 +49,12 @@ typedef struct {
 #define PACKED_POINTER_GET_POINTER(p) (((p).pointerClipped & (1ull << (BITS_IN_ADDRESS_SPACE - 1))) ? ((p).pointerClipped | 0xFFFF000000000000ull) : (p).pointerClipped)
 
 
-
 // When InsideReference reaches a count of 0, it should be freed (as this means nothing knows about it,
 //  and so if we don't free it now it will leak).
 #pragma pack(push, 1)
 typedef struct {
-    uint64_t pointerClipped : BITS_IN_ADDRESS_SPACE;
-	uint64_t count : 64 - BITS_IN_ADDRESS_SPACE;
+    void* pointer;
+	uint64_t count;
 } InsideReference;
 #pragma pack(pop)
 
@@ -122,10 +113,6 @@ bool Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef,
 //  returns true on success
 bool Reference_DestroyOutside(OutsideReference* outsideRef, InsideReference* insideRef);
 
-//  prevRef is optional, if passed outsideRef may be still in existence (and will be compared against prevRef) to verify
-//      we are replacing the correct reference.
-//  insideRef is optional, if not passed we just call Reference_DestroyOutside
-bool Reference_ReplaceOutside(OutsideReference* outsideRef, InsideReference* prevRef, InsideReference* insideRef);
 
 // dest must be zeroed out, OR previously an outside ref destroyed by DestroyReference
 // Must have an inside reference to be called, and does not free inside reference

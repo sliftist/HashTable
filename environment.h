@@ -2,6 +2,12 @@
 
 #define CASSERT(predicate) typedef char C_STATIC_ASSERT_blah [2*!!(predicate)-1];
 
+#ifdef _MSC_VER
+#define breakpoint() __debugbreak()
+#else
+#define breakpoint() asm("int $3")
+#endif
+
 #ifdef KERNEL
 
 	#include <stdint.h>
@@ -46,9 +52,9 @@ extern "C" {
 
 
 void OnErrorInner(int code, const char* name, unsigned long long line);
-#define OnError(code) OnErrorInner(code, __FILE__, __LINE__)
+#define OnError(code) breakpoint(); OnErrorInner(code, __FILE__, __LINE__)
 
-#define ErrorTop(statement) { int errorTopResult = statement; if(errorTopResult != 0) OnError(errorTopResult); }
+#define ErrorTop(statement) { int errorTopResult = statement; if(errorTopResult != 0) { OnError(errorTopResult); } }
 
 
 #ifdef __cplusplus

@@ -611,6 +611,7 @@ void runRefTest2() {
 }
 
 #include "AtomicHashTable.h"
+#include "AtomicHashTable2.h"
 
 
 uint64_t invertBits(uint64_t value) {
@@ -702,12 +703,103 @@ uint64_t testGetCount(AtomicHashTable& table, uint64_t a, uint64_t b) {
 	return context.count;
 }
 
+#include <functional>
+
+typedef void(*CallbackFunction)(void* context, void* value);
+template <typename T, typename Result>
+class FunctionWrapper {
+private:
+	const std::function<Result(T)> fnc;
+public:
+	FunctionWrapper(const std::function<Result(T)> fnc): fnc(fnc) { }
+
+	void* getContext() {
+		return (void*)this;
+	}
+
+	static Result callbackFnc(void* context, void* value) {
+		auto wrapper = (FunctionWrapper<T, Result>*)context;
+		return wrapper->fnc((T)value);
+	}
+};
+
+
+void deleteItem(void* itemVoid) {
+	Item* item = (Item*)itemVoid;
+	delete item;
+}
+
+void testAdd2(AtomicHashTable2& table, uint64_t a, uint64_t b, uint64_t c) {
+	Item* item = new Item();
+	item->a = a;
+	item->b = b;
+	item->c = c;
+	uint64_t hash = getHash(a, b);
+
+	ErrorTop(AtomicHashTable2_insert(&table, hash, item));
+}
+
+
+uint64_t testRemove2(AtomicHashTable2& table, Item& item) {
+	uint64_t hash = getHash(item.a, item.b);
+	uint64_t count = 0;
+
+	FunctionWrapper<Item*, int> removeCallback([&](Item* other) {
+		int shouldRemove = (int)(item.a == other->a && item.b == other->b && item.c == other->c);
+		if (shouldRemove) {
+			count++;
+		}
+		return shouldRemove;
+	});
+	
+	int result = AtomicHashTable2_remove(&table, hash, removeCallback.getContext(), removeCallback.callbackFnc);
+	ErrorTop(result);
+	return count;
+}
+Item testGetSome2(AtomicHashTable2& table, Item& item) {
+	uint64_t hash = getHash(item.a, item.b);
+	Item someItem = { 0 };
+
+	FunctionWrapper<Item*, void> findCallback([&](Item* other) {
+		if(item.a == other->a && item.b == other->b && item.c == other->c) {
+			someItem = *other;
+		}
+	});
+
+	int result = AtomicHashTable2_find(&table, hash, findCallback.getContext(), findCallback.callbackFnc);
+	ErrorTop(result);
+	return someItem;
+}
+uint64_t testGetCount2(AtomicHashTable2& table, uint64_t a, uint64_t b) {
+	typedef struct {
+		Item item;
+		uint64_t count;
+	} Context;
+	Context context = { 0 };
+	context.item.a = a;
+	context.item.b = b;
+
+	uint64_t hash = getHash(a, b);
+
+	int result = AtomicHashTable2_find(&table, hash, &context, [](void* contextAny, void* value) {
+		Context* context = (Context*)contextAny;
+		Item* item = (Item*)value;
+		if (context->item.a == item->a && context->item.b == item->b) {
+			context->count++;
+		}
+	});
+	ErrorTop(result);
+	return context.count;
+}
+
+
 //#define AssertEqual(correct, test) AssertEqualInner(correct, test, __FILE__, __LINE__)
 #define AssertEqual(correct, test) !AssertEqualInner(correct, test, __FILE__, __LINE__) && !AssertEqualInner(correct, test, "repeat fail", __LINE__)
 
 bool AssertEqualInner(uint64_t test, uint64_t correct, const char* file, unsigned long long line) {
 	if(correct != test) {
 		printf("Error. Was %llu correct is %llu at %s:%llu\n", test, correct, file, line);
+		breakpoint();
 		return false;
 	}
 	return true;
@@ -763,6 +855,9 @@ int CompareSnapshot(TableSnapshot info) {
 }
 
 void testHashLeaksRefs() {
+	//todonext
+	// Change all code to use AtomicHashTable2 instead, with non of the snapshot code
+	//	(but maybe start with linear adding and removing code)
 	AtomicHashTable table = { 0 };
 
 	auto zeroState = GetSnapshot(table);
@@ -886,8 +981,8 @@ void testSizingVar(int variation) {
 		itemCount = 1000;
 	}
 	else if(variation == 1) {
-		itemCount = 30000;
-		factor = 30000;
+		itemCount = 1000 * 1000;
+		factor = 100 * 1000;
 		itemCount = itemCount / factor;
 	}
 	else if(variation == 2) {
@@ -898,12 +993,8 @@ void testSizingVar(int variation) {
 	}
 
 
-	AtomicHashTable table = { 0 };
+	AtomicHashTable2 table = AtomicHashTableDefault(sizeof(Item), deleteItem);
 
-	TableSnapshot zeroState;
-	if (variation == 0 || variation == 1 || variation == 3) {
-		zeroState = GetSnapshot(table);
-	}
 
 	if (variation == 2 || variation == 3) {
 		printf("insert + 2 gets + remove + dtor timing\n");
@@ -911,21 +1002,21 @@ void testSizingVar(int variation) {
 	}
 
 	for (uint64_t i = 0; i < itemCount; i++) {
-		testAdd(table, i, i, i);
+		testAdd2(table, i, i, i);
+		testAdd2(table, i, i, i);
 
 		if (variation == 2) {
 			if (i % (itemCount / 100) == 0) {
-				auto props = DebugAtomicHashTable_properties(&table);
-				uint64_t count = props.currentFillCount;
-				uint64_t maxCount = 1ll << (props.currentAllocationLog - 1);
-				printf("Add at %f%% %llu/%llu\n", (double)(i + 1) / itemCount * 100, count, maxCount);
+				uint64_t count = DebugAtomicHashTable2_reservedSize(&table);
+				uint64_t maxCount = DebugAtomicHashTable2_allocationSize(&table);
+				printf("Add at %f%% %llu/%llu\n", (double)(i + 1) / itemCount * 100 / 2, count, maxCount);
 			}
 		}
 
 		if (variation == 0) {
 			for (uint64_t j = 0; j <= i; j++) {
-				uint64_t count = testGetCount(table, j, j);
-				AssertEqual(count, 1);
+				uint64_t count = testGetCount2(table, j, j);
+				AssertEqual(count, 2);
 			}
 		}
 	}
@@ -934,20 +1025,19 @@ void testSizingVar(int variation) {
 		for (uint64_t j = 0; j < itemCount; j++) {
 			if (variation == 2) {
 				if (j % (itemCount / 100) == 0) {
-					auto props = DebugAtomicHashTable_properties(&table);
-					uint64_t count = props.currentFillCount;
-					uint64_t maxCount = 1ll << (props.currentAllocationLog - 1);
+					uint64_t count = DebugAtomicHashTable2_reservedSize(&table);
+					uint64_t maxCount = DebugAtomicHashTable2_allocationSize(&table);
 					printf("Check at %f%% %llu/%llu\n", (double)(j + 1) / itemCount * 100, count, maxCount);
 				}
 			}
 
 			{
-				uint64_t count = testGetCount(table, j + itemCount, j + itemCount);
+				uint64_t count = testGetCount2(table, j + itemCount, j + itemCount);
 				AssertEqual(count, 0);
 			}
 			{
-				uint64_t count = testGetCount(table, j, j);
-				AssertEqual(count, 1);
+				uint64_t count = testGetCount2(table, j, j);
+				AssertEqual(count, 2);
 			}
 		}
 	}
@@ -956,10 +1046,8 @@ void testSizingVar(int variation) {
 		Timing_StartRoot(&rootTimer);
 		for (uint64_t k = 0; k < factor; k++) {
 			for (uint64_t j = 0; j < itemCount; j++) {
-				TimeBlock(gets,
-					uint64_t count = testGetCount(table, j + itemCount, j + itemCount);
+				uint64_t count = testGetCount2(table, j + itemCount, j + itemCount);
 				AssertEqual(count, 0);
-				);
 			}
 		}
 		Timing_EndRootPrint(&rootTimer, itemCount * factor);
@@ -968,10 +1056,8 @@ void testSizingVar(int variation) {
 		Timing_StartRoot(&rootTimer);
 		for (uint64_t k = 0; k < factor; k++) {
 			for (uint64_t j = 0; j < itemCount; j++) {
-				TimeBlock(gets,
-					uint64_t count = testGetCount(table, j, j);
-				AssertEqual(count, 1);
-				);
+				uint64_t count = testGetCount2(table, j, j);
+				AssertEqual(count, 2);
 			}
 		}
 		Timing_EndRootPrint(&rootTimer, itemCount * factor);
@@ -981,9 +1067,8 @@ void testSizingVar(int variation) {
 	for (uint64_t i = 0; i < itemCount; i++) {
 		if (variation == 2) {
 			if (i % (itemCount / 100) == 0) {
-				auto props = DebugAtomicHashTable_properties(&table);
-				uint64_t count = props.currentFillCount;
-				uint64_t maxCount = 1ll << (props.currentAllocationLog - 1);
+				uint64_t count = DebugAtomicHashTable2_reservedSize(&table);
+				uint64_t maxCount = DebugAtomicHashTable2_allocationSize(&table);
 				printf("Remove at %f%% %llu/%llu\n", (double)(i + 1) / itemCount * 100, count, maxCount);
 			}
 		}
@@ -992,21 +1077,26 @@ void testSizingVar(int variation) {
 		item.a = i;
 		item.b = i;
 		item.c = i;
-		testRemove(table, &item);
+		// TODO: Oh, the remove count can easily be higher, as it is possible the function will be called many times
+		//	for the same value (because of contention).
+		uint64_t removeCount = testRemove2(table, item);
+		AssertEqual(removeCount, 2);
 
 		if (variation == 0) {
 			for (uint64_t j = 0; j <= i; j++) {
-				AssertEqual(testGetCount(table, j, j), 0);
+				AssertEqual(testGetCount2(table, j, j), 0);
 			}
 			for (uint64_t j = i + 1; j < itemCount; j++) {
-				AssertEqual(testGetCount(table, j, j), 1);
+				AssertEqual(testGetCount2(table, j, j), 2);
 			}
 		}
 	}
 
-	AtomicHashTable_dtor(&table);
-	if (variation == 0 || variation == 1 || variation == 3) {
-		CompareSnapshot(zeroState);
+	// Hmm... we should probably add "iterate all" function, because I am sure it would be useful to display
+	//	the contents in a UI. Although... iterate all is problematic... Hmm... And maybe a clear all function?
+	uint64_t allocSize = DebugAtomicHashTable2_allocationSize(&table);
+	for(uint64_t i = 0; i < allocSize; i++) {
+		AtomicHashTable2_remove(&table, i, nullptr, [](void* x, void* value){ x; value; return true; } );
 	}
 
 	if (variation == 2 || variation == 3) {
@@ -1014,9 +1104,9 @@ void testSizingVar(int variation) {
 	}
 }
 void testSizing() {
-	testSizingVar(0);
+	//testSizingVar(0);
 	testSizingVar(1);
-	testSizingVar(3);
+	//testSizingVar(3);
 
 	// Tests to make sure we can scale large
 	//testSizingVar(2);
@@ -1148,14 +1238,14 @@ void testHashChurn2() {
 
 
 void runAtomicHashTableTest() {
+	testSizing();
 	/*
 	testHashLeaksRefs();
 	testHashChurn();
-	testSizing();
 	testHashChurn2();
 	*/
 
-	testTableMultiThreads(4, 1, 1, threadedChurn);
+	//testTableMultiThreads(4, 1, 1, threadedChurn);
 
 	//todonext
 	// Oh, test with multiple threads... obviously...
@@ -1319,8 +1409,6 @@ void testTableMultiThreads(
 ) {
 */
 
-#include <functional>
-
 // 800kb... but it's just static memory, so that's nothing...
 HANDLE threads[1000 * 100] = { 0 };
 volatile LONG64 curThreadIndex = -1;
@@ -1422,7 +1510,7 @@ void runRefCountTests() {
 				for (int i = 0; i < itemCount; i++) {
 					InsideReference* value = Reference_Acquire(&sharedValues[i]);
 					if (value) {
-						Value* v = (Value*)PACKED_POINTER_GET_POINTER(*value);
+						Value* v = (Value*)value->pointer;
 						if (v->thread == t) {
 							v->value++;
 						}
@@ -1434,7 +1522,7 @@ void runRefCountTests() {
 				for (int i = 0; i < itemCount; i++) {
 					InsideReference* value = Reference_Acquire(&sharedValues[i]);
 					if (value) {
-						Value* v = (Value*)PACKED_POINTER_GET_POINTER(*value);
+						Value* v = (Value*)value->pointer;
 						if (v->thread == t) {
 							Reference_DestroyOutside(&sharedValues[i], value);
 						}
@@ -1446,7 +1534,7 @@ void runRefCountTests() {
 			uint64_t totalCount = 0;
 			for (int i = 0; i < itemCount; i++) {
 				InsideReference* value = Reference_Acquire(&values[i]);
-				Value* v = (Value*)PACKED_POINTER_GET_POINTER(*value);
+				Value* v = (Value*)value->pointer;
 				
 				totalCount += v->value;
 
@@ -1466,10 +1554,10 @@ void runRefCountTests() {
 
 int main() {
 	try {
-		//runAtomicHashTableTest();
+		runAtomicHashTableTest();
 		//benchmarkCompareExchanges();
 		//benchmarkObfuscatedPointers();
-		runRefCountTests();
+		//runRefCountTests();
 	}
 	catch (...) {
 		printf("error main\n");

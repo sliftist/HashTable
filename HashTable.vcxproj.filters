@@ -51,10 +51,16 @@
     <ClCompile Include="RefCount.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="AtomicHashTable3.c">
+    <ClCompile Include="TransApply.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="TransApply.c">
+    <ClCompile Include="AtomicHashTable2.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MemoryPool.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="bittricks.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -92,10 +98,13 @@
     <ClInclude Include="RefCount.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="AtomicHashTable3.h">
+    <ClInclude Include="TransApply.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="TransApply.h">
+    <ClInclude Include="AtomicHashTable2.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="bittricks.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

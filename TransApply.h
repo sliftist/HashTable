@@ -27,7 +27,7 @@ typedef struct {
 } OutsideReferenceAtomic;
 
 #pragma pack(push, 1)
-typedef struct {
+typedef __declspec(align(16)) struct {
     // The refs for the memory sourceUnits and destUnits are in, moved here,
     //  to make it possible for hanging threads to still have valid source and dest memory.
     //  (the source and dest values don't really matter, they might as well be arbitrary refs)
@@ -56,9 +56,9 @@ typedef struct {
 #define MAX_CHANGE_COUNT 3
 
 #pragma pack(push, 1)
-typedef struct {
-    uint64_t changeCount;
+typedef __declspec(align(16)) struct {
     TransChange changes[MAX_CHANGE_COUNT];
+    uint64_t changeCount;
 
     // Populated and used internally
     uint64_t startVersion;
@@ -81,9 +81,14 @@ typedef __declspec(align(16)) struct {
         AtomicUnit2 transactionToApplyUnit;
     };
 
+    uint64_t curUniqueId;
+
 } TransApply;
 #pragma pack(pop)
 
+
+// Gets the version, or returns 0 if TransApply_GetVersion must be called instead
+uint64_t TransApply_FastGetVersion(TransApply* trans);
 
 // Gets a version id, which if it still the current version id guarantees no more writes have occured.
 uint64_t TransApply_GetVersion(TransApply* trans);

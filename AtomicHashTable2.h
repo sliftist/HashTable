@@ -6,9 +6,6 @@
 extern "C" {
 #endif
 
-// Values rounded up to 64 bit increments, as we can't really store less
-#define AtomicHashTableSlotSize(VALUE_SIZE) (sizeof(AtomicSlot) - sizeof(AtomicUnit2) + ((VALUE_SIZE) + sizeof(uint64_t) - 1) / sizeof(uint64_t) * sizeof(uint64_t) * 2)
-
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
     // (our move code has hardcoded assumptions that this only contains AtomicUnits, so... keep it that way, or change the move code)
@@ -52,17 +49,20 @@ typedef __declspec(align(16)) struct {
 
 // TODO: Make reference counting optional, as sometimes we won't even need it
 
+// Values rounded up to 64 bit increments, as we can't really store less
+#define AtomicHashTableSlotSize(VALUE_SIZE) (sizeof(AtomicSlot) - sizeof(AtomicUnit2) + ((VALUE_SIZE) + sizeof(uint64_t) - 1) / sizeof(uint64_t) * sizeof(uint64_t) * 2)
 
 // Should be initialized as:
 //  AtomicHashTable2 table = AtomicHashTableDefault(VALUE_SIZE, void (*deleteValue)(void* value));
 
-#define AtomicHashTableDefault(VALUE_SIZE, deleteValue) { VALUE_SIZE, deleteValue, TransApplyDefault(), { AtomicHashTableSlotSize(VALUE_SIZE) + sizeof(InsideReference) }, { VALUE_SIZE } }
+#define AtomicHashTableDefault(VALUE_SIZE, deleteValue) { VALUE_SIZE, AtomicHashTableSlotSize(VALUE_SIZE), deleteValue, TransApplyDefault(), { AtomicHashTableSlotSize(VALUE_SIZE) + sizeof(InsideReference) }, { VALUE_SIZE } }
 
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
     // (in bytes)
     uint64_t VALUE_SIZE;
+    uint64_t SLOT_SIZE;
 
     void (*deleteValue)(void* value);
 

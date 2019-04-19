@@ -97,6 +97,7 @@ InsideReference* Reference_Acquire(OutsideReference* pRef) {
         }
         OutsideReference ref;
         ref.value = InterlockedAdd64((LONG64*)pRef, 1ll << BITS_IN_ADDRESS_SPACE);
+        #ifdef DEBUG
         // Getting a reference to a nullptr can happen, but it is fine, we can just ignore it. It won't happen
         //  enough to overrun the ref count, as only threads that have seen it have a value one will try this,
         //  so it won't continue to build up over time.
@@ -122,6 +123,9 @@ InsideReference* Reference_Acquire(OutsideReference* pRef) {
         if(IsInsideRefCorrupt(*insideRef, insideRef)) return nullptr;
 
         return insideRef;
+        #else
+        return (void*)PACKED_POINTER_GET_POINTER(ref);
+        #endif
     }
 }
 
@@ -169,6 +173,10 @@ bool Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef,
             // If there is nothing to decrement in the outer reference, our reference must have been moved to the inner,
             //  so... go release it there
             if(ref.count == 0) break;
+
+            
+            // Unfortunately, we can't do a InterlockedDecrement64, because... the outside reference might
+            //  move, which would cause our decrement to wrap around the number, messing up the pointer field.
 
             ref.count--;
             if(!XchgOutsideReference(outsideRef, &refOriginal, &ref)) continue;

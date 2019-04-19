@@ -7,7 +7,7 @@
 
 // (sizeof(InsideReference) because our tracked allocations are this much smaller)
 
-#define getSlotSize(hashTable) AtomicHashTableSlotSize(hashTable->VALUE_SIZE)
+#define getSlotSize(hashTable) (hashTable)->SLOT_SIZE
 
 // Means when we add more bits, overlaps stay as neighbors (which is a useful property when resizing)
 #define getSlotBaseIndex(alloc, hash) (hash >> (64 - alloc->logSlotsCount))
@@ -632,115 +632,6 @@ int AtomicHashTable2_remove(
     return result;
 }
 
-
-// NOTE: we have to copy the values out, and store all of them independently, because once we start calling the callback
-//  we can't go back and retry, unless we keep track of the values we passed and don't pass them again... but then that would
-//  require a fast lookup structure, which is what we are building in the first place. Unless of course there are few values,
-//  in which case copying all of them should be fine... unless they are large values. But if they are large values,
-//  and there is enough contention, then the user shouldn't be storing them inline anyway! They should store a pointer
-//  in our table, making inserts and removals faster, and finds faster!
-int atomicHashTable2_findLoopInner(
-    AtomicHashTable2* this,
-	uint64_t hash,
-    AtomicHashTableBase* table,
-    InsideReference* tableRef,
-    uint64_t version,
-    // If increased, we get called again with a higher valueCount
-    uint64_t* valueCount,
-    uint64_t* valuesUsed,
-    byte* values,
-    // All of these are released on retries
-    OutsideReference* valueReferences
-) {
-    uint64_t slotSize = getSlotSize(this);
-
-    uint64_t indexStart = getSlotBaseIndex(table, hash);
-    uint64_t indexOffset = 0;
-    while(version == this->transaction.transactionToApplyUnit.version) {
-        uint64_t index = (indexStart + indexOffset++) % table->slotsCount;
-        AtomicSlot* slot = (AtomicSlot*)&(&table->slots)[slotSize * index];
-        if(slot->valueUniqueId.value == 0) break;
-        if(slot->valueUniqueId.value == 1) continue;
-        if(slot->hash.value != hash) continue;
-        
-        if(*valuesUsed + 1 > *valueCount) {
-			if (*valueCount == 0) {
-				*valueCount = 1;
-			}
-			else {
-				// Need more values. No point in adding extra iterator code, just multiple by 10. If they are
-				//  expecting find to return many elements... then they probably shouldn't be using a hash table anyway...
-				*valueCount = *valueCount * 10;
-			}
-            return 1;
-        }
-
-        {
-            InsideReference* valueRef = Reference_Acquire(&slot->ref.ref);
-            if(!valueRef) {
-                // Eh... must be a contention we will surely retry later
-                continue;
-            }
-
-            Reference_SetOutside(&valueReferences[*valuesUsed], valueRef);
-            Reference_Release(&slot->ref.ref, valueRef, false);
-        }
-
-        byte* value = &values[this->VALUE_SIZE * (*valuesUsed)];
-
-        for(uint64_t i = 0; i < this->VALUE_SIZE / 8; i++) {
-            ((uint64_t*)value)[i] = (&slot->valueUnits)[i].value;
-        }
-        uint64_t alignedEnd = this->VALUE_SIZE / 8 * 8;
-        for(uint64_t i = alignedEnd; i < this->VALUE_SIZE; i++) {
-            value[i] = ((byte*)(&slot->valueUnits)[i].value)[i - alignedEnd];
-        }
-
-        if(version != this->transaction.transactionToApplyUnit.version) {
-            // Writes have occured since we started reading, so our read is not consistent. Retry
-            return 1;
-        }
-
-        (*valuesUsed)++;
-    }
-
-    return 0;
-}
-
-int atomicHashTable2_findLoop(
-    AtomicHashTable2* this,
-	uint64_t hash,
-    uint64_t version,
-    // If increased, we get called again with a higher valueCount
-    uint64_t* valueCount,
-    uint64_t* valuesUsed,
-    byte* values,
-    // All of these are released on retries
-    OutsideReference* valueReferences
-) {
-    InsideReference* tableRef = Reference_Acquire(&this->currentAllocation.ref);
-    if(!tableRef) {
-        return 1;
-    }
-    AtomicHashTableBase* table = tableRef->pointer;
-
-    int result = atomicHashTable2_findLoopInner(
-        this,
-        hash,
-        table,
-        tableRef,
-        version,
-        valueCount,
-        valuesUsed,
-        values,
-        valueReferences
-    );
-
-    Reference_Release(&this->currentAllocation.ref, tableRef, false);
-
-    return result;
-}
-
 int AtomicHashTable2_find(
     AtomicHashTable2* this,
     uint64_t hash,
@@ -751,15 +642,15 @@ int AtomicHashTable2_find(
     //  for the same value, assuming no value is added to the table more than once).
     void(*callback)(void* callbackContext, void* value)
 ) {
+    uint64_t slotSize = getSlotSize(this);
+
     uint64_t valueCount = 0;
     uint64_t lastValueCount = valueCount;
     uint64_t valuesUsed = 0;
 	OutsideReference* valueReferences = nullptr;
 	byte* values = nullptr;
 
-    OutsideReference valueReferencesOne[1] = { 0 };
-
-    int result = 0;
+	OutsideReference valueReferencesOne[1];
 
     while(true) {
 
@@ -768,18 +659,72 @@ int AtomicHashTable2_find(
 			RETURN_ON_ERROR(atomicHashTable2_getVersion(this, &version));
 		}
 
-        int result = atomicHashTable2_findLoop(
-            this,
-            hash,
-            version,
-            &valueCount,
-            &valuesUsed,
-            values,
-            valueReferences
-        );
+        InsideReference* tableRef = Reference_Acquire(&this->currentAllocation.ref);
+        if(!tableRef) {
+            continue;
+        }
+        AtomicHashTableBase* table = tableRef->pointer;
+
+        {
+            uint64_t indexStart = getSlotBaseIndex(table, hash);
+            uint64_t indexOffset = 0;
+            while(version == this->transaction.transactionToApplyUnit.version) {
+                uint64_t index = (indexStart + indexOffset++) % table->slotsCount;
+                AtomicSlot* slot = (AtomicSlot*)&(&table->slots)[slotSize * index];
+                if(slot->valueUniqueId.value == 0) break;
+                if(slot->valueUniqueId.value == 1) continue;
+                if(slot->hash.value != hash) continue;
+                
+                if(valuesUsed + 1 > valueCount) {
+                    if (valueCount == 0) {
+                        valueCount = 1;
+                    }
+                    else {
+                        // Need more values. No point in adding extra iterator code, just multiple by 10. If they are
+                        //  expecting find to return many elements... then they probably shouldn't be using a hash table anyway...
+                        valueCount = valueCount * 10;
+                    }
+                    break;
+                }
+
+                {
+                    InsideReference* valueRef = Reference_Acquire(&slot->ref.ref);
+                    if(!valueRef) {
+                        // Eh... must be a contention we will surely retry later
+                        continue;
+                    }
+
+                    Reference_SetOutside(&valueReferences[valuesUsed], valueRef);
+                    Reference_Release(&slot->ref.ref, valueRef, false);
+                }
+
+                byte* value = &values[this->VALUE_SIZE * (valuesUsed)];
+
+                for(uint64_t i = 0; i < this->VALUE_SIZE / 8; i++) {
+                    ((uint64_t*)value)[i] = (&slot->valueUnits)[i].value;
+                }
+                uint64_t alignedEnd = this->VALUE_SIZE / 8 * 8;
+                for(uint64_t i = alignedEnd; i < this->VALUE_SIZE; i++) {
+                    value[i] = ((byte*)(&slot->valueUnits)[i].value)[i - alignedEnd];
+                }
+
+                if(version != this->transaction.transactionToApplyUnit.version) {
+                    // Writes have occured since we started reading, so our read is not consistent. Retry
+                    break;
+                }
+
+                valuesUsed++;
+            }
+        }
+
+        Reference_Release(&this->currentAllocation.ref, tableRef, false);
 
         if(valueCount != lastValueCount) {
 			if (valueCount == 1) {
+                // Nothing to free in here, as if valueCount is 1 now, then previous it must have been zero.
+				OutsideReference zeroRef = { 0 };
+				valueReferencesOne[0] = zeroRef;
+
 				valueReferences = valueReferencesOne;
 				values = MemoryPool_Allocate(&this->valueFindPool);
 				if (!values) {
@@ -804,26 +749,41 @@ int AtomicHashTable2_find(
 
 				values = malloc(this->VALUE_SIZE * valueCount);
 				valueReferences = malloc(sizeof(OutsideReference) * valueCount);
+
+                if(!values || !valueReferences) {
+                    if(values) {
+                        values = nullptr;
+                        free(values);
+                    }
+                    if(valueReferences) {
+                        valueReferences = nullptr;
+                        free(valueReferences);
+                    }
+
+                    return 2;
+                }
 			}
             lastValueCount = valueCount;
-        }
-		if (result != 0) {
-			memset(values, 0, (int)(this->VALUE_SIZE * valueCount));
+            memset(values, 0, (int)(this->VALUE_SIZE * valueCount));
 			memset(valueReferences, 0, (int)(sizeof(OutsideReference) * valueCount));
             valuesUsed = 0;
-		}
-
-        if(result != 1) break;
-        // This version check should catch all result == 1 cases anyway, so we don't need to check for it.
-        if(version != this->transaction.transactionToApplyUnit.version) {
             continue;
         }
+
+        // This version check should catch all result == 1 cases anyway, so we don't need to check for it.
+        if(version != this->transaction.transactionToApplyUnit.version) {
+            memset(values, 0, (int)(this->VALUE_SIZE * valueCount));
+			memset(valueReferences, 0, (int)(sizeof(OutsideReference) * valueCount));
+            valuesUsed = 0;
+            continue;
+        }
+
+        break;
     }
 
-    if(result == 0) {
-        for(uint64_t i = 0; i < valuesUsed; i++) {
-            callback(callbackContext, (void*)&values[this->VALUE_SIZE * i]);
-        }
+    
+    for(uint64_t i = 0; i < valuesUsed; i++) {
+        callback(callbackContext, (void*)&values[this->VALUE_SIZE * i]);
     }
 
     for(uint64_t i = 0; i < valuesUsed; i++) {
@@ -844,7 +804,7 @@ int AtomicHashTable2_find(
         free(valueReferences);
     }
 
-    return result;
+    return 0;
 }
 
 

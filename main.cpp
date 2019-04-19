@@ -1064,6 +1064,7 @@ void testSizingVar(int variation) {
 				context.item.b = j + itemCount;
 
 				uint64_t hash = hashes[j];
+				// This call takes maybe ~170 instructions. Which seems like a lot.
 				AtomicHashTable2_find(&table, hash, &context, [](void* contextAny, void* value) {
 					Context* context = (Context*)contextAny;
 					Item* item = (Item*)value;

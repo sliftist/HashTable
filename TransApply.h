@@ -46,6 +46,17 @@ typedef __declspec(align(16)) struct {
     OutsideReferenceAtomic* sourceRefToMove;
     OutsideReferenceAtomic* destRefToMove;
 
+    // (Must be acquired before sourceRefToMove is acquired, as it must be held if sourceRefToMove releases
+    //  and indicates it has been destroyed).
+    // These values are passed to sourceOrSourceRefDeleteFnc if sourceRefToMove or destRefToMove are deleted
+    OutsideReference sourceRefDeleteValueRef;
+    MemoryPool* sourceRefDeleteValueRefMemPool;
+    OutsideReference destRefDeleteValueRef;
+    MemoryPool* destRefDeleteValueRefMemPool;
+
+    void(*sourceOrSourceRefDeleteFnc)(void* value);
+
+
     uint64_t moveCount;
     AtomicUnit2* sourceUnits;
     uint64_t sourceConstValue;

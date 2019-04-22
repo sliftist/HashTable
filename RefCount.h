@@ -84,7 +84,9 @@ CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
 //  OutsideReferences is allowed (however you better not store arbitrary memory there).
 
 // (May set outPointer to nullptr if the allocation fails)
-void Reference_Allocate(uint64_t size, OutsideReference* outRef, void** outPointer);
+//void Reference_Allocate(uint64_t size, OutsideReference* outRef, void** outPointer);
+#define Reference_Allocate(size, outRef, outPointer) Reference_AllocateInner(size, outRef, outPointer, __FILE__, __LINE__)
+void Reference_AllocateInner(uint64_t size, OutsideReference* outRef, void** outPointer, const char* file, int line);
 
 // The emptyAllocation must be size + sizeof(InsideReference)
 void Reference_RecycleAllocate(void* emptyAllocation, uint64_t size, OutsideReference* outRef, void** outPointer);
@@ -103,7 +105,9 @@ InsideReference* Reference_Acquire(OutsideReference* ref);
 // If dontFree, and this is the last reference, then we don't free it.
 // Returns true if this was the last reference (so if dontFree is passed, it is up to the caller
 //  to call free on insideRef).
-bool Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef, bool dontFree);
+//bool Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef, bool dontFree);
+#define Reference_Release(outsideRef, insideRef, dontFree) Reference_ReleaseInner(outsideRef, insideRef, dontFree, __FILE__, __LINE__)
+bool Reference_ReleaseInner(OutsideReference* outsideRef, InsideReference* insideRef, bool dontFree, const char* file, int line);
 
 
 
@@ -111,7 +115,9 @@ bool Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef,
 //  in the inside ref being freed).
 // Must have an inside reference to be called, but does not free inside reference
 //  returns true on success
-bool Reference_DestroyOutside(OutsideReference* outsideRef, InsideReference* insideRef);
+//bool Reference_DestroyOutside(OutsideReference* outsideRef, InsideReference* insideRef);
+#define Reference_DestroyOutside(outsideRef, insideRef) Reference_DestroyOutsideInner(outsideRef, insideRef, __FILE__, __LINE__)
+bool Reference_DestroyOutsideInner(OutsideReference* outsideRef, InsideReference* insideRef, const char* file, int line);
 
 
 // dest must be zeroed out, OR previously an outside ref destroyed by DestroyReference

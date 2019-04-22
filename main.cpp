@@ -624,7 +624,11 @@ uint64_t invertBits(uint64_t value) {
 	return output;
 }
 uint64_t getHash(uint64_t a, uint64_t b) {
-	return invertBits(a + b);
+	uint64_t hash = invertBits(a + b);
+	if (hash == 0) {
+		hash = 1;
+	}
+	return hash;
 }
 
 
@@ -887,39 +891,33 @@ void testHashChurnVar(int variation) {
 		randomBytes((unsigned char*)items, (int)(totalCount * sizeof(Item)), 0x7cdd44b);
 	}
 
-	AtomicHashTable table = { 0 };
-	auto zeroState = GetSnapshot(table);
+	AtomicHashTable2 table = AtomicHashTableDefault(sizeof(Item), deleteItem);
 
 	TableSnapshot firstInsert = { 0 };
 
 	for (uint64_t i = 0; i < totalCount; i += stride) {
 		for (uint64_t j = 0; j < stride; j++) {
 			Item* item = &items[i + j];
-			testAdd(table, item->a, item->b, item->c);
-		}
-		if(!firstInsert.snapshot) {
-			firstInsert = GetSnapshot(table);
-		}
-		else {
-			//printf("compare\n");
-			if (CompareSnapshot(firstInsert)) {
-				printf("\tat i=%llu\n", i);
-				break;
-			}
+			testAdd2(table, item->a, item->b, item->c);
+			int wtf = 0;
 		}
 		
 		for (int j = 0; j < stride; j++) {
 			Item* item = &items[i + j];
-			AssertEqual(testGetSome(table, item).c, item->c);
+			AssertEqual(testGetSome2(table, *item).c, item->c);
+			int wtf = 0;
 		}
 		for (int j = 0; j < stride; j++) {
 			Item* item = &items[i + j];
-			testRemove(table, item);
+			testRemove2(table, *item);
+			int wtf = 0;
 		}
 	}
 
-	AtomicHashTable_dtor(&table);
-	CompareSnapshot(zeroState);
+	uint64_t allocSize = DebugAtomicHashTable2_allocationSize(&table);
+	for(uint64_t i = 0; i < allocSize; i++) {
+		AtomicHashTable2_remove(&table, i, nullptr, [](void* x, void* value){ x; value; return true; } );
+	}
 }
 void testHashChurn() {
 	testHashChurnVar(0);
@@ -933,7 +931,7 @@ void testHashChurn() {
 
 
 typedef struct {
-	AtomicHashTable* table;
+	AtomicHashTable2* table;
 	int variation;
 	int threadIndex;
 	HANDLE thread;
@@ -945,7 +943,7 @@ void testTableMultiThreads(
 	DWORD(*runThread)(TableMultiThreadsContext*)
 ) {
 	for(int v = variationStart; v < variationStart + variationCount; v++) {
-		AtomicHashTable table = { 0 };
+		AtomicHashTable2 table = AtomicHashTableDefault(sizeof(Item), deleteItem);
 
 		TableMultiThreadsContext* threads = new TableMultiThreadsContext[count];
 
@@ -981,15 +979,21 @@ void testSizingVar(int variation) {
 		itemCount = 1000;
 	}
 	else if(variation == 1) {
-		itemCount = 1000 * 1000 * 2;
-		factor = 1000 * 100 / 2;
+#ifdef DEBUG
+		itemCount = 1000 * 100;
+		factor = 1000 * 10;
+#else
+		itemCount = 1000 * 1000;
+		factor = 1000 * 100;
+#endif
 		itemCount = itemCount / factor;
 	}
 	else if(variation == 2) {
+		//itemCount = (1ll << 23);
 		itemCount = (1ll << 26);
 	}
 	else {
-		itemCount = (1ll << 17);
+		itemCount = (1ll << 14);
 	}
 
 
@@ -1009,7 +1013,7 @@ void testSizingVar(int variation) {
 			if (i % (itemCount / 100) == 0) {
 				uint64_t count = DebugAtomicHashTable2_reservedSize(&table);
 				uint64_t maxCount = DebugAtomicHashTable2_allocationSize(&table);
-				printf("Add at %f%% %llu/%llu\n", (double)(i + 1) / itemCount * 100 / 2, count, maxCount);
+				printf("Add at %f%% %llu/%llu\n", (double)(i + 1) / itemCount * 100, count, maxCount);
 			}
 		}
 
@@ -1042,7 +1046,7 @@ void testSizingVar(int variation) {
 		}
 	}
 	else {
-		printf("get no matches (fast caching):\n");
+		printf("get no matches (fast hashing):\n");
 
 		uint64_t* hashes = new uint64_t[itemCount];
 		for (uint64_t j = 0; j < itemCount; j++) {
@@ -1150,7 +1154,7 @@ void testSizing() {
 }
 
 #include <vector>
-void testHashChurn2VarInner(AtomicHashTable& table, int variation) {
+void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIndex = 0) {
 
 	uint64_t itemCount = 10;
 	uint64_t iterationCount = itemCount * 10;
@@ -1165,10 +1169,11 @@ void testHashChurn2VarInner(AtomicHashTable& table, int variation) {
 		randomBytes((unsigned char*)randomChoices, (int)(iterationCount * sizeof(int16_t)), 0x7cdd44b);
 		randomBytes((unsigned char*)randomIndexes, (int)(iterationCount * sizeof(int64_t)), 0x7cdd44b);
 
+		uint64_t offset = itemCount * threadIndex;
 		for (uint64_t i = 0; i < itemCount; i++) {
-			items[i].a = i + 1;
-			items[i].b = i * 2;
-			items[i].c = i;
+			items[i].a = i + offset;
+			items[i].b = i + offset;
+			items[i].c = i + offset;
 		}
 	}
 	else {
@@ -1191,74 +1196,86 @@ void testHashChurn2VarInner(AtomicHashTable& table, int variation) {
 		if((decision >= 0 || itemsAdded.size() == 0) && itemsNotAdded.size() > 0) {
 			index = index % itemsNotAdded.size();
 			Item item = itemsNotAdded.at(index);
-			testAdd(table, item.a, item.b, item.c);
-			AssertEqual(testGetCount(table, item.a, item.b), 1);
-			AssertEqual(testGetSome(table, &item).c, item.c);
+			testAdd2(table, item.a, item.b, item.c);
+			AssertEqual(testGetCount2(table, item.a, item.b), 1);
+			AssertEqual(testGetSome2(table, item).c, item.c);
 			itemsNotAdded.erase(itemsNotAdded.begin() + index);
 			itemsAdded.push_back(item);
 		} else {
 			index = index % itemsAdded.size();
 			Item item = itemsAdded.at(index);
-			uint64_t count = testRemove(table, &item);
+			uint64_t count = testRemove2(table, item);
 
-			AssertEqual(count, 1);
+			// Count could be higher than 1, it just means we had to try a few times to remove it
+			if (count < 1) {
+				uint64_t count2 = testRemove2(table, item);
+				AssertEqual(true, false);
+			}
 
 			itemsAdded.erase(itemsAdded.begin() + index);
 			itemsNotAdded.push_back(item);
 		}
-		decision += randomChoices[i] / 256;
 
 		{
 			for (uint64_t j = 0; j < itemsAdded.size(); j++) {
 				Item item = itemsAdded.at(j);
-				AssertEqual(testGetCount(table, item.a, item.b), 1);
+				uint64_t count = testGetCount2(table, item.a, item.b);
+				if (count != 1) {
+					uint64_t count2 = testGetCount2(table, item.a, item.b);
+					breakpoint();
+					AssertEqual(count, 1);
+				}
 			}
 			for (uint64_t j = 0; j < itemsNotAdded.size(); j++) {
 				Item item = itemsNotAdded.at(j);
-				AssertEqual(testGetCount(table, item.a, item.b), 0);
+				uint64_t hash = getHash(item.a, item.b);
+				uint64_t count = testGetCount2(table, item.a, item.b);
+				if (count != 0) {
+					uint64_t count2 = testGetCount2(table, item.a, item.b);
+					breakpoint();
+					AssertEqual(testGetCount2(table, item.a, item.b), 0);
+				}
 			}
 		}
+		decision += randomChoices[i] / 256;
 	}
 
 	for(uint64_t i = 0; i < itemsAdded.size(); i++) {
 		Item item = itemsAdded.at(i);
-		AssertEqual(testGetCount(table, item.a, item.b), 1);
+		AssertEqual(testGetCount2(table, item.a, item.b), 1);
 	}
 
 	for(uint64_t i = 0; i < itemsAdded.size(); i++) {
 		Item item = itemsAdded.at(i);
-		uint64_t count = testRemove(table, &item);
-		AssertEqual(count, 1);
+		uint64_t count = testRemove2(table, item);
+		if (count < 1) {
+			AssertEqual(true, false);
+		}
 	}
 
 	
 }
 
 void testHashChurn2Var(int variation) {
-	AtomicHashTable table = { 0 };
+	AtomicHashTable2 table = AtomicHashTableDefault(sizeof(Item), deleteItem);
 
 	// Cause an allocation, to get the "empty, but has had data before" state (see the final zeroSnapshot check comment for why this matters)
-	testAdd(table, 1, 1, 1);
+	testAdd2(table, 1, 1, 1);
 	Item item = { 0 };
 	item.a = 1;
 	item.b = 1;
 	item.c = 1;
-	testRemove(table, &item);
+	testRemove2(table, item);
 
-	auto zeroSnapshot = GetSnapshot(table);
 
 	testHashChurn2VarInner(table, variation);
-
-	// So, the snapshot should be equal, with the only allocation the initial minimal allocation (this verifies that we deallocate down to
-	//	the minimum allocation... which may not be what we want, so if this starts failing... maybe just change this test...)
-	CompareSnapshot(zeroSnapshot);
 }
 
 DWORD threadedChurn(TableMultiThreadsContext* context) {
 	auto table = context->table;
 	auto variation = context->variation;
 
-	testHashChurn2VarInner(*table, variation);
+	testHashChurn2VarInner(*table, variation, context->threadIndex);
 
 	return 0;
 }
@@ -1271,22 +1288,6 @@ void testHashChurn2() {
 
 
 
-
-
-
-void runAtomicHashTableTest() {
-	testSizing();
-	/*
-	testHashLeaksRefs();
-	testHashChurn();
-	testHashChurn2();
-	*/
-
-	//testTableMultiThreads(4, 1, 1, threadedChurn);
-
-	//todonext
-	// Oh, test with multiple threads... obviously...
-}
 
 
 void benchmarkCompareExchanges() {
@@ -1587,6 +1588,23 @@ void runRefCountTests() {
 	WaitForAllThreads();
 
 	Timing_EndRootPrint(&rootTimer, totalCount * threadCount);
+}
+
+
+
+void runAtomicHashTableTest() {
+	// TODO: Add a debug wrapper for malloc and free, so we can track the number of allocations, and run tests to make sure we don't leak allocations.
+	testSizing();
+	//testHashChurn();
+	/*
+	testHashLeaksRefs();
+	testHashChurn2();
+	*/
+
+	//testTableMultiThreads(4, 0, 1, threadedChurn);
+
+	//todonext
+	// Oh, test with multiple threads... obviously...
 }
 
 int main() {

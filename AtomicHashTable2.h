@@ -10,7 +10,7 @@ extern "C" {
 typedef __declspec(align(16)) struct {
     // (our move code has hardcoded assumptions that this only contains AtomicUnits, so... keep it that way, or change the move code)
     //  (also, it depends on ref being first, and valueUniqueId being second)
-    OutsideReferenceAtomic ref;
+    OutsideReferenceAtomic valueRef;
 
     // This is a unique number created on insert of the value. This allows us to store duplicate values and then
     //  dedupe them before we return them, which allows inserts to be broken up into many transactions,
@@ -55,7 +55,14 @@ typedef __declspec(align(16)) struct {
 // Should be initialized as:
 //  AtomicHashTable2 table = AtomicHashTableDefault(VALUE_SIZE, void (*deleteValue)(void* value));
 
-#define AtomicHashTableDefault(VALUE_SIZE, deleteValue) { VALUE_SIZE, AtomicHashTableSlotSize(VALUE_SIZE), deleteValue, TransApplyDefault(), { AtomicHashTableSlotSize(VALUE_SIZE) + sizeof(InsideReference) }, { VALUE_SIZE } }
+#define AtomicHashTableDefault(VALUE_SIZE, deleteValue) { \
+    VALUE_SIZE,\
+    AtomicHashTableSlotSize(VALUE_SIZE), \
+    deleteValue, \
+    TransApplyDefault(), \
+    { sizeof(InsideReference) + AtomicHashTableSlotSize(VALUE_SIZE) }, \
+    { sizeof(InsideReference) + VALUE_SIZE } \
+}
 
 
 #pragma pack(push, 1)

@@ -38,6 +38,11 @@ bool transaction_applyWrite(
     InsideReference* sourceRef,
     InsideReference* destRef
 ) {
+    // ATTENTION! THIS FUNCTION HAS TO ENSURE ALL OPERATIONS ARE COMPLETED BEFORE IT RETURNS@
+    //  - This means if it doesn't see a new version, it has to keep going.
+    //  - This is essential, as this is relatively easy to ensure, and greatly simplifies and increases the speed of applying transactions
+    //      (also I think it provides some guarantees about progress being made or something).
+
     if(change->destUnits) {
         for(uint64_t i = 0; i < change->moveCount; i++) {
             AtomicUnit2 newUnit = { 0 };
@@ -62,13 +67,14 @@ bool transaction_applyWrite(
                 continue;
             }
 
-			// TODO: We can actually retry here if the change isn't a version change. This will let this code be a bit faster.
 			if (!InterlockedCompareExchangeStruct128(
 				pCurrent,
 				&current,
 				&newUnit
 			)) {
-				return true;
+				// We have to retry here, as if we return before applying all changes it will break other code...
+                i--;
+                continue;
 			}
         }
     }
@@ -87,6 +93,7 @@ bool transaction_applyWrite(
             if(change->sourceRefToMove) {
                 sourceRefToMove = Reference_Acquire(&change->sourceRefToMove->ref);
                 if(!sourceRefToMove) {
+                    breakpoint();
                     // Value has been deleted (but a transaction could move and then delete something, so we have to still continue,
                     //  it is just that this change is done)
                     return false;
@@ -97,7 +104,10 @@ bool transaction_applyWrite(
 
             if(!InterlockedCompareExchangeStruct128(change->destRefToMove, &currentRefToMove, &newRefToMove)) {
                 if(sourceRefToMove) {
-                    Reference_DestroyOutside(&newRefToMove.ref, sourceRefToMove);
+					// Acquiring this should never fail, it is a thread local outside ref (because the swap failed).
+					InsideReference* tempNewRef = Reference_Acquire(&newRefToMove.ref);
+                    Reference_DestroyOutside(&newRefToMove.ref, tempNewRef);
+					Reference_Release(&newRefToMove.ref, tempNewRef, false);
                 }
             } else {
                 // else the outside reference is now in the dest, and so is alive, in shared memory
@@ -106,14 +116,12 @@ bool transaction_applyWrite(
                 InsideReference* prevRef = Reference_Acquire(&currentRefToMove.ref);
                 if(prevRef) {
                     Reference_DestroyOutside(&currentRefToMove.ref, prevRef);
-                    Reference_Release(nullptr, prevRef, false);
+                    Reference_Release(&currentRefToMove.ref, prevRef, false);
                 }
             }
             
             if(sourceRefToMove) {
-                // We can't release from newRefToMove, as it has been forcefully moved to new memory, and so
-                //  its count no longer means anything.
-                Reference_Release(nullptr, sourceRefToMove, false);
+                Reference_Release(&change->sourceRefToMove->ref, sourceRefToMove, false);
             }
         }
     }
@@ -151,16 +159,16 @@ void transaction_applyWrites(TransApply* trans, Trans* transaction) {
         );
 
         if(sourceRef) {
+            Reference_DestroyOutside(&change->sourceRef, sourceRef);
             if(Reference_Release(&change->sourceRef, sourceRef, true)) {
                 MemoryPool_Free(change->sourceRefMemPool, sourceRef);
             }
-            Reference_DestroyOutside(&change->sourceRef, sourceRef);
         }
         if(destRef) {
+            Reference_DestroyOutside(&change->destRef, destRef);
             if(Reference_Release(&change->destRef, destRef, true)) {
                 MemoryPool_Free(change->destRefMemPool, destRef);
             }
-            Reference_DestroyOutside(&change->destRef, destRef);
         }
 
         if(newVersionSeen) {

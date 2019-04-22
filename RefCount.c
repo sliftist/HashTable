@@ -30,6 +30,11 @@ bool IsInsideRefCorruptInner(InsideReference ref, InsideReference* pRef) {
 		OnError(3);
 		return true;
 	}
+    if (ref.pointer == (void*)0xdddddddddddddddd) {
+        // Probably freed memory
+        OnError(3);
+        return true;
+    }
 	if (ref.count <= 0) {
 		// Something decremented our ref count more times than it held it... this is invalid...
 		//  Our outside references should store at least once reference, and if not the caller should have
@@ -61,13 +66,17 @@ bool IsOutsideRefCorruptInner(OutsideReference ref) {
 }
 
 
-void Reference_Allocate(uint64_t size, OutsideReference* outRef, void** outPointer) {
+void Reference_AllocateInner(uint64_t size, OutsideReference* outRef, void** outPointer, const char* file, int line) {
     InsideReference* insideRef = malloc(size + sizeof(InsideReference));
     if(!insideRef) {
         OnError(2);
         *outPointer = nullptr;
         return;
     }
+
+    file;
+    line;
+    //printf("Allocate %p, %s:%d\n", insideRef, file, line);
     
     Reference_RecycleAllocate(insideRef, size, outRef, outPointer);
 }
@@ -97,6 +106,7 @@ InsideReference* Reference_Acquire(OutsideReference* pRef) {
         }
         OutsideReference ref;
         ref.value = InterlockedAdd64((LONG64*)pRef, 1ll << BITS_IN_ADDRESS_SPACE);
+
         #ifdef DEBUG
         // Getting a reference to a nullptr can happen, but it is fine, we can just ignore it. It won't happen
         //  enough to overrun the ref count, as only threads that have seen it have a value one will try this,
@@ -129,10 +139,12 @@ InsideReference* Reference_Acquire(OutsideReference* pRef) {
     }
 }
 
-bool releaseInsideReference(InsideReference* insideRef, bool dontFree) {
+bool releaseInsideReference(InsideReference* insideRef, bool dontFree, const char* file, int line, OutsideReference* outsideRef) {
     if(IsInsideRefCorrupt(*insideRef, insideRef)) return false;
 
     LONG64 decrementResult = InterlockedDecrement64((LONG64*)&insideRef->count);
+
+    //printf("release outside %p, inside %p, %s:%d\n", outsideRef, insideRef, file, line);
 
     if(decrementResult == 0) {
         // This means our OutsideReference must be gone, and in fact all ourside references are gone... and
@@ -141,13 +153,16 @@ bool releaseInsideReference(InsideReference* insideRef, bool dontFree) {
         //  is an argument, so it is thread safe, and the actual pointer we want to free)
         if(!dontFree) {
             free(insideRef);
+            file;
+            line;
+            //printf("free %p, %s:%d\n", insideRef, file, line);
         }
         return true;
     }
     return false;
 }
 
-bool Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef, bool dontFree) {
+bool Reference_ReleaseInner(OutsideReference* outsideRef, InsideReference* insideRef, bool dontFree, const char* file, int line) {
     if(!insideRef) {
         // This saves our cleanup code constantly null checking insideRef. Instead it can just unconditional
         //  release it, we we can null check it.
@@ -193,11 +208,11 @@ bool Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef,
     //  (while new references may be added to the outside reference, and it may be reused with the same pointer,
     //      meaning it is possible to retry to use the outside reference, we should always be able to dereference
     //      from the inside reference, as our reference had to go somewhere if it wasn't in the outside ref...)
-    return releaseInsideReference(insideRef, dontFree);
+    return releaseInsideReference(insideRef, dontFree, file, line, outsideRef);
 }
 
 
-bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
+bool Reference_DestroyOutsideInner(OutsideReference* pOutsideRef, InsideReference* pInsideRef, const char* file, int line) {
     // First move the references from outside ref to inside ref (causing them to be duplicated for a bit)
     //  (and which if removing from the outside ref fails may require removing from the inside ref)
     // Then try to make the outside ref wiped out
@@ -206,7 +221,10 @@ bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pI
 	//	combine the new changes with undoing the previous changes, which makes this more efficient (for retries).
 	int64_t insideRefDelta = 0;
 
+    int loops = 0;
+
     while(true) {
+        loops++;
 		OutsideReference outsideRef = *pOutsideRef;
 
         if(IsOutsideRefCorrupt(outsideRef)) return false;
@@ -227,7 +245,7 @@ bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pI
         }
 
 
-        // Now try to remove from outside ref. If we fail... we have to go fix insideRef before we retry
+        // Now try to remove from outside ref. If we fail... we have to go fix insideRef before we retry again
         OutsideReference outsideRefOriginal = outsideRef;
         outsideRef.count = 0;
         outsideRef.pointerClipped = nullptr;
@@ -240,9 +258,21 @@ bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pI
 
         // Now that the outside ref is atomically gone, we can remove the outside's own ref to the inside ref
         //  (this is NOT the reference the caller has, this is the outside reference's own ref, completely different)
-        if(releaseInsideReference(pInsideRef, nullptr)) {
+        if(releaseInsideReference(pInsideRef, nullptr, __FILE__, __LINE__, pOutsideRef)) {
             // If our reference's own reference was the last reference, that means the caller lied about
             //  having a reference, and bad stuff is going to happen...
+            OnError(3);
+        }
+        if(loops > 1) {
+            //printf("MULTIPLE LOOPS!!!! loops %d\n", loops);
+        }
+        //printf("moved %lld to inside from %p to %p, %s:%d\n", amountAdded, pOutsideRef, pInsideRef, file, line);
+        if(loops == 1 && amountAdded == 0) {
+            // (loops == 1 because retries will mess up amountAdded. We can check if loops > 1, it just takes more code,
+            //      and this case should cover it anyway...)
+            // This is actually invalid. You have to gain a reference via the outside reference to release it.
+            //  We checked to make sure your reference was for the outside reference, but if it has no references,
+            //  you must have obtained your reference via a different outside reference, which is bad.
             OnError(3);
         }
         return true;
@@ -274,13 +304,15 @@ bool Reference_SetOutside(OutsideReference* pOutsideRef, InsideReference* pInsid
         // So, going from {0, 0} to {0, pInsideRef}
         if(!XchgOutsideReference(pOutsideRef, &outsideRefOriginal, &outsideRef)) {
             // Failure means it is already being used. So, undo our inside ref increment, and abort
-            if(releaseInsideReference(pInsideRef, nullptr)) {
+            if(releaseInsideReference(pInsideRef, nullptr, __FILE__, __LINE__, pOutsideRef)) {
                 // If our reference's own reference was the last reference, that means the caller lied about
                 //  having a reference, and bad stuff is going to happen...
                 OnError(3);
             }
             return false;
         }
+
+        //printf("set outside %p from inside %p\n", pOutsideRef, pInsideRef);
         return true;
     }
     return false;

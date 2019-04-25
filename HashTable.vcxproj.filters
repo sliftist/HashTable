@@ -57,10 +57,10 @@
     <ClCompile Include="AtomicHashTable2.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="MemoryPool.c">
+    <ClCompile Include="bittricks.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="bittricks.c">
+    <ClCompile Include="MemPool.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -105,6 +105,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="bittricks.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MemPool.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

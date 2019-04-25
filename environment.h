@@ -2,11 +2,17 @@
 
 #define CASSERT(predicate) typedef char C_STATIC_ASSERT_blah [2*!!(predicate)-1];
 
+#if !defined(NDEBUG) && defined(_DEBUG)
+#define DEBUG
+#endif
+
 #ifdef _MSC_VER
 #define breakpoint() __debugbreak()
+#define WINDOWS
 #else
 #define breakpoint() asm("int $3")
 #endif
+
 
 #ifdef KERNEL
 

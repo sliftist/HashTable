@@ -1,6 +1,7 @@
 #pragma once
 
 #include "environment.h"
+#include "MemPool.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,26 +38,22 @@ extern "C" {
 
 #define BITS_IN_ADDRESS_SPACE 48
 
-#pragma pack(push, 1)
-typedef struct {
-    uint64_t pointerClipped : BITS_IN_ADDRESS_SPACE;
-	uint64_t value : 64 - BITS_IN_ADDRESS_SPACE;
-} PackedPointer;
-#pragma pack(pop)
+struct InsideReference;
+typedef struct InsideReference InsideReference;
+#define InsideReferenceSize 32
 
-// If the highest bit in the address space is set, then we have to set all the high bits. Otherwise bit fields does the rest for us.
-//  (and all other fields can just be get/set via the bitfield)
-#define PACKED_POINTER_GET_POINTER(p) (((p).pointerClipped & (1ull << (BITS_IN_ADDRESS_SPACE - 1))) ? ((p).pointerClipped | 0xFFFF000000000000ull) : (p).pointerClipped)
+todonext;
+// Oh... I've been comparing pointers directly to pointerClipped. I can't do this, I have to mask
+//  the pointer first, via a macro, so the windows kernel can mask out the high bits.
 
-
-// When InsideReference reaches a count of 0, it should be freed (as this means nothing knows about it,
-//  and so if we don't free it now it will leak).
-#pragma pack(push, 1)
-typedef struct {
-    void* pointer;
-	uint64_t count;
-} InsideReference;
-#pragma pack(pop)
+// Creats an expression to fast check a reference and a pointer. May fail due to redirect though,
+//  so this should only be used in retry loops that call Reference_Acquire and Reference_GetValue
+//  on the value anyway.
+#if defined(WINDOWS) && defined(KERNEL)
+#define FAST_CHECK_POINTER(outsideRef, insideRef) ((outsideRef).pointerClipped == ((uint64_t)(insideRef) & ((1ll << BITS_IN_ADDRESS_SPACE) - 1)))
+#else
+#define FAST_CHECK_POINTER(outsideRef, insideRef) ((outsideRef).pointerClipped == ((uint64_t)(insideRef)))
+#endif
 
 
 // OutsideReferences can have a count of 0, the count simply refers to the number of references not yet moved
@@ -70,14 +67,22 @@ typedef struct {
 typedef struct {
     union {
         struct {
+            
             uint64_t pointerClipped : BITS_IN_ADDRESS_SPACE;
-            uint64_t count : 64 - BITS_IN_ADDRESS_SPACE;
+            uint64_t count : 64 - BITS_IN_ADDRESS_SPACE - 1;
+            // Special metadata flag, for use if you need an extra metadata bit, and don't want to exceed 64 bits.
+            uint64_t isNull : 1;
         };
-        uint64_t value;
+        uint64_t valueForSet;
     };
 } OutsideReference;
 #pragma pack(pop)
 CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
+
+OutsideReference GetNextNULL();
+void* Reference_GetValue(InsideReference* ref);
+
+bool Reference_HasBeenRedirected(InsideReference* ref);
 
 
 // Of course the memory OutsideReference is stored in must be guaranteed to exist, however reuse of the memory for other
@@ -85,11 +90,18 @@ CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
 
 // (May set outPointer to nullptr if the allocation fails)
 //void Reference_Allocate(uint64_t size, OutsideReference* outRef, void** outPointer);
-#define Reference_Allocate(size, outRef, outPointer) Reference_AllocateInner(size, outRef, outPointer, __FILE__, __LINE__)
-void Reference_AllocateInner(uint64_t size, OutsideReference* outRef, void** outPointer, const char* file, int line);
+void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPointer, uint64_t size, uint64_t hash);
 
-// The emptyAllocation must be size + sizeof(InsideReference)
-void Reference_RecycleAllocate(void* emptyAllocation, uint64_t size, OutsideReference* outRef, void** outPointer);
+// Makes it so future Reference_Acquire calls that would return oldRef now return newRef (for all OutsideReferences).
+// Returns true on success, or false if it has already been redirected.
+bool Reference_RedirectReference(
+    // Must be acquired first
+    // If already redirected, fails and returns false.
+    InsideReference* oldRef,
+    // Must be allocated normally, and having the value, pool, etc, set as desired.
+    //  This must be exclusive to this thread.
+    InsideReference* newRef
+);
 
 
 // pointer should be directly used inside of InsideReference. The only reason a raw pointer isn't returned is
@@ -100,24 +112,16 @@ void Reference_RecycleAllocate(void* emptyAllocation, uint64_t size, OutsideRefe
 //  its pointer is always valid, so does not need to be null checked).
 InsideReference* Reference_Acquire(OutsideReference* ref);
 
-// Outside reference may be knowingly wiped out, we will just ignore it and then
-//  release the inside reference.
-// If dontFree, and this is the last reference, then we don't free it.
-// Returns true if this was the last reference (so if dontFree is passed, it is up to the caller
-//  to call free on insideRef).
-//bool Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef, bool dontFree);
-#define Reference_Release(outsideRef, insideRef, dontFree) Reference_ReleaseInner(outsideRef, insideRef, dontFree, __FILE__, __LINE__)
-bool Reference_ReleaseInner(OutsideReference* outsideRef, InsideReference* insideRef, bool dontFree, const char* file, int line);
-
+// Outside reference may be knowingly wiped out, we will just ignore it and then release the inside reference.
+//  Always pass an outsideRef, even if you know it has been wiped out.
+void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef);
 
 
 // Destroys this outside ref to the inside ref (which if it is the last outside ref, and there are no more inside references, will result
 //  in the inside ref being freed).
 // Must have an inside reference to be called, but does not free inside reference
 //  returns true on success
-//bool Reference_DestroyOutside(OutsideReference* outsideRef, InsideReference* insideRef);
-#define Reference_DestroyOutside(outsideRef, insideRef) Reference_DestroyOutsideInner(outsideRef, insideRef, __FILE__, __LINE__)
-bool Reference_DestroyOutsideInner(OutsideReference* outsideRef, InsideReference* insideRef, const char* file, int line);
+bool Reference_DestroyOutside(OutsideReference* outsideRef, InsideReference* insideRef);
 
 
 // dest must be zeroed out, OR previously an outside ref destroyed by DestroyReference

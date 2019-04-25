@@ -7,8 +7,6 @@
 
 // (sizeof(InsideReference) because our tracked allocations are this much smaller)
 
-#define getSlotSize(hashTable) (hashTable)->SLOT_SIZE
-
 // Means when we add more bits, overlaps stay as neighbors (which is a useful property when resizing)
 #define getSlotBaseIndex(alloc, hash) ((hash) >> (64 - (alloc)->logSlotsCount))
 
@@ -17,14 +15,20 @@ uint64_t log2RoundDown(uint64_t v) {
 	return log2(v * 2) - 1;
 }
 
+#define SIZE_PER_COUNT(table) (table->HASH_VALUE_SIZE + InsideReferenceSize + MemPoolHashed_VALUE_OVERHEAD + sizeof(AtomicSlot))
+
 uint64_t minSlotCount(AtomicHashTable2* this) {
-    uint64_t slotSize = getSlotSize(this);
-    uint64_t minCount = (PAGE_SIZE - (sizeof(AtomicHashTableBase) - sizeof(byte*)) - sizeof(InsideReference)) / slotSize;
+    uint64_t sizePerCount = SIZE_PER_COUNT(this);
+    
+    uint64_t minCount = (PAGE_SIZE - sizeof(AtomicHashTableBase) - InsideReferenceSize - sizeof(MemPoolHashed)) / sizePerCount;
 
     // Must be a power of 2, for getSlotBaseIndex
     minCount = 1ll << log2RoundDown(minCount);
 
     return minCount;
+}
+uint64_t getTableSize(AtomicHashTable2* this, uint64_t slotCount) {
+    uint64_t tableSize = SIZE_PER_COUNT(this) * slotCount;
 }
 
 
@@ -48,356 +52,323 @@ uint64_t newGrowSize(AtomicHashTable2* this, uint64_t slotCount, uint64_t fillCo
 
 int atomicHashTable2_getVersion(AtomicHashTable2* this, uint64_t* versionOut);
 
+todonext
+// Destroys newOperation if it can't add it (because of an error, or because the version changed)
+//  (and if it adds it takes ownership of newOperation).
+int atomicHashTable2_runOperation(AtomicHashTable2* this, uint64_t* versionOut, OutsideReference newOperation);
+
+
+void destroyUniqueOutsideRef(OutsideReference* ref)  {
+    void* temp = Reference_Acquire(&ref);
+    Reference_DestroyOutside(&ref, temp);
+    Reference_Release(&ref, temp);
+    ref->valueForSet = 0;
+}
+
+void atomicHashTable2_memPoolFreeCallback(AtomicHashTable2* this, InsideReference* ref) {
+    if(!Reference_HasBeenRedirected(ref)) {
+        // And if it hasn't, it never will be, as the free callback is only called when all outside and inside references are gone...
+        void* userValue = (byte*)ref + sizeof(InsideReference) + sizeof(HashValue);
+        this->deleteValue(userValue);
+    }
+}
+
+
 // Not to be called in a retry loop, as it runs its own (but it still may return errors)
 //  (also pVersion is an out, so don't get a version before you call this)
+// The value it returns is a value with all moves applied, so if the version doesn't change, no moves have happened.
+//  (does not return 1)
 int atomicHashTable2_updateReservedCount(AtomicHashTable2* this, uint64_t* pVersion, uint64_t delta) {
-    uint64_t slotsReserved = InterlockedAdd64((LONG64*)&this->slotsReserved, (LONG64)delta);
+    InterlockedAdd64((LONG64*)&this->slotsReserved, (LONG64)delta);
 
     while(true) {
         RETURN_ON_ERROR(atomicHashTable2_getVersion(this, pVersion));
-        InsideReference* curAllocRef = Reference_Acquire(&this->currentAllocation.ref);
-        AtomicHashTableBase* curTable = curAllocRef ? curAllocRef->pointer : nullptr;
+
+        InsideReference* curAllocRef = Reference_Acquire(&this->state.currentAllocation);
+        AtomicHashTableBase* curTable = curAllocRef ? Reference_GetValue(curAllocRef) : nullptr;
+
+        uint64_t slotsReserved = this->slotsReserved;
 
         uint64_t newSlotCount = 0;
         uint64_t curSlotCount = curTable ? curTable->slotsCount : 0;
         newSlotCount = newShrinkSize(this, curSlotCount, slotsReserved);
         newSlotCount = newSlotCount ? newSlotCount : newGrowSize(this, curSlotCount, slotsReserved);
 
-        Reference_Release(&this->currentAllocation.ref, curAllocRef, false);
-
-		if (!newSlotCount) {
-			return 0;
-		}
-
-        Trans transaction = { 0 };
-        TransChange emptyChange = { 0 };
-        TransChange change = { 0 };
-
-        change.moveCount = 1;
-        change.sourceUnits = 0;
-        change.destUnits = &this->nextMoveSlot;
-        transaction.changes[transaction.changeCount++] = change;
-
-        change = emptyChange;
-        change.moveCount = 1;
-        change.sourceUnits = 0;
-        change.destUnits = &this->nextDestSlot;
-        transaction.changes[transaction.changeCount++] = change;
-
-        
-        AtomicHashTableBase* newTable = nullptr;
-        // Reference_Allocate memsets allocations to 0
-        Reference_Allocate(
-            newSlotCount * getSlotSize(this) + sizeof(AtomicHashTableBase) - sizeof(byte*),
-            &change.sourceRef,
-            &newTable
-        );
-        if(!newTable) {
-            // Allocation failed
-            OnError(2);
-            return 2;
+        if(!newSlotCount) {
+            return 0;
         }
 
-        OutsideReference newTableRef = { 0 };
-        InsideReference* newTableInsideRef = Reference_Acquire(&change.sourceRef);
-        Reference_SetOutside(&newTableRef, newTableInsideRef);
-        Reference_Release(&change.sourceRef, newTableInsideRef, false);
+        // Create and prepare the new allocation
+        OutsideReference newAllocation;
+        AtomicHashTableBase* newTable;
+        uint64_t tableSize = getTableSize(this, newSlotCount);
+        Reference_Allocate(&memPoolSystem, &newAllocation, newTable, tableSize);
+        if(!newTable) {
+            Reference_Release(&this->state.currentAllocation, curAllocRef);
+            return 3;
+        }
 
-        
         newTable->slotsCount = newSlotCount;
         newTable->logSlotsCount = log2(newSlotCount);
+        newTable->slots = (void*)((byte*)newTable + sizeof(AtomicHashTableBase));
+        newTable->valuePool = (void*)((byte*)newTable->slots + sizeof(AtomicSlot) * newSlotCount);
 
-        change = emptyChange;
-        change.moveCount = 1;
-        change.sourceConstValue = newTableRef.value;
-        change.destUnits = (AtomicUnit2*)&this->newAllocation;
-        transaction.changes[transaction.changeCount++] = change;
+        for(uint64_t i = 0; i < newSlotCount; i++) {
+            newTable->slots[i].value = GetNextNull();
+        }
 
-        
-        int result = TransApply_Run(&this->transaction, *pVersion, transaction);
-        if(result == 1) continue;
+        MemPoolHashed pool = MemPoolHashedDefault(this->VALUE_SIZE, newSlotCount, newAllocation, this, atomicHashTable2_memPoolFreeCallback);
+        *newTable->valuePool = pool;
+
+        OutsideReference newOperation = { 0 };
+        Operation* operation = nullptr;
+
+        Reference_Allocate(&this->operationPool, &newOperation, &operation, sizeof(Operation), 0);
+        if(!operation) {
+            Reference_Release(&this->state.currentAllocation, curAllocRef);
+            destroyUniqueOutsideRef(&newAllocation);
+            return 3;
+        }
+
+        operation->type = 1;
+        operation->newAllocation = newAllocation;
+        operation->moveState.destSlot = GetNextNull();
+
+        //int atomicHashTable2_runOperation(AtomicHashTable2* this, uint64_t* versionOut, OutsideReference newOperation);
+        int result = atomicHashTable2_runOperation(this, pVersion, newOperation);
+
+        Reference_Release(&this->state.currentAllocation, curAllocRef);
+
+        if(result != 0) {
+            destroyUniqueOutsideRef(&newAllocation);
+        }
+        if(result == 1) {
+            continue;
+        }
         return result;
     }
 }
 
-int atomicHashTable2_applyMoveInner(
+
+int atomicHashTable2_applyMoveTableOperationInner(
     AtomicHashTable2* this,
-    uint64_t version,
-    InsideReference* newAllocRef,
-    AtomicHashTableBase* newAlloc,
-    InsideReference* curAllocRef,
-    AtomicHashTableBase* curAlloc
+    OperationRef* operationRef,
+    Operation* operation,
+    AtomicHashTableBase* curAlloc,
+    AtomicHashTableBase* newAlloc
 ) {
-    //printf("applying move %llu to %llu\n", curAlloc ? curAlloc->slotsCount : 0, newAlloc->slotsCount);
-    uint64_t nextMoveSlotIndex = this->nextMoveSlot.value;
+    uint64_t HASH_VALUE_SIZE = this->HASH_VALUE_SIZE;
+    uint64_t VALUE_SIZE = this->VALUE_SIZE;
 
-    uint64_t slotSize = getSlotSize(this);
-    while(curAlloc && nextMoveSlotIndex < curAlloc->slotsCount) {
-        
-        Trans transaction = { 0 };
-        TransChange emptyChange = { 0 };
-        TransChange change = { 0 };
+    bool growing = newAlloc->slotsCount > curAlloc->slotsCount;
 
-        AtomicSlot* slotSource = (AtomicSlot*)&(&curAlloc->slots)[nextMoveSlotIndex * slotSize];
-        if(slotSource->valueUniqueId.value > 1) {
-            uint64_t destSlotIndex = getSlotBaseIndex(newAlloc, slotSource->hash.value);
-            if(destSlotIndex < this->nextDestSlot.value) {
-                destSlotIndex = this->nextDestSlot.value;
-            }
-            uint64_t realDestSlotIndex = destSlotIndex;
-            // Logic to deal with shrinking tables having collisions at the end, which force them to wrap around.
-            if(destSlotIndex >= newAlloc->slotsCount) {
-                realDestSlotIndex = realDestSlotIndex % newAlloc->slotsCount;
-                while(((AtomicSlot*)&(&newAlloc->slots)[realDestSlotIndex * slotSize])->valueUniqueId.value > 1) {
-                    realDestSlotIndex++;
-					nextMoveSlotIndex++;
-                }
-            }
-            AtomicSlot* slotDest = (AtomicSlot*)&(&newAlloc->slots)[realDestSlotIndex * slotSize];
-
-            Reference_SetOutside(&change.sourceRef, curAllocRef);
-            Reference_SetOutside(&change.destRef, newAllocRef);
-
-            change.sourceRefToMove = &slotSource->valueRef;
-            change.destRefToMove = &slotDest->valueRef;
-
-            // Move all the data in one big move (not really faster, we still have to iterate through it in TransApply, but it is easier)
-            //  (except sourceRefToMove, which we move independently to allow references to be added without transactions)
-            change.moveCount = slotSize / sizeof(AtomicUnit2) - 1;
-            change.sourceUnits = &slotSource->valueUniqueId;
-            change.destUnits = &slotDest->valueUniqueId;
-
-            transaction.changes[transaction.changeCount++] = change;
-
-			if (destSlotIndex >= this->nextDestSlot.value) {
-				change = emptyChange;
-				change.moveCount = 1;
-				change.sourceConstValue = destSlotIndex + 1;
-				change.destUnits = &this->nextDestSlot;
-				transaction.changes[transaction.changeCount++] = change;
-			}
-        }
-
-        change = emptyChange;
-        nextMoveSlotIndex++;
-        change.moveCount = 1;
-        change.sourceConstValue = nextMoveSlotIndex;
-        change.destUnits = &this->nextMoveSlot;
-        transaction.changes[transaction.changeCount++] = change;
-
-
-        RETURN_ON_ERROR(TransApply_Run(&this->transaction, version, transaction));
-		
-		version = TransApply_GetVersion(&this->transaction);
-		if (this->newAllocation.ref.pointerClipped != (uint64_t)newAllocRef) {
-			return 1;
-		}
-		nextMoveSlotIndex = this->nextMoveSlot.value;
-    }
-
-    // Finish up the move
-    {
-        Trans transaction = { 0 };
-        TransChange emptyChange = { 0 };
-        TransChange change = { 0 };
-
-        // Must do this seperately, as refs are moved last, so if we wipe out newAllocation first we won't be able to move it...
-        change.moveCount = 0;
-        change.sourceRefToMove = &this->newAllocation;
-        change.destRefToMove = &this->currentAllocation;
-        transaction.changes[transaction.changeCount++] = change;
-
-        change = emptyChange;
-        change.moveCount = 1;
-        change.sourceUnits = nullptr;
-        change.destUnits = (AtomicUnit2*)&this->newAllocation;
-        transaction.changes[transaction.changeCount++] = change;
-
-        return TransApply_Run(&this->transaction, version, transaction);
-    }
-}
-int atomicHashTable2_applyMove(AtomicHashTable2* this, uint64_t version) {
-    // This check is an optimization
-    if(!this->newAllocation.ref.pointerClipped) {
-        return 0;
-    }
-    
-    InsideReference* newAllocRef = Reference_Acquire(&this->newAllocation.ref);
-    AtomicHashTableBase* newAlloc = newAllocRef ? newAllocRef->pointer : nullptr;
-    if(!newAllocRef) {
+    MoveStateInner moveState = operation->moveState;
+    // Ensure we atomically read 128 bits.
+    if(!EqualsStruct128(&moveState, &operation->moveState)) {
         return 1;
     }
-    InsideReference* curAllocRef = Reference_Acquire(&this->currentAllocation.ref);
-    AtomicHashTableBase* curAlloc = curAllocRef ? curAllocRef->pointer : nullptr;
 
-    int result = atomicHashTable2_applyMoveInner(this, version, newAllocRef, newAlloc, curAllocRef, curAlloc);
+    while(true) {
+        // Finish the move
+        if(!curAlloc || moveState.nextSourceSlot == curAlloc->slotsCount) {
+            TransactionState transaction = this->state;
+            if(
+                !EqualsStruct128(&transaction, &this->state)
+                ||
+                !FAST_CHECK_POINTER(transaction.currentOperation, operationRef)
+            ) {
+                return 1;
+            }
+            // Atomically moves the outside reference from newAllocation to curAlloc,
+            //  and finishes the operation.
+            TransactionState newTransaction = { operation->newAllocation, GetNextNULL() };
+            if(InterlockedCompareExchangeStruct128(&this->state, &transaction, &newTransaction)) {
+                // curAlloc has been atomically removed from the hash table, so we inform the real owner of that
+                //  reference that at least we no longer need it (but if it has outstanding allocations it will
+                //  hang onto the reference until those are freed).
+                MemPoolHashed_Destruct(&curAlloc->valuePool);
+            }
+            return 1;
+        }
 
-    Reference_Release(&this->newAllocation.ref, newAllocRef, false);
-    Reference_Release(&this->currentAllocation.ref, curAllocRef, false);
+        AtomicSlot* sourceSlot = &curAlloc->slots[moveState.nextSourceSlot];
+        uint32_t sourceSlot = moveState.nextSourceSlot;
+        int32_t destOffset = moveState.destOffset;
+        
+        uint64_t destIndex = ((growing ? moveState.nextSourceSlot * 2 : moveState.nextSourceSlot / 2) + destOffset) % newAlloc->slotsCount;
 
+        OutsideReference newValueRef = { 0 };
+        InsideReference* newValueRefInside = Reference_Acquire(&sourceSlot->value);
+        
+        if(newValueRef) {
+            
+            if(!MemPoolHashed_IsInPool(&curAlloc->valuePool, newValueRefInside)) {
+                // If it ISN'T in the pool, then it must have been already moved, so... there's no point in calling redirect
+                Reference_SetOutside(&newValueRef, newValueRefInside);
+            } else {
+                HashValue* sourceValue = Reference_GetValue(newValueRefInside);
+                if(sourceValue->deleted) {
+                    Reference_Release(&sourceSlot->value, newValueRefInside);
+                }
+                else {
+                    uint64_t hash = sourceValue->hash;
+
+                    HashValue* newValue = nullptr;
+                    Reference_Allocate(newAlloc->valuePool, &newValueRef, &newValue, HASH_VALUE_SIZE, hash);
+                    if(!newValue) {
+                        Reference_Release(&sourceSlot->value, valueRef);
+                        return 3;
+                    }
+
+                    destIndex = ((int32_t)getSlotBaseIndex(newAlloc, hash) + destOffset) % newAlloc->slotsCount;
+                    newValue->hash = hash;
+                    // The delete flag is set in the transaction, so we don't need to worry about this
+                    //  copy being atomic. If the delete flag changes our transaction version will change.
+                    memcpy(
+                        (byte*)newValue + sizeof(HashValue),
+                        (byte*)sourceValue + sizeof(HashValue),
+                        VALUE_SIZE
+                    );
+
+                    InsideReference* newValueInsideRef = Reference_Acquire(&newValueRef);
+
+                    bool redirected = Reference_RedirectReference(
+                        newValueRefInside,
+                        newValueInsideRef
+                    );
+                    if(!redirected) {
+                        Reference_DestroyOutside(&newValueRef, newValueInsideRef);
+                        Reference_Release(&newValueRef, newValueInsideRef);
+                        continue;
+                    }
+
+                    newValueRefInside = newValueInsideRef;
+                }
+            }
+        }
+
+        
+
+        AtomicSlot* destSlot = &newAllocation->slots[destIndex];
+
+        OutsideReference destValueRef = moveState.destSlot;
+        MoveStateInner newMoveState;
+        if(destValueRef.valueForSet == 0) {
+            destValueRef = destSlot->value;
+            newMoveState = moveState;
+            newMoveState.destSlot = sourceValueRef;
+            if(!InterlockedCompareExchangeStruct128(&operation->moveState, &moveState, &newMoveState)) {
+                Reference_DestroyOutside(&newValueRef, newValueRefInside);
+                Reference_Release(&newValueRef, newValueRefInside);
+                return 1;
+            }
+            moveState = newMoveState;
+        }
+
+        // After this swap works our outside reference is now in the destination.
+        int swapFailed = InterlockedCompareExchange64(
+            (LONG64*)&newAllocation->slots[destIndex].value
+            newValueRef.valueForSet,
+            destValueRef.valueForSet
+        ) != destValueRef.valueForSet;
+
+        if(swapFailed) {
+            Reference_DestroyOutside(&newValueRef, newValueRefInside);
+            Reference_Release(&newValueRef, newValueRefInside);
+            return 1;
+        }
+
+        if(growing) {
+            destOffset = max(0, destOffset - 2);
+        } else if(sourceSlot % 2) {
+            destOffset = max(0, destOffset - 1);
+        }
+
+        newMoveState = moveState;
+        newMoveState.nextSourceSlot++;
+        newMoveState.destOffset = destOffset;
+        newMoveState.destSlot = 0;
+
+        if(!InterlockedCompareExchangeStruct128(&operation->moveState, &moveState, &newMoveState)) {
+            Reference_Release(&newValueRef, newValueRefInside);
+            return 1;
+        }
+
+
+        // Destroy the source reference, so the mem pool can reclaim it (and because we redirected to the new pool,
+        //  all the memory stays intact, meaning we have atomically moved it to the new pool, so the destruct callback
+        //  won't be called multiple time, even if there are outstanding references to it in hanging finds, etc - 
+        //  although, hanging finds WILL prevent the destruct callback from being called in the first place).
+        {
+            InsideReference* sourceSlotRef = Reference_Acquire(&sourceSlot->value);
+            Reference_DestroyOutside(&sourceSlot->value, sourceSlotRef);
+            Reference_Release(&sourceSlot->value, sourceSlotRef);
+        }
+
+        Reference_Release(&newValueRef, valueRef);
+        moveState = newMoveState;
+    }
+
+    
+    
+}
+int atomicHashTable2_applyMoveTableOperation(AtomicHashTable2* this, OperationRef* operationRef, Operation* operation, AtomicHashTableBase* currentAllocation) {
+    InsideReference* newAllocationRef = Reference_Acquire(&operation->newAllocation);
+    if(!newAllocationRef) {
+        return 1;
+    }
+    AtomicHashTableBase* newAllocation = Reference_GetValue(newAllocationRef);
+    
+    int result = atomicHashTable2_applyMoveTableOperationInner(this, operationRef, operation, currentAllocation, newAllocation);
+    Reference_Release(&operation->newAllocation, newAllocationRef);
     return result;
+}
+int atomicHashTable2_applyRemoveEntryOperation(Operation* operation) {
+    todonext
+    // This 
 }
 
 // TransApply_FastGetVersion
 // Returns the version, or 0 if atomicHashTable2_getVersion must be called instead
 uint64_t atomicHashTable2_fastGetVersion(AtomicHashTable2* this) {
-    if(this->newAllocation.ref.pointerClipped) {
-        return 0;
-    }
-    return TransApply_FastGetVersion(&this->transaction);
-}
-
-int atomicHashTable2_getVersion(AtomicHashTable2* this, uint64_t* versionOut) {
-    while(true) {
-        // This also applies any pending transactions, which is nice...
-        uint64_t version = TransApply_GetVersion(&this->transaction);
-        *versionOut = version;
-        int result = atomicHashTable2_applyMove(this, version);
-        if(result == 0) {
-            // Apply any last changes?
-            *versionOut = TransApply_GetVersion(&this->transaction);
-        }
-        if(result != 1) {
-            return result;
-        }
-    }
-}
-
-/*
-int atomicHashTable2_copyAndAllocateValue(AtomicHashTable2* this, AtomicSlot* slot, void** value) {
-    
-}
-int atomicHashTable2_freeValue(AtomicHashTable2* this, void** value) {
-    
-}
-*/
-
-//todonext
-// Hmm... if we could embed memory pools in inside references... that would make both 10 times better...
-// And maybe... if memory pools existed inside of slots... which would require the memory pool to reference
-//  the table, which would mean moving the slots would require atomically moving the inside references... which
-//  requires them to be interlaced... unless..
-//  Maybe inside references could be chained in someway?
-//      - Well.. that really just gets into how to move ref counted memory without interlacing? Which... I think is possible...
-
-// Moving ref counted memory without interlacing
-//  - So... the OutsideReference controls access to the InsideReference.
-//  - Hmm... maybe, we have two ref counts inside the InsideReference? Or maybe, an InsideReference starts with an
-//      OutsideReference? Which if exists, is accessed as opposed to the original pointer? And then, when the
-//      first InsideReference is finally destroyed, instead of freeing its value, you just destroy the OutsideReference?
-//      - So leaking references will cause increasingly long chains of OutsideReferences? And shrinking these chains...
-//          is inherently difficult...
-//          - We could have the chains two way link? So an InsideReference knows who moved to it?
-//              - And then when the ref count becomes 1, if we know we point to another reference, we have to go to it
-//                  and remove its reference to us, so we can free ourself.
-//              - And then when the ref count becomes 2, we can see if we both point to another reference, and have
-//                  a reference pointed to ourself. If so... then those are our references. However, we have to do it differently...
-//                  We have to try to replace the reference that points to us to point to the reference after us.
-//              - And of course, SetOutsideReference will follow to the deepest reference.
-//              - So... we will have a doubled linked list, which we only add to the end of
-//                  - But as everything is ref counted, removing is actually easy, having A -> B -> C, we can
-//                      hold all references and atomically swap. Oh, but... what about back references? Hmm... upon seeing
-//                      B only has 2 references, you could then get the back reference, and destroy it, maybe atomically
-//                      swapping it, ensuring deletion of a node only happens once?
-//  - So...
-//      - Oh crap... but, actually, our whole linked list thing doesn't work IF you link to another InsideReference stored
-//          in different underlying storage. Crap... okay, we do have to resolve that...
-//          - Optional- or... required? self reference to storage holding InsideReference? Or, maybe they only require the reference
-//              to their storage once they are moved WHILE they have an outstanding reference (as if they don't have an outstanding reference,
-//              they can just be destroyed without worry).
-//          - And then, that reference is destroyed last, after the value would be freed.
-
-// So, an InsideReference is one of:
-//      // (Count will overlap with insideReferenceHolderRef, and be incremented so it works as either, that way chaining
-//      //  is simple)
-//      uint64_t count;
-//      MemoryPool* pool;
-//      OutsideReference prevInsideReference;
-//      // (if it has no pool, this can be a constant reference which the MemoryPool knows about, causing it to just call a static function, ex, the free fnc,
-//      //    which we will just call the global pool, or system pool, or whatever...)
-//      // (also, it is assumed the pool will exist in the same memory as the insideReference, so be valid, or if we are chained
-//      //    use insideReferenceHolderRef to make sure it is alive)
-//      // (for the InsideReference itself, and will be called with InsideReference*)
-//      (not used)
-//      OutsideReference nextInsideReference;
-//  OR
-//      OutsideReference insideReferenceHolderRef;
-//      // (not used?)
-//      MemoryPool* pool;
-//      OutsideReference prevInsideReference;
-//      OutsideReference nextInsideReference;
-
-// Hmm... swapping stuff around gets really tricky... but I believe it is tractable... We can make everything sort of immutable,
-//  and once the insideReferenceHolderRef.count becomes low enough, we have do a few checks, and once we know our type,
-//  we can them be sure we are currently single threaded, and then go about removing the last references to a node,
-//  (which can be done safely, because all the pointers will stay unique, as we will have references to them), and after which
-//  we will be truly single threaded, and able to do a lot of stuff.
-
-// Hmm... but if a reference finds nothing needs its inside reference to stay alive, except the prevInsideReference, it could just go
-//  back to the prevInsideReference and change it to point to the new inside reference. The ref count on prevInsideReference.nextInsideReference
-//  should be 0, and if it is 0 that is safe, so this should be usually possible. And actually... all swaps will really be like that,
-//  so swaps should actually be really easy to do.
-
-// Move
-//  - count -> insideReferenceHolderRef
-//  - pool -> null
-//  - prevInsideReference stays whatever it is
-//  - nextInsideReference from null -> new allocation reference
-
-//      // We have no pool, as it is assumed we were moved to free the holder, and so it is assumed the real holder for us is inside
-//      //    insideReferenceHolderRef, which probably holds multiple inside references.
-//      // ALSO, of course, in our specific case our free will also pass the inside value to be freed by the user's allocator, which should only happen
-//      //  once. Of course if this isn't wanted, the insideReferenceHolder could iterate over all of its references can simulate each of them
-//      //  being freed independently, or something...
-
-// Then we can put fixed sized pools for values in AtomicSlots
-//  - This fixed sized memory pool will have a special handler to also pass the value back to us (or it might just be part of us), so we can call 
-//      the user's free with the value.
-//      - This only gets called once, as once we move a value it gains a new memory pool, and the old value when freed will only free the
-//          inside reference holder (the main allocation).
-
-// And then... the InsideReferences for values can actually just store the entire values, continously.
-
-// So... when moving an InsideReference... maybe we have a bit on every field that we check when accessing? Definitely count and
-//  insideReferenceHolderRef need to be close... or maybe THEY should be the same field? And so... when we decrement count, we can know
-//  if in fact we just decremented the insideReferenceHolderRef? In which case... that could be okay... if we move all of our count
-//  to that... And actually, we could always have an insideReferenceHolderRef, just sometimes have it be nullptr. And then if we go to 0
-//  and it is nullptr, we will know to free via our pool? Yeah... and then no one will even try to move our memory, and that caller
-//  will have to have basically an insideReferenceHolderRef anyway, so everything will be fine...
-
-// And then... finally, the benefit of all is this, is that it means we can put fixed sized MemPools where the entries used to be,
-//  allocate from them (oh, I guess we need to actually make our MemoryPools stack allocate a few objects, like we thought of before),
-//  and then store an OutsideReference to that in the value slot. Which means the value doesn't have to be interlaced, as when
-//  swapping we can just move the pointer, and allow the underlying values to be immutable. Which also means finds can be
-//  faster, and everything can just be a lot faster...
-// OH! And we can actually move the memory pools so they aren't beside the main values, and even do some linear probing looking between
-//  memory pools (or at least add a todo for that), which will allow the main hash lookup search to use very very little memory,
-//  and really just be a list of OutsideReferences and hashes (in atomic values, although... we should consider whether they need
-//  to be atomic, or if we can just swap them together, as their own 128 bit value???)
-
-// And actually, just make one memory pool per allocation, but start searching based on the hash.
-
-//todonext
-// Design MemoryPool, probably to just be basically polymorphic, having the free and allocate as the first members.
-
-// TODO: Once we allocate InsideReferences from the main allocation, we could actually change the references to just be indexes
-//  instead of pointers. And then if we run out of allocations we could resize (even if the reserved count is lower), so we only
-//  ever have to use indexes. This would give us extra bits, meaning if a system used a full 64 bits in pointers, we could
-//  create an index which uses however many bits we actually need.
-
-/*
-int atomicHashTable2_copyToValue(AtomicHashTable2* this, AtomicSlot* slot, OutsideReference* outRef, InsideReference* outInsideRef) {
-    if(this->VALUE_SIZE % 8 != 0) {
-        // VALUE_SIZE must be divisible by 8, or else this code is slower, and harder to write (and that's really the only reason)
-        OnError(3);
-        return 3;
-    }
-    for(uint64_t i = 0; i < this->VALUE_SIZE / 8; i++) {
-        ((uint64_t*)value)[i] = (&slot->valueUnits)[i].value;
+    OutsideReference curOperation = this->state.currentOperation;
+    if(curOperation.isNull) {
+        return curOperation.valueForSet;
     }
     return 0;
 }
-*/
+
+int atomicHashTable2_getVersion(AtomicHashTable2* this, uint64_t* versionOut) {
+    uint64_t version;
+    while(true) {
+        OutsideReference curOperation = this->state.currentOperation;
+        if(curOperation.isNull) {
+            *versionOut = curOperation.valueForSet;
+            return 0;
+        }
+
+        InsideReference* curOperationRef = Reference_Acquire(&this->state.currentOperation);
+        if(!curOperationRef) {
+            continue;
+        }
+        Operation* operation = Reference_GetValue(curOperationRef);
+        InsideReference* currentAllocationRef = Reference_Acquire(&this->state.currentAllocation);
+
+        AtomicHashTableBase* currentAllocation = Reference_GetValue(currentAllocationRef);
+
+        int result;
+        if(operation->type == 1) {
+            result = atomicHashTable2_applyMoveTableOperation(this, curOperationRef, operation, currentAllocation);
+        } else if(operation->type == 2) {
+            result = atomicHashTable2_applyRemoveEntryOperation(this, operation, currentAllocation);
+        }
+        Reference_Release(&this->state.currentAllocation, currentAllocationRef);
+        Reference_Release(&this->state.currentOperation, curOperationRef);
+        RETURN_ON_ERROR(result);
+        // continue
+    }
+}
+
 
 
 int atomicHashTable2_insertInner(AtomicHashTable2* this, uint64_t hash, void* valueVoid, OutsideReference* slotRef, AtomicSlot* slot) {
@@ -492,6 +463,78 @@ int atomicHashTable2_insertInner(AtomicHashTable2* this, uint64_t hash, void* va
     return 0;
 }
 int AtomicHashTable2_insert(AtomicHashTable2* this, uint64_t hash, void* valueVoid) {
+    uint64_t version;
+    RETURN_ON_ERROR(atomicHashTable2_updateReservedCount(this, &version, 1));
+
+    while(true) {
+        InsideReference* curAllocRef = Reference_Acquire(&this->currentAllocation);
+        AtomicHashTableBase* curAlloc = Reference_GetValue(curAllocRef);
+
+        OutsideReference newValueRef = { 0 };
+        HashValue* value = nullptr;
+        Reference_Allocate(curAlloc->valuePool, &newValueRef, &value, this->HASH_VALUE_SIZE, hash);
+        if(!value) {
+            Reference_Release(&this->currentAllocation, curAllocRef);
+            return 3;
+        }
+        memcpy(
+            (byte*)value + sizeof(HashValue),
+            valueVoid,
+            this->VALUE_SIZE
+        );
+
+        uint64_t baseInsertIndex = getSlotBaseIndex(curAlloc, hash);
+        AtomicSlot* slots = curAlloc->slots;
+        OutsideReference prevValue;
+        uint64_t cycles = 0;
+        while(true) {
+            prevValue = slots[baseInsertIndex].value;
+            if(!prevValue.pointerClipped) {
+                break;
+            }
+            // TODO: After a certain amount of iterations, or under certain conditions, start looking into values
+            //  and seeing if they are deleted, and then replacing them if they are? But then again... who deletes
+            //  a value without wiping it out in the table? That should be rare...
+            baseInsertIndex = baseInsertIndex + 1;
+            if(baseInsertIndex >= curAlloc->slotsCount) {
+                baseInsertIndex = 0;
+                cycles++;
+                if(cycles > 10) {
+                    // Somehow after 10 cycles through the table we haven't found a free spot. This must be an error.
+                    OnError(9);
+                    return 9;
+                }
+            }
+        }
+
+        if(InterlockedCompareExchange64(
+            &slots[baseInsertIndex]->value,
+            newValueRef,
+            prevValue,
+        ) != prevValue) {
+            Reference_Release(&this->currentAllocation, curAllocRef);
+            void* temp = Reference_Acquire(&newValueRef);
+            Reference_DestroyOutside(&newValueRef, temp);
+            Reference_Release(&newValueRef, temp);
+            continue;
+        }
+        Reference_Release(&this->currentAllocation, curAllocRef);
+
+        todonext
+        // Oh wait... if we insert, while resizing... Hmm... maybe inserting does require a transaction? And maybe the move loop does have to be
+        //  in the transaction queue?
+        if(version == atomicHashTable2_fastGetVersion(this)) {
+
+        }
+
+        
+        break;
+    }
+
+
+
+    //RETURN_ON_ERROR(atomicHashTable2_getVersion(this, &version));
+
     void* slotMemory = MemoryPool_Allocate(&this->valueInsertPool);
     if(!slotMemory) {
         // Out of memory
@@ -510,11 +553,6 @@ int AtomicHashTable2_insert(AtomicHashTable2* this, uint64_t hash, void* valueVo
     return 0;
 }
 
-//todonext
-// During contention holes appear in continous blocks in the hash table. So... clearly some of our code is wrong.
-//  Maybe just print every time we completely remove an element?
-//  The problem is probably our fast retry code failing to check for something, allowing it to continue even after we should
-//  restart the outer loop...
 
 int atomicHashTable2_removeInner(
 	AtomicHashTable2* this,

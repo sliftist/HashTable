@@ -4,7 +4,7 @@
 
 #include "RefCount.h"
 
-#include "MemoryPool.h"
+#include "MemPool.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,73 +26,33 @@ typedef struct {
     };
 } OutsideReferenceAtomic;
 
-#pragma pack(push, 1)
-typedef __declspec(align(16)) struct {
-    // The refs for the memory sourceUnits and destUnits are in, moved here,
-    //  to make it possible for hanging threads to still have valid source and dest memory.
-    //  (the source and dest values don't really matter, they might as well be arbitrary refs)
-    //  (destRef can be { 0 }, for example, when the dest and source are equal)
-    //  (sourceRef can be  { 0 }, for example, when we are moving in static memory)
-    // (these are destroyed whether or not we succeed in adding the transaction)
-    OutsideReference sourceRef;
-    OutsideReference destRef;
-
-    MemoryPool* sourceRefMemPool;
-    MemoryPool* destRefMemPool;
-
-    // The reference we move
-    //  (source can be nullptr, if we just want to wipe a value out.)
-    //  (if dest is nullptr, it means we aren't moving a reference)
-    OutsideReferenceAtomic* sourceRefToMove;
-    OutsideReferenceAtomic* destRefToMove;
-
-    // (Must be acquired before sourceRefToMove is acquired, as it must be held if sourceRefToMove releases
-    //  and indicates it has been destroyed).
-    // These values are passed to sourceOrSourceRefDeleteFnc if sourceRefToMove or destRefToMove are deleted
-    OutsideReference sourceRefDeleteValueRef;
-    MemoryPool* sourceRefDeleteValueRefMemPool;
-    OutsideReference destRefDeleteValueRef;
-    MemoryPool* destRefDeleteValueRefMemPool;
-
-    void(*sourceOrSourceRefDeleteFnc)(void* value);
 
 
-    uint64_t moveCount;
-    AtomicUnit2* sourceUnits;
-    uint64_t sourceConstValue;
-    AtomicUnit2* destUnits;
-} TransChange;
-#pragma pack(pop)
+
 
 #define MAX_CHANGE_COUNT 3
 
-#pragma pack(push, 1)
-typedef __declspec(align(16)) struct {
-    TransChange changes[MAX_CHANGE_COUNT];
-    uint64_t changeCount;
 
-    // Populated and used internally
-    uint64_t startVersion;
-} Trans;
-#pragma pack(pop)
 
 
 // Should be initialized like:
 //  TransApply value = TransApplyDefault();
 
-#define TransApplyDefault() { { sizeof(Trans) + sizeof(InsideReference) } }
+#define TransApplyDefault() { MemPoolFixedDefault() }
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
-    MemoryPool transPool;
+    // TransChange*
+    MemPoolFixed transPool;
 
     union {
-        // Trans*
+        // TransChange*
         OutsideReference transactionToApply;
         AtomicUnit2 transactionToApplyUnit;
     };
 
     uint64_t curUniqueId;
+    uint64_t padding;
 
 } TransApply;
 #pragma pack(pop)
@@ -106,7 +66,7 @@ uint64_t TransApply_GetVersion(TransApply* trans);
 
 // Returns 0 if we ran it, 1 if we didn't because the version changed, and > 1 on errors.
 //  If the version isn't equal to versionRead, we don't apply the transaction
-int TransApply_Run(TransApply* trans, uint64_t versionRead, Trans transaction);
+int TransApply_Run(TransApply* trans, uint64_t* versionRead, TransChange transaction);
 
 
 

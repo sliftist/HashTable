@@ -50,13 +50,6 @@ uint64_t newGrowSize(AtomicHashTable2* this, uint64_t slotCount, uint64_t fillCo
     return 0;
 }
 
-int atomicHashTable2_getVersion(AtomicHashTable2* this, uint64_t* versionOut);
-
-todonext
-// Destroys newOperation if it can't add it (because of an error, or because the version changed)
-//  (and if it adds it takes ownership of newOperation).
-int atomicHashTable2_runOperation(AtomicHashTable2* this, uint64_t* versionOut, OutsideReference newOperation);
-
 
 void destroyUniqueOutsideRef(OutsideReference* ref)  {
     void* temp = Reference_Acquire(&ref);
@@ -74,23 +67,90 @@ void atomicHashTable2_memPoolFreeCallback(AtomicHashTable2* this, InsideReferenc
 }
 
 
-// Not to be called in a retry loop, as it runs its own (but it still may return errors)
-//  (also pVersion is an out, so don't get a version before you call this)
-// The value it returns is a value with all moves applied, so if the version doesn't change, no moves have happened.
-//  (does not return 1)
-int atomicHashTable2_updateReservedCount(AtomicHashTable2* this, uint64_t* pVersion, uint64_t delta) {
-    InterlockedAdd64((LONG64*)&this->slotsReserved, (LONG64)delta);
-
+// Doesn't free curAllocRefOut on errors (as this should be in your main loop, which should free curAllocRef on errors anyway)
+// Should be called at the beginning of the loop, and at the end, where if the end call returns 0, we know we are done.
+// And the caller is responsible for freeing curAllocRefOut (via calling Reference_Release(&this->state.currentAllocation, curAllocRef)),
+//      on errors and success (except it can pass the same values back multiple times, and we will free the values before
+//      we clobber them).
+int atomicHashTable2_moveLoop(
+    AtomicHashTable2* this,
+    uint64_t* versionOut,
+    InsideReference** curAllocRefOut,
+    AtomicHashTableBase** curAllocOut
+) {
+    uint64_t version;
     while(true) {
-        RETURN_ON_ERROR(atomicHashTable2_getVersion(this, pVersion));
+        TransactionState state = this->state;
+        if(!EqualsStruct128(&state, &this->state)) continue;
+
+        if(!state.currentAllocation.valueForSet) {
+            *versionOut = state.currentOperation.valueForSet;
+            *curAllocRefOut = nullptr;
+            *curAllocOut = nullptr;
+            return 0;
+        }
+
+        if(*versionOut == state.currentOperation.valueForSet && *curAllocOut) {
+            return 0;
+        }
+        InsideReference* curAllocRef = *curAllocRefOut;
+        if(curAllocRef) {
+            Reference_Release(&this->state.currentAllocation, curAllocRef);
+        }
 
         InsideReference* curAllocRef = Reference_Acquire(&this->state.currentAllocation);
-        AtomicHashTableBase* curTable = curAllocRef ? Reference_GetValue(curAllocRef) : nullptr;
+        AtomicHashTableBase* curAlloc = Reference_GetValue(curAllocRef);
+        if(!FAST_CHECK_POINTER(state.currentAllocation, curAllocRef)) {
+            Reference_Release(&this->state.currentAllocation, curAllocRef);
+            continue;
+        }
+
+        // currentOperation should never be 0, so a isNull check is sufficient
+        if(state.currentOperation.isNull) {
+            *versionOut = state.currentOperation.valueForSet;
+            *curAllocRefOut = curAllocRef;
+            *curAllocOut = curAlloc;
+            return 0;
+        }
+
+
+        InsideReference* curOperationRef = Reference_Acquire(&this->state.currentOperation);
+        if(!curOperationRef) {
+            Reference_Release(&this->state.currentAllocation, curAllocRef);
+            continue;
+        }
+        Operation* operation = Reference_GetValue(curOperationRef);
+
+        // applyMoveTableOperation updated this->state, making it isNull when it finishes, so the next iteration should get able to return
+        int result = atomicHashTable2_applyMoveTableOperation(this, curOperationRef, operation, curAlloc);
+
+        Reference_Release(&this->state.currentOperation, curOperationRef);
+        
+        RETURN_ON_ERROR(result);
+
+        Reference_Release(&this->state.currentAllocation, curAllocRef);
+    }
+}
+
+
+// Not to be called in a retry loop, as it runs its own (but it still may return errors)
+//  (does not return 1)
+//  (also pVersion is an out, so don't get a version before you call this)
+// The value it returns is a value with all moves applied, so if the version doesn't change, no moves have happened.
+int atomicHashTable2_reservedCountUpdated(
+    AtomicHashTable2* this,
+    uint64_t* pVersion,
+    InsideReference** curAllocRef,
+    AtomicHashTableBase** curAlloc
+) {
+    while(true) {
+        RETURN_ON_ERROR(atomicHashTable2_moveLoop(this, pVersion, curAllocRef, curAlloc));
 
         uint64_t slotsReserved = this->slotsReserved;
 
         uint64_t newSlotCount = 0;
-        uint64_t curSlotCount = curTable ? curTable->slotsCount : 0;
+        AtomicHashTableBase* curAllocTable = *curAlloc;
+        uint64_t curSlotCount = curAllocTable ? curAllocTable->slotsCount : 0;
         newSlotCount = newShrinkSize(this, curSlotCount, slotsReserved);
         newSlotCount = newSlotCount ? newSlotCount : newGrowSize(this, curSlotCount, slotsReserved);
 
@@ -152,7 +212,7 @@ int atomicHashTable2_updateReservedCount(AtomicHashTable2* this, uint64_t* pVers
 
 int atomicHashTable2_applyMoveTableOperationInner(
     AtomicHashTable2* this,
-    OperationRef* operationRef,
+    InsideReference* operationRef,
     Operation* operation,
     AtomicHashTableBase* curAlloc,
     AtomicHashTableBase* newAlloc
@@ -181,7 +241,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
             }
             // Atomically moves the outside reference from newAllocation to curAlloc,
             //  and finishes the operation.
-            TransactionState newTransaction = { operation->newAllocation, GetNextNULL() };
+            TransactionState newTransaction = { operation->newAllocation, GetNextNull() };
             if(InterlockedCompareExchangeStruct128(&this->state, &transaction, &newTransaction)) {
                 // curAlloc has been atomically removed from the hash table, so we inform the real owner of that
                 //  reference that at least we no longer need it (but if it has outstanding allocations it will
@@ -300,7 +360,20 @@ int atomicHashTable2_applyMoveTableOperationInner(
         //  won't be called multiple time, even if there are outstanding references to it in hanging finds, etc - 
         //  although, hanging finds WILL prevent the destruct callback from being called in the first place).
         {
-            InsideReference* sourceSlotRef = Reference_Acquire(&sourceSlot->value);
+            // Forcefully move it out first though, so we can be certain the destruction will succeed
+            OutsideReference sourceValue;
+            while(true) {
+                sourceValue = sourceSlot->value;
+                if(sourceValue.valueForSet == 0) break;
+                if(InterlockedCompareExchange64(
+                    &sourceSlot->value,
+                    0,
+                    sourceValue.valueForSet
+                ) == sourceValue.valueForSet) {
+                    break;
+                }
+            }
+            InsideReference* sourceSlotRef = Reference_Acquire(&sourceValue);
             Reference_DestroyOutside(&sourceSlot->value, sourceSlotRef);
             Reference_Release(&sourceSlot->value, sourceSlotRef);
         }
@@ -312,7 +385,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
     
     
 }
-int atomicHashTable2_applyMoveTableOperation(AtomicHashTable2* this, OperationRef* operationRef, Operation* operation, AtomicHashTableBase* currentAllocation) {
+int atomicHashTable2_applyMoveTableOperation(AtomicHashTable2* this, InsideReference* operationRef, Operation* operation, AtomicHashTableBase* currentAllocation) {
     InsideReference* newAllocationRef = Reference_Acquire(&operation->newAllocation);
     if(!newAllocationRef) {
         return 1;
@@ -323,51 +396,748 @@ int atomicHashTable2_applyMoveTableOperation(AtomicHashTable2* this, OperationRe
     Reference_Release(&operation->newAllocation, newAllocationRef);
     return result;
 }
-int atomicHashTable2_applyRemoveEntryOperation(Operation* operation) {
-    todonext
-    // This 
+
+
+
+
+uint64_t atomicHashTable2_getDeleteInsertStateVersion(AtomicHashTableBase* table) {
+    while(true) {
+        DeleteInsertState prevDeleteState = table->deleteState;
+        if(!EqualsStruct128(&prevDeleteState, &table->deleteState)) {
+            continue;
+        }
+        if(!prevDeleteState.) {
+            return prevDeleteState.nullToDelete.valueForSet;
+        }
+
+        OutsideReference* pValue = &table->slots[prevDeleteState.index].value;
+        if(prevDeleteState.nullToDelete.isNull) {
+            // If this fails it is fine, it may be that the delete has already been applied (in which case our
+            //  update of deleteState will fail, and we will retry), OR the table has changed, in which case the update
+            //  of deleteState will succeed.
+            InterlockedCompareExchange64(
+                (LONG64*)pValue,
+                0,
+                prevDeleteState.nullToDelete.valueForSet
+            );
+        } else {
+            OutsideReference value = *pValue;
+            // If it isn't the same value to delete, just pretend we applied it, we must have (or a move
+            //  happened? Which will wipe it out with 0, so that's fine too...)
+            if(FAST_CHECK_POINTER(value, prevDeleteState.nullToDelete.pointerClipped)) {
+                if(InterlockedCompareExchange64(
+                    (LONG64*)pValue,
+                    GetNextNull().valueForSet,
+                    value.valueForSet
+                ) != value.valueForSet) {
+                    continue;
+                }
+                // We wiped it out, so we have to destroy the outside reference
+                destroyUniqueOutsideRef(&value);
+            }
+        }
+
+        DeleteInsertState newPrevDeleteState = { 0 };
+        newPrevDeleteState.nullToDelete = prevDeleteState.nullToDelete;
+
+        if(InterlockedCompareExchangeStruct128(&table->deleteState, &prevDeleteState, &newPrevDeleteState)) {
+            return newPrevDeleteState.nullToDelete.valueForSet;
+        }
+    }
 }
 
-// TransApply_FastGetVersion
-// Returns the version, or 0 if atomicHashTable2_getVersion must be called instead
-uint64_t atomicHashTable2_fastGetVersion(AtomicHashTable2* this) {
-    OutsideReference curOperation = this->state.currentOperation;
-    if(curOperation.isNull) {
-        return curOperation.valueForSet;
+// Returns true if it did replace the value with null
+bool atomicHashTable2_replaceValueWithNull(
+    AtomicHashTableBase* table,
+    OutsideReference value,
+    uint64_t index
+) {
+    DeleteInsertState deleteState = { 0 };
+    deleteState.hasNotBeenApplied = 1;
+    deleteState.index = index;
+    deleteState.nullToDelete = value;
+
+    DeleteInsertState prevState = { 0 };
+    prevState.nullToDelete.valueForSet = atomicHashTable2_getDeleteInsertStateVersion(table);
+    if(InterlockedCompareExchangeStruct128(&table->deleteState, &prevState, &deleteState)) {
+        // Because all deletes go through this, we know the delete state insert will succeed,
+        //  unless there is a move, but we will detect that later...
+        atomicHashTable2_getDeleteInsertStateVersion(table);
+        return true;
+    }
+    return false;
+}
+
+// TODO: This could be a lot faster for high collision cases if instead of searching a whole
+//  continous section we have some memory of where we set nulls (in AtomicHashTable2_removeUntilCountEquals).
+//  The most obvious way would be via immediatelly compressing as soon as we remove, however... this could cause
+//  recursion, and so we would need to do it carefully.
+//  - Having a fixed sized array to keep track of nulls might also work, giving us good performance in the case
+//      of few nulls, but the continous section being large.
+//  - Although... to remove a null we have to search most of the continous section anyway, so... maybe it doesn't matter...
+int atomicHashTable2_deleteEndNulls(
+    AtomicHashTableBase* table,
+    uint64_t baseIndex,
+    uint64_t* deleteInsertVersionInOut
+) {
+    while(true) {
+        uint64_t deleteInsertVersion = atomicHashTable2_getDeleteInsertStateVersion(table);
+        if(deleteInsertVersion != *deleteInsertVersionInOut) {
+            *deleteInsertVersionInOut = deleteInsertVersion;
+            return 1;
+        }
+        uint64_t endOffset = 0;
+        bool endsInNull = false;
+        while(true) {
+            OutsideReference value = table->slots[(baseIndex + endOffset) % table->slotsCount].value;
+            if(value.valueForSet == 0) {
+                break;
+            }
+            endsInNull = value.isNull;
+            endOffset++;
+            if(endOffset == table->slotsCount * 10) {
+                // The table has become way too full. How did this happen?
+                OnError(9);
+                return 9;
+            }
+        }
+        
+        if(!endsInNull) {
+            *deleteInsertVersionInOut = deleteInsertVersion;
+            return 0;
+        }
+
+        while(true) {
+            uint64_t index = (baseIndex + endOffset) % table->slotsCount;
+
+            OutsideReference value = table->slots[index].value;
+            if(!value.isNull) {
+                break;
+            }
+
+            DeleteInsertState newDeleteState = { 0 };
+            newDeleteState.index = index;
+            newDeleteState.hasNotBeenApplied = 1;
+            newDeleteState.nullToDelete = value;
+
+            DeleteInsertState prevDeleteState = { 0 };
+            prevDeleteState.nullToDelete.valueForSet = deleteInsertVersion;
+
+            if(!InterlockedCompareExchangeStruct128(&table->deleteState, &prevDeleteState, &newDeleteState)) {
+                break;
+            }
+            deleteInsertVersion = value.valueForSet;
+
+            InterlockedCompareExchange64(
+                (LONG64*)&table->slots[index].value,
+                0,
+                deleteInsertVersion
+            );
+            DeleteInsertState finishedDeleteState = { 0 };
+            finishedDeleteState.nullToDelete = value;
+            InterlockedCompareExchangeStruct128(&table->deleteState, &newDeleteState, &finishedDeleteState);
+
+            if(endOffset == 0) {
+                break;
+            }
+            endOffset--;
+        }
+
+        if(deleteInsertVersion == atomicHashTable2_getDeleteInsertStateVersion(table)) {
+            *deleteInsertVersionInOut = deleteInsertVersion;
+            return 0;
+        }
     }
     return 0;
 }
 
-int atomicHashTable2_getVersion(AtomicHashTable2* this, uint64_t* versionOut) {
-    uint64_t version;
+// Stops the value from swapping, deleting duplicates, making nullSwappingWith 0.
+//  (does not fail)
+void atomicHashTable2_replaceValuesWithNull(
+    AtomicHashTableBase* table,
+    void* valueRefPointerForCompare,
+    HashValue* value,
+    bool leaveFirstValue
+) {
+    start:
+   
+    OutsideReference startNullSwappingWith = value->nullSwappingWith;
+    if(leaveFirstValue) {
+        if(startNullSwappingWith.valueForSet == 0) {
+            return;
+        }
+    }
+
+    uint64_t baseIndex = getSlotBaseIndex(table, value->hash);
+
+    bool found = !leaveFirstValue;
+
+
+    uint64_t indexOffset = 0;
     while(true) {
-        OutsideReference curOperation = this->state.currentOperation;
-        if(curOperation.isNull) {
-            *versionOut = curOperation.valueForSet;
+        uint64_t searchIndex = (baseIndex + indexOffset) % table->slotsCount;
+        OutsideReference* valuePointer = &table->slots[searchIndex].value;
+        OutsideReference compareOutsideRef = *valuePointer;
+        if(compareOutsideRef.valueForSet == 0) break;
+        // Get rid of all startNullSwappingWith values, to interrupt the swap
+        if(compareOutsideRef.valueForSet == startNullSwappingWith.valueForSet) {
+            // This is safe... because it is a null value with another null value, not actually a delete
+            if(InterlockedCompareExchange64(
+                (LONG64*)valuePointer,
+                GetNextNull().valueForSet,
+                compareOutsideRef.valueForSet
+            ) != compareOutsideRef.valueForSet) {
+                // Retry
+                goto start;
+            }
+        }
+        if(FAST_CHECK_POINTER(compareOutsideRef, valueRefPointerForCompare)) {
+            if(!found) {
+                found = true;
+            } else {
+                // We can safely remove it, as we only swap down, so if we saw it before us, then that value will stay before us.
+                if(!atomicHashTable2_replaceValueWithNull(table, compareOutsideRef, searchIndex)) {
+                    goto start;
+                }
+            }
+        }
+        indexOffset++;
+    }
+
+    if(InterlockedCompareExchange64(
+        (LONG64*)&value->nullSwappingWith,
+        0,
+        startNullSwappingWith.valueForSet
+    ) != startNullSwappingWith.valueForSet) {
+        // Retry
+        goto start;
+    }
+    return;
+}
+
+int atomicHashTable2_swapWithNull(
+    AtomicHashTableBase* table,
+    OutsideReference* nullPointer,
+    uint64_t valueIndex,
+    OutsideReference* valuePointer,
+    OutsideReference nullValue,
+    InsideReference* valueRef,
+    HashValue* value
+) {
+    OutsideReference newValueOutsideRef = { 0 };
+    if(!Reference_SetOutside(&newValueOutsideRef, valueRef)) {
+        // Must be because of a move, so leave and retry
+        return 1;
+    }
+
+    // value->nullSwappingWith = nullValue;
+    while(InterlockedCompareExchange64(
+        (LONG64*)&value->nullSwappingWith,
+        nullValue.valueForSet,
+        0
+    ) != 0) {
+        atomicHashTable2_replaceValuesWithNull(table, valueRef, value, true);
+    }
+
+    if(InterlockedCompareExchange64(
+        (LONG64*)nullPointer,
+        newValueOutsideRef.valueForSet,
+        nullValue.valueForSet
+    ) != nullValue.valueForSet) {
+        atomicHashTable2_replaceValuesWithNull(table, valueRef, value, true);
+        Reference_DestroyOutside(&newValueOutsideRef, valueRef);
+        return 1;
+    }
+
+    // After this point newValueOutsideRef is in the list, so not our responsibility (AND as moving
+    //  zeros out entries, and we swapped with nullValue... we KNOW it got in the list before a move).
+
+    // We could just call atomicHashTable2_replaceValuesWithNull to begin with, but if we can swap
+    //  without searching (which we should be able to do most of the time), it is a lot faster.
+    
+    // Just keep trying to delete it until we can, or until it has moved
+    while(true) {
+        OutsideReference higherValue = *valuePointer;
+        if(!FAST_CHECK_POINTER(higherValue, valueRef)) break;
+        if(atomicHashTable2_replaceValueWithNull(table, higherValue, valueIndex)) {
+            // The only reason we can't reset nullSwappingWith is if someone else set it, in which
+            //  case that is fine, we did our swap successfully, they clearly failed to interrupt it,
+            //  so we can just return 0.
+            InterlockedCompareExchange64(
+                (LONG64*)&value->nullSwappingWith,
+                0,
+                nullValue.valueForSet
+            );
             return 0;
         }
+    }
+    atomicHashTable2_replaceValuesWithNull(table, valueRef, value, true);
+    return 1;
+}
 
-        InsideReference* curOperationRef = Reference_Acquire(&this->state.currentOperation);
-        if(!curOperationRef) {
+int atomicHashTable2_swapNullTowardsEnd(
+    AtomicHashTableBase* table,
+    OutsideReference nullToRemove,
+    uint64_t nullIndex
+) {
+    uint64_t searchIndex = 0;
+    InsideReference* afterRef = 0;
+    HashValue* afterValue = 0;
+
+    uint64_t loops = 0;
+    uint64_t indexOffset = 1;
+    while(true) {
+        if(indexOffset == table->slotsCount) {
+            loops++;
+            indexOffset = 1;
+            if(loops >= 10) {
+                // Okay, so... this is possible. The table may only have 1 entry in it, which keeps moving in front of us.
+                //  But... it is more likely this is indicative of some error in the internal hash table code.
+                OnError(13);
+                return 13;
+            }
+        }
+        
+        searchIndex = (nullIndex + indexOffset) % table->slotsCount;
+        afterRef = Reference_Acquire(&table->slots[searchIndex].value);
+        afterValue = Reference_GetValue(afterRef);
+
+        if(!afterValue) {
+            Reference_Release(&table->slots[searchIndex].value, afterRef);
+            return 0;
+        }
+        if(afterValue->deleted) {
+            indexOffset++;
+            Reference_Release(&table->slots[searchIndex].value, afterRef);
             continue;
         }
-        Operation* operation = Reference_GetValue(curOperationRef);
-        InsideReference* currentAllocationRef = Reference_Acquire(&this->state.currentAllocation);
+        uint64_t afterBaseIndex = getSlotBaseIndex(table, afterValue->hash);
 
-        AtomicHashTableBase* currentAllocation = Reference_GetValue(currentAllocationRef);
-
-        int result;
-        if(operation->type == 1) {
-            result = atomicHashTable2_applyMoveTableOperation(this, curOperationRef, operation, currentAllocation);
-        } else if(operation->type == 2) {
-            result = atomicHashTable2_applyRemoveEntryOperation(this, operation, currentAllocation);
+        // We want afterBaseIndex to NOT be between nullIndex and searchIndex
+        bool swapWillMoveBeforeBase;
+        if(searchIndex < nullIndex) {
+            // If we wrapped around then we add table->slotsCount
+            //swapWillMoveBeforeBase = nullIndex < (afterBaseIndex + table->slotsCount) && (afterBaseIndex + table->slotsCount) <= (searchIndex + table->slotsCount);
+            swapWillMoveBeforeBase = nullIndex < (afterBaseIndex + table->slotsCount) && afterBaseIndex <= searchIndex;
+        } else {
+            swapWillMoveBeforeBase = nullIndex < afterBaseIndex && afterBaseIndex <= searchIndex;
         }
-        Reference_Release(&this->state.currentAllocation, currentAllocationRef);
-        Reference_Release(&this->state.currentOperation, curOperationRef);
-        RETURN_ON_ERROR(result);
-        // continue
+        if(swapWillMoveBeforeBase) {
+            indexOffset++;
+            Reference_Release(&table->slots[searchIndex].value, afterRef);
+            continue;
+        }
+
+        break;
+    }
+
+    int swapResult = atomicHashTable2_swapWithNull(
+        table,
+        &table->slots[nullIndex].value,
+        &table->slots[searchIndex].value,
+        nullToRemove,
+        afterRef,
+        afterValue
+    );
+
+    Reference_Release(&table->slots[searchIndex].value, afterRef);
+
+    return swapResult;
+}
+
+
+int atomicHashTable2_deleteNulls(
+    AtomicHashTableBase* table,
+    uint64_t baseIndex,
+    uint64_t* deleteInsertVersionOut
+) {
+    uint64_t indexOffset = 0;
+    while(true) {
+        uint64_t searchIndex = (baseIndex + indexOffset) % table->slotsCount;
+        OutsideReference value = table->slots[searchIndex].value;
+        if(value.valueForSet == 0) {
+            break;
+        }
+        if(value.isNull) {
+            int result = atomicHashTable2_swapNullTowardsEnd(table, value, searchIndex);
+            // Retry that index, until we get a consistent value
+            if(result == 1) continue;
+            RETURN_ON_ERROR(result);
+        }
+        indexOffset++;
+        if(indexOffset >= table->slotsCount * 10) {
+            // Okay, so... this is possible. The table may only have 1 entry in it, which keeps moving in front of us.
+            //  But... it is more likely this is indicative of some error in the internal hash table code.
+			OnError(13);
+            return 13;
+        }
+    }
+
+    // This might miss cases where a group gets split up? But... then it really wouldn't be our responsibility to
+    //  remove the nulls, would it? It would have to be the responsibility of whomever split the group up!
+    return atomicHashTable2_deleteEndNulls(table, baseIndex, deleteInsertVersionOut);
+}
+
+int AtomicHashTable2_removeInner(
+	AtomicHashTable2* this,
+    AtomicHashTableBase* table,
+	uint64_t hash,
+	void* callbackContext,
+	// On true, removes the value from the table
+	bool(*callback)(void* callbackContext, void* value),
+    // If count changed
+    bool* countChanged
+) {
+    uint64_t deleteInsertVersion = atomicHashTable2_getDeleteInsertStateVersion(table);
+    uint64_t baseIndex = getSlotBaseIndex(table, hash);
+
+    uint64_t indexOffset = 0;
+    while(true) {
+        uint64_t searchIndex = (baseIndex + indexOffset) % table->slotsCount;
+        OutsideReference* pValue = &table->slots[searchIndex].value;
+        // Important because it will catch moves, and differentiate between 0 and isNull (
+        //  as in, we break on 0, but not isNull, so we can't break if !value, but we can
+        //  if !valueForSet).
+        if(pValue->valueForSet == 0) {
+            break;
+        }
+        InsideReference* valueRef = Reference_Acquire(pValue);
+        HashValue* value = Reference_GetValue(valueRef);
+        if(value) {
+            if(value->hash == hash) {
+                // IMPORTANT! DO NOT CHECK value->deleted here! Just because value->deleted is set, doesn't
+                //  mean it can't be deleted, and doesn't mean it should be deleted. It could be in the process
+                //  of adding (meaning it should only be deleted if callback is called), or it could be a zombie value,
+                //  in which case we definitely want to call the callback, and maybe delete it (that part isn't as important...),
+                //  OR we could have set deleted, but have it been moved, and so we had to run again, in which case
+                //  we really do need to delete it, but we have to verify with callback.
+                if(callback(callbackContext, (byte*)value + sizeof(HashValue))) {
+                    value->deleted = 1;
+
+                    
+                    while(true) {
+                        OutsideReference prevValue = *pValue;
+                        if(!FAST_CHECK_POINTER(prevValue, valueRef)) {
+                            Reference_Release(pValue, valueRef);
+                            return 1;
+                        }
+                        if(InterlockedCompareExchange64(
+                            (LONG64*)pValue,
+                            GetNextNull().valueForSet,
+                            prevValue.valueForSet
+                        ) != prevValue.valueForSet) {
+                            continue;
+                        }
+                        InterlockedAdd64((LONG64*)&this->slotsReserved, (LONG64)-1ll);
+                        *countChanged = true;
+                        // Here we have atomically removed prevValue from the array, replacing it with null
+                        Reference_DestroyOutside(&prevValue, valueRef);
+                        Reference_Release(&prevValue, valueRef);
+                        valueRef = nullptr;
+                    }
+                }
+            }
+        }
+        if(valueRef) {
+            Reference_Release(pValue, valueRef);
+        }
+        
+        indexOffset++;
+        if(indexOffset >= table->slotsCount * 10) {
+            // Okay, so... this is possible. The table may only have 1 entry in it, which keeps moving in front of us.
+            //  But... it is more likely this is indicative of some error in the internal hash table code.
+			OnError(13);
+            return 13;
+        }
+    }
+
+    return atomicHashTable2_deleteEndNulls(table, baseIndex, &deleteInsertVersion);
+}
+
+int AtomicHashTable2_remove(
+	AtomicHashTable2* this,
+	uint64_t hash,
+	void* callbackContext,
+	// On true, removes the value from the table
+	bool(*callback)(void* callbackContext, void* value)
+) {
+    uint64_t moveVersion = 0;
+    InsideReference* curAllocRef = nullptr;
+    AtomicHashTableBase* curAlloc = nullptr;
+
+    int result = 0;
+
+    bool countChanged = false;
+
+    //atomicHashTable2_deleteNulls
+    while(true) {
+        uint64_t moveVersion = 0;
+        result = atomicHashTable2_moveLoop(this, &moveVersion, &curAllocRef, &curAlloc);
+        if(result == 1) continue;
+        if(result > 1) break;
+
+        result = AtomicHashTable2_removeInner(this, curAlloc, hash, callbackContext, callback, &countChanged);
+        if(result == 1) continue;
+        if(result > 1) break;
+    }
+
+    if(countChanged) {
+        int result2 = atomicHashTable2_reservedCountUpdated(this, &moveVersion, &curAllocRef, &curAlloc);
+        if(result != 0) {
+            result = result2;
+        }
+    }
+    
+    Reference_Release(&this->state.currentAllocation, curAllocRef);
+
+    return result;
+}
+
+
+// Value should have deleted set to true, so it isn't used until we are sure it has been inserted correctly.
+int AtomicHashTable2_insertInner(
+    AtomicHashTable2* this,
+    AtomicHashTableBase* table,
+    uint64_t hash,
+    // Takes ownership of value, adding it on both result == 0 and result == 1
+    OutsideReference value,
+    void* valueRefPointerForCompare,
+    HashValue* hashValue,
+    OutsideReference** insertedLocation
+) {
+    uint64_t deleteVersion = atomicHashTable2_getDeleteInsertStateVersion(table);
+
+    uint64_t baseIndex = getSlotBaseIndex(table, hash);
+    uint64_t indexOffset = 0;
+    while(true) {
+        uint64_t searchIndex = (baseIndex + indexOffset) % table->slotsCount;
+        OutsideReference* pValue = &table->slots[searchIndex].value;
+        OutsideReference prevValue = *pValue;
+        if(prevValue.valueForSet == 0 || prevValue.isNull) {
+            if(InterlockedCompareExchange64(
+                (LONG64*)pValue,
+                value.valueForSet,
+                prevValue.valueForSet
+            ) == prevValue.valueForSet) {
+                *insertedLocation = pValue;
+                // Inserted, we a committed to making sure we inserted correctly, OR removing the value and trying again.
+
+                uint64_t curDeleteVersion = atomicHashTable2_getDeleteInsertStateVersion(table);
+                if(deleteVersion != curDeleteVersion) {
+                    // The delete may have introduced a hole.
+                    // Try to remove the value from where we inserted it really quickly.
+                    if(InterlockedCompareExchange64(
+                        (LONG64*)pValue,
+                        GetNextNull().valueForSet,
+                        value.valueForSet
+                    ) != value.valueForSet) {
+                        // We inserted it, but... then it was moved, and there may be holes between it and the base index...
+                        atomicHashTable2_replaceValuesWithNull(table, valueRefPointerForCompare, hashValue, false);
+
+                        // it must have added, then moved
+                    }
+                    return 1;
+                }
+
+                return 0;
+            }
+        }
+
+        indexOffset++;
+        if(indexOffset >= table->slotsCount * 10) {
+            // Okay, so... this is possible. The table may only have 1 entry in it, which keeps moving in front of us.
+            //  But... it is more likely this is indicative of some error in the internal hash table code.
+			OnError(13);
+            return 13;
+        }
     }
 }
+
+int AtomicHashTable2_insert(AtomicHashTable2* this, uint64_t hash, void* valueVoid) {
+    InterlockedIncrement64(&this->slotsReserved);
+
+    uint64_t moveVersion = 0;
+    InsideReference* tableRef = nullptr;
+    AtomicHashTableBase* table = nullptr;
+
+    int result = atomicHashTable2_reservedCountUpdated(this, &moveVersion, &tableRef, &table);
+    if(result != 0) {
+        Reference_Release(&this->state.currentAllocation, tableRef);
+        return result;
+    }
+
+    //atomicHashTable2_deleteNulls
+    while(true) {
+        OutsideReference valueRefOutside = { 0 };
+        OutsideReference* insertedLocation = nullptr;
+
+        // void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPointer, uint64_t size, uint64_t hash) 
+        HashValue* hashValue = nullptr;
+        Reference_Allocate(&table->valuePool, &valueRefOutside, &hashValue, this->HASH_VALUE_SIZE, hash);
+        if(!hashValue) {
+            Reference_Release(&this->state.currentAllocation, tableRef);
+            // Out of memory
+            OnError(3);
+            return 3;
+        }
+        InsideReference* valueRefInside = Reference_Acquire(&valueRefOutside);
+
+
+        hashValue->hash = hash;
+        hashValue->deleted = true;
+        memcpy(
+            (byte*)hashValue + sizeof(HashValue),
+            valueVoid,
+            this->VALUE_SIZE
+        );
+
+        result = AtomicHashTable2_insertInner(
+            this,
+            table,
+            hash,
+            valueRefOutside,
+            // Just used for comparisons, so this is fine...
+            valueRefOutside.pointerClipped,
+            hashValue,
+            &insertedLocation
+        );
+
+        if(result == 0) {
+            // Not a race condition, the insert hasn't been finished, so if they deleted it while we were inserting,
+            //  and did remove it, then setting deleted = 0 is fine (and when we return, it will have deleted == 0,
+            //  but not be in the list, and will probably free before we return, but as always, we can't guarantee a state
+            //  upon return, because there is always a gap between our code, and returning...)
+            hashValue->deleted = 0;
+            // We HAVE to check for redirection after setting deleted, or else we might set delete right as it becomes redirected!
+            //  (which is fine, it means the value has been inserted almost correctly, with the exception that the moved value will
+            //  still have the previous deleted, so deleted == 1... Which will mean it will never be returned in find, and so a normal
+            //  user will never try to actually delete it).
+
+            OutsideReference currentOperation = this->state.currentOperation;
+            bool movingOrMoved = !currentOperation.isNull || currentOperation.valueForSet != moveVersion;
+            
+            // Check moving/moved first, as if we aren't moving or moved, we weren't put in moved space.
+            //  Then check redirected, because if we were redirected our deleted set may not have took.
+            if(!movingOrMoved && !Reference_HasBeenRedirected(valueRefInside)) {
+                // valueRefOutside has been moved, so... we don't need to free it
+                Reference_Release(insertedLocation, valueRefInside);
+                break;
+            }
+        }
+
+        if(result > 1) {
+            // valueRefOutside hasn't been added, so we need to destroy it.
+            Reference_DestroyOutside(&valueRefOutside, valueRefInside);
+            Reference_Release(&valueRefOutside, valueRefInside);
+            break;
+        }
+
+        // result <= 1, so it has been inserted (somewhere)
+
+    
+        // Either we inserted it in moved space, and then this loop will find that bad insert,
+        //  OR we inserted it in an okay space (but a hole could have opened up, so not the perfect space)
+        //  - In which case we will either find it and remove it
+        //  - OR it will be moved, and we will see that
+        // So no matter what, this recovers us...
+        {
+            // Then we have to remove it, it may have a hole, or we may be in a move, and it may be in already moved space...
+            //  And... we KNOW it has been inserted, so... we have to put in considerable effort to delete it (if it is in
+            //  deleted space it is possible it is very far from the base index, with all 0s before it...)
+
+            uint64_t iterations = 0;
+            uint64_t indexOffset = 0;
+            uint64_t baseIndex = getSlotBaseIndex(table, hash);
+            while(true) {
+                iterations++;
+                uint64_t searchIndex = (baseIndex + indexOffset) % table->slotsCount;
+                OutsideReference* pValue = &table->slots[searchIndex].value;
+                OutsideReference value = *pValue;
+                if(FAST_CHECK_POINTER(value, valueRefInside)) {
+                    if(InterlockedCompareExchange64(
+                        (LONG64*)pValue,
+                        GetNextNull().valueForSet,
+                        value.valueForSet
+                    ) == value.valueForSet) {
+                        // YES! We found it, and removed it
+                        break;
+                    }
+                    // It must have been moved lower, so reset indexOffset
+                    indexOffset = 0;
+                    continue;
+                }
+                if(value.valueForSet == 0 && !Reference_HasBeenRedirected(valueRefInside)) {
+                    // It must have been moved past us, retry from the beginning
+                    indexOffset = 0;
+                    continue;
+                }
+                
+                indexOffset++;
+                if(indexOffset >= table->slotsCount * 10 && iterations > 10000) {
+                    // It could have just kept moving out of the way, but... I think it is more likely our code is broken,
+                    //  so we better just not infinitely loop.
+                    OnError(13);
+                    return 13;
+                }
+            }
+        }
+        Reference_Release(insertedLocation, valueRefInside);
+
+        // It has been removed, so we can just continue with the move loop
+        //  (we don't care about moveResult == 0 here, as we check for that case already with an explicit currentOperation check)
+
+        int moveResult = atomicHashTable2_moveLoop(this, &moveVersion, &tableRef, &table);
+        if(moveResult > 1) {
+            result = moveResult;
+            break;
+        }
+    }
+    
+    Reference_Release(&this->state.currentAllocation, tableRef);
+
+    return result;
+}
+
+
+int AtomicHashTable2_find(
+    AtomicHashTable2* self,
+    uint64_t hash,
+    void* callbackContext,
+    // May return results that don't equal the given hash, so a deep comparison should be done on the value
+	//	to determine if it is the one you want.
+	// (and obviously, may call this callback multiple times for one call, but not more than one time per call
+    //  for the same value, assuming no value is added to the table more than once).
+    void(*callback)(void* callbackContext, void* value)
+) {
+    todonext
+    // call atomicHashTable2_getDeleteInsertStateVersion, if the delete version changed, there may
+    //  have been swaps, so we might have missed a value, so we have to retry
+
+    todonext
+    // Hmm... when we read a value, we need to read DeleteInsertState, then nullSwappingWith, then DeleteInsertState
+    //  again. And if nullSwappingWith has a value, OR DeleteInsertState changes, then there might be a duplicate, and we should
+    //  start iterating again.
+    
+    todonext
+    // Wait... nullSwappingWith isn't set as part of DeleteInsertState. Hmm... but maybe,
+    //  if it is only set as a result of a DeleteInsertState change? Yeah... something is wrong,
+    //  I think we need to make a transaction state for nullSwappingWith. And I can't see how it can
+    //  be less than 192 bits, so... we are going to need an allocator. Which isn't so bad,
+    //  it will mean we won't need a 128 bit swap!
+
+    // Maybe... call atomicHashTable2_deleteEndNulls, and then
+    //  make it so nullSwappingWith uses deleteState to wipe out the duplicate value?
+
+    todonext
+    // If we see nullSwappingWith values when we read, we need to remove them via atomicHashTable2_replaceValuesWithNull,
+    //  and run again.
+    // hmm... but doesn't that still cause race conditions? Ugh... we might have to use a transaction value for
+    //  nullSwappingWith values too... that is used when creating them?
+}
+
+
+
+
 
 
 
@@ -592,7 +1362,7 @@ int atomicHashTable2_removeInner(
             }
         }
         indexOffset++;
-        if(indexOffset == table->slotsCount * 10) {
+        if(indexOffset >= table->slotsCount * 10) {
             // Okay, so... this is possible. The table may only have 1 entry in it, which keeps moving in front of us.
             //  But... it is more likely this is indicative of some error in the internal hash table code.
 			OnError(13);

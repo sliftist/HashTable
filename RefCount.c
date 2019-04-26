@@ -2,20 +2,29 @@
 #include "AtomicHelpers.h"
 
 
+// ATTTENTION! We can't call PACKED_POINTER_GET_POINTER on any threaded values, because there is a race between access of p.
+
 // If the highest bit in the address space is set, then we have to set all the high bits. Otherwise bit fields does the rest for us.
 //  (and all other fields can just be get/set via the bitfield)
 #if defined(KERNEL) && defined(_MSC_VER)
 // Windows kernel space may have kernel addresses
-#define PACKED_POINTER_GET_POINTER(p) (((p).pointerClipped & (1ull << (BITS_IN_ADDRESS_SPACE - 1))) ? ((p).pointerClipped | 0xFFFF000000000000ull) : (p).pointerClipped)
+#define PACKED_POINTER_GET_POINTER(p) ((p).isNull ? 0 : (((p).pointerClipped & (1ull << (BITS_IN_ADDRESS_SPACE - 1))) ? ((p).pointerClipped | 0xFFFF000000000000ull) : (p).pointerClipped))
 #else
-#define PACKED_POINTER_GET_POINTER(p) (p).pointerClipped
+#define PACKED_POINTER_GET_POINTER(p) ((p).isNull ? 0 : (p).pointerClipped)
 #endif
 
-static OutsideReference NEXT_NULL = { 0, 0, 1 };
-OutsideReference GetNextNULL() {
+static OutsideReference emptyReference = { 0 };
+
+static OutsideReference NEXT_NULL = BASE_NULL();
+OutsideReference GetNextNull() {
     OutsideReference value;
     value.valueForSet = InterlockedIncrement64((LONG64*)&NEXT_NULL.valueForSet);
     return value;
+}
+
+bool Reference_IsNull(uint64_t value) {
+    // The highest bit set, the second highest bit not set
+    return (value & (1ull << 63)) && ((~value) & (1ull << 62));
 }
 
 
@@ -97,6 +106,9 @@ bool IsInsideRefCorruptInner(InsideReference* pRef) {
 	return false;
 }
 bool IsOutsideRefCorruptInner(OutsideReference ref) {
+    if(ref.isNull || ref.valueForSet == 0) {
+        return true;
+    }
     if(ref.count < 0) {
         // Is the outside reference being used for memory other than an outside reference? If so... that's bad,
         //  because it could overlap with the previous outside ref... which will break everything.
@@ -108,21 +120,21 @@ bool IsOutsideRefCorruptInner(OutsideReference ref) {
         OnError(1);
         return true;
     }
-	if (ref.pointerClipped) {
-		InsideReference* insideRef = (void*)PACKED_POINTER_GET_POINTER(ref);
-        if(IsInsideRefCorrupt(insideRef)) {
-            return true;
-        }
-	}
+    InsideReference* insideRef = (void*)PACKED_POINTER_GET_POINTER(ref);
+    if(insideRef && IsInsideRefCorrupt(insideRef)) {
+        return true;
+    }
     return false;
 }
 
 
-bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, InsideReference* newInsideRef);
+bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef);
 
 bool Reference_HasBeenRedirected(InsideReference* ref) {
     if(IsInsideRefCorrupt(ref)) return false;
-    return !!ref->nextRedirectValue.pointerClipped;
+
+    // Include nulls, as they are how we mark something as destructed, but still redirected.
+    return ref->nextRedirectValue.valueForSet;
 }
 
 void* Reference_GetValue(InsideReference* ref) {
@@ -141,7 +153,6 @@ bool XchgOutsideReference(
     return InterlockedCompareExchange64((LONG64*)structAddress, *(LONG64*)structNew, *(LONG64*)structOriginal) == *(LONG64*)structOriginal;
 }
 
-static OutsideReference emptyRef = { 0 };
 bool Reference_RedirectReference(
     // Must be acquired first
     // If already redirects, fails and returns false.
@@ -161,7 +172,7 @@ bool Reference_RedirectReference(
     newRef->count++;
     OutsideReference newOutsideRef;
     newOutsideRef.valueForSet = newRef;
-    bool didRedirect = XchgOutsideReference(&oldRef->nextRedirectValue, &emptyRef, &newOutsideRef);
+    bool didRedirect = XchgOutsideReference(&oldRef->nextRedirectValue, &emptyReference, &newOutsideRef);
     if(didRedirect) {
         return true;
     }
@@ -179,8 +190,8 @@ bool releaseInsideReference(InsideReference* insideRef) {
     // Remove nodes that have no more external references
     while(true) {
         if(!insideRef->rearranging) {
-            if(insideRef->nextRedirectValue.pointerClipped) {
-                if(insideRef->prevRedirectValue.pointerClipped) {
+            if(PACKED_POINTER_GET_POINTER(insideRef->nextRedirectValue)) {
+                if(PACKED_POINTER_GET_POINTER(insideRef->prevRedirectValue)) {
                     if(insideRef->countFullValue == 3) {
                         // Set rearranging to 1
                         if(InterlockedCompareExchange64(&insideRef->countFullValue, (1ll << 63) | 3, 3) != 3) {
@@ -189,7 +200,7 @@ bool releaseInsideReference(InsideReference* insideRef) {
 
                         OutsideReference prevOutsideRef;
                         prevOutsideRef.valueForSet = InterlockedAdd64((LONG64*)&insideRef->prevRedirectValue, 1ll << BITS_IN_ADDRESS_SPACE);
-                        InsideReference* prev = prevOutsideRef.pointerClipped;
+                        InsideReference* prev = PACKED_POINTER_GET_POINTER(prevOutsideRef);
                         if(!prev) {
                             insideRef->rearranging = 0;
                             continue;
@@ -197,7 +208,7 @@ bool releaseInsideReference(InsideReference* insideRef) {
 
                         OutsideReference nextOutsideRef;
                         nextOutsideRef.valueForSet = InterlockedAdd64((LONG64*)&insideRef->nextRedirectValue, 1ll << BITS_IN_ADDRESS_SPACE);
-                        InsideReference* next = nextOutsideRef.pointerClipped;
+                        InsideReference* next = PACKED_POINTER_GET_POINTER(nextOutsideRef);
                         if(!next) {
                             insideRef->rearranging = 0;
                             Reference_Release(&insideRef->prevRedirectValue, prev);
@@ -229,7 +240,7 @@ bool releaseInsideReference(InsideReference* insideRef) {
                         // We now have exclusive access to our node, and our siblings. So... we can remove our node now...
 
                         
-                        if(!Reference_ReplaceOutside(&prev->nextRedirectValue, insideRef, next)) {
+                        if(!Reference_ReplaceOutside(&prev->nextRedirectValue, insideRef, nextOutsideRef)) {
                             // Shouldn't happen, because rearranging is exclusively set nextRedirectValue should still point to us
                             OnError(9);
                             insideRef->rearranging = 0;
@@ -240,7 +251,7 @@ bool releaseInsideReference(InsideReference* insideRef) {
                             break;
                         }
 
-                        if(!Reference_ReplaceOutside(&next->prevRedirectValue, insideRef, prev)) {
+                        if(!Reference_ReplaceOutside(&next->prevRedirectValue, insideRef, prevOutsideRef)) {
                             // Shouldn't happen, because rearranging is exclusively set nextRedirectValue should still point to us
                             // Hmm... I don't think we can really cleanup next->prevRedirectValue
                             // And then, we treat this the same as a regular successful destruction.
@@ -248,11 +259,11 @@ bool releaseInsideReference(InsideReference* insideRef) {
                         }
 
                         // Replace prev first, as having a next but no prev is valid, but the other way around isn't.
-                        if(!Reference_DestroyOutside(&insideRef->prevRedirectValue, prev)) {
+                        if(!Reference_ReplaceOutside(&insideRef->prevRedirectValue, prev, GetNextNull())) {
                             // Shouldn't happen, rearranging should exclusively hold this
                             OnError(9);
                         }
-                        if(!Reference_DestroyOutside(&insideRef->nextRedirectValue, next)) {
+                        if(!Reference_ReplaceOutside(&insideRef->nextRedirectValue, next, GetNextNull())) {
                             // Shouldn't happen, rearranging should exclusively hold this
                             OnError(9);
                         }
@@ -272,7 +283,7 @@ bool releaseInsideReference(InsideReference* insideRef) {
 
                         OutsideReference nextOutsideRef;
                         nextOutsideRef.valueForSet = InterlockedAdd64((LONG64*)&insideRef->nextRedirectValue, 1ll << BITS_IN_ADDRESS_SPACE);
-                        InsideReference* next = nextOutsideRef.pointerClipped;
+                        InsideReference* next = PACKED_POINTER_GET_POINTER(nextOutsideRef);
                         if(!next) {
                             insideRef->rearranging = 0;
                             continue;
@@ -287,12 +298,12 @@ bool releaseInsideReference(InsideReference* insideRef) {
                             break;
                         }
 
-                        if(!Reference_DestroyOutside(&next->prevRedirectValue, insideRef)) {
+                        if(!Reference_ReplaceOutside(&next->prevRedirectValue, insideRef, GetNextNull())) {
                             // Shouldn't happen, rearranging should exclusively hold this
                             OnError(9);
                         }
 
-                        if(!Reference_DestroyOutside(&insideRef->nextRedirectValue, insideRef)) {
+                        if(!Reference_ReplaceOutside(&insideRef->nextRedirectValue, insideRef, GetNextNull())) {
                             // Shouldn't happen, rearranging should exclusively hold this
                             OnError(9);
                         }
@@ -321,14 +332,7 @@ bool releaseInsideReference(InsideReference* insideRef) {
 
 InsideReference* Reference_Acquire(OutsideReference* pRef) {
     if(IsOutsideRefCorrupt(*pRef)) return nullptr;
-
-    if(!pRef->pointerClipped) {
-        return nullptr;
-    }
-    if(pRef->isNull) {
-        return nullptr;
-    }
-
+    if(!PACKED_POINTER_GET_POINTER(*pRef)) return nullptr;
 
     OutsideReference refForSet;
     // Getting a reference to a nullptr can happen, but it is fine, we can just ignore it. It won't happen
@@ -340,31 +344,12 @@ InsideReference* Reference_Acquire(OutsideReference* pRef) {
     if(!ref) return nullptr;
     if(IsInsideRefCorrupt(ref)) return nullptr;
 
-
-    OutsideReference* nextOutsideRef = nullptr;
-    InsideReference* nextRef = ref;
-    while(nextRef->nextRedirectValue.pointerClipped) {
-        nextOutsideRef = &nextRef->nextRedirectValue;
-        OutsideReference nextRefRead;
-        nextRefRead.valueForSet = InterlockedAdd64((LONG64*)nextOutsideRef, 1ll << BITS_IN_ADDRESS_SPACE);
-        nextRef = PACKED_POINTER_GET_POINTER(nextRefRead);
-
-        if(!nextRef) return nullptr;
-        if(IsInsideRefCorruptInner(nextRef)) return nullptr;
-    }
-
-    if(nextOutsideRef) {
-        // Make the outside reference point to the new, deepest, inside reference
-        if(!Reference_ReplaceOutside(pRef, ref, nextRef)) {
-            // Outside ref has become something else. Free the refs we got, and tail recurse
-            Reference_Release(nextOutsideRef, nextRef);
-            Reference_Release(pRef, ref);
-            return Reference_Acquire(pRef);
-        }
-        // Free our original ref (and we already have a reference to nextRef, so we don't have to worry about that)
+    if(ref->nextRedirectValue.valueForSet) {
+        Reference_DestroyOutside(pRef, ref);
         Reference_Release(pRef, ref);
-        return nextRef;
+        return nullptr;
     }
+
     return ref;
 }
 
@@ -433,7 +418,7 @@ void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef)
     releaseInsideReference(insideRef);
 }
 
-bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, InsideReference* newInsideRef) {
+bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef) {
     if(IsOutsideRefCorrupt(*pOutsideRef)) return false;
     if(IsInsideRefCorrupt(pInsideRef)) return false;
 
@@ -470,11 +455,7 @@ bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pI
 
 
         // Now try to remove from outside ref. If we fail... we have to go fix insideRef before we retry again
-        OutsideReference outsideRefOriginal = outsideRef;
-        outsideRef.count = 0;
-        outsideRef.pointerClipped = newInsideRef;
-
-		if (!XchgOutsideReference(pOutsideRef, &outsideRefOriginal, &outsideRef)) {
+		if (!XchgOutsideReference(pOutsideRef, &outsideRef, &newOutsideRef)) {
 			// Subtract outsideRefOriginal.count from insideRef, but don't worry about it destructing the inside ref, the caller has a reference to it anyway
 			insideRefDelta -= amountAdded;
 			continue;
@@ -507,12 +488,15 @@ bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pI
     return false;
 }
 bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
-    return Reference_ReplaceOutside(pOutsideRef, pInsideRef, nullptr);
+    return Reference_ReplaceOutside(pOutsideRef, pInsideRef, emptyReference);
 }
 
 bool Reference_SetOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
     if(IsOutsideRefCorrupt(*pOutsideRef)) return false;
     if(IsInsideRefCorrupt(pInsideRef)) return false;
+
+    // Refuse to create more references for redirects values
+    if(pInsideRef->nextRedirectValue.valueForSet) return false;
 
     while(true) {
         OutsideReference outsideRef = *pOutsideRef;

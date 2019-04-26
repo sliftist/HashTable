@@ -42,17 +42,17 @@ struct InsideReference;
 typedef struct InsideReference InsideReference;
 #define InsideReferenceSize 32
 
-todonext;
-// Oh... I've been comparing pointers directly to pointerClipped. I can't do this, I have to mask
-//  the pointer first, via a macro, so the windows kernel can mask out the high bits.
 
-// Creats an expression to fast check a reference and a pointer. May fail due to redirect though,
+
+// Creates an expression to fast check a reference and a pointer. May fail due to redirect though,
 //  so this should only be used in retry loops that call Reference_Acquire and Reference_GetValue
 //  on the value anyway.
+// Also, because it uses an expression, outsideRef obviously can't be a shared value...
+// Also, doesn't compare against nullptr InsideReferences...
 #if defined(WINDOWS) && defined(KERNEL)
-#define FAST_CHECK_POINTER(outsideRef, insideRef) ((outsideRef).pointerClipped == ((uint64_t)(insideRef) & ((1ll << BITS_IN_ADDRESS_SPACE) - 1)))
+#define FAST_CHECK_POINTER(outsideRef, insideRef) (!(outsideRef).isNull && (outsideRef).pointerClipped == ((uint64_t)(insideRef) & ((1ll << BITS_IN_ADDRESS_SPACE) - 1)))
 #else
-#define FAST_CHECK_POINTER(outsideRef, insideRef) ((outsideRef).pointerClipped == ((uint64_t)(insideRef)))
+#define FAST_CHECK_POINTER(outsideRef, insideRef) (!(outsideRef).isNull && (outsideRef).pointerClipped == ((uint64_t)(insideRef)))
 #endif
 
 
@@ -79,10 +79,17 @@ typedef struct {
 #pragma pack(pop)
 CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
 
-OutsideReference GetNextNULL();
+#define BASE_NULL() { 0, 0, 1 }
+
+OutsideReference GetNextNull();
 void* Reference_GetValue(InsideReference* ref);
 
 bool Reference_HasBeenRedirected(InsideReference* ref);
+
+// We can tell the different between a valid pointer and null because null with have the highest bit set, the lower
+//  bits used for the count BUT THE COUNT WON'T BE LARGE ENOUGH TO REACH THE 2ND HIGHEST BIT! This should be true
+//  for outside references too, so this should really work for more uint64_t values
+bool Reference_IsNull(uint64_t);
 
 
 // Of course the memory OutsideReference is stored in must be guaranteed to exist, however reuse of the memory for other
@@ -111,6 +118,8 @@ bool Reference_RedirectReference(
 // If the reference has been freed (or was never initialized), we return nullptr (but if we return an InsideReference,
 //  its pointer is always valid, so does not need to be null checked).
 InsideReference* Reference_Acquire(OutsideReference* ref);
+
+
 
 // Outside reference may be knowingly wiped out, we will just ignore it and then release the inside reference.
 //  Always pass an outsideRef, even if you know it has been wiped out.

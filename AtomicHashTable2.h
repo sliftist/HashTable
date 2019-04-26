@@ -1,6 +1,5 @@
-#include "TransApply.h"
-#include "RefCount.h"
 #include "MemPool.h"
+#include "RefCount.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,8 +44,10 @@ extern "C" {
 
 #pragma pack(push, 1)
 typedef struct {
-    uint64_t deleted: 1;
-    uint64_t mightBeDuplicated: 1;
+    uint64_t deleted;
+    // If this is set to non-0, it means we are swapping with this null value (that is below us),
+    //  and therefore, we might be duplicated (so find has to take extra steps to screen out duplicates).
+    OutsideReference nullSwappingWith;
     uint64_t hash;
 
     // After the end is filled with the value
@@ -56,15 +57,43 @@ typedef struct {
 #pragma pack(push, 1)
 typedef struct {
     // HashValue*
+    // If isNull then this is a skip value, so we have to keep searching
     OutsideReference value;
 } AtomicSlot;
 #pragma pack(pop)
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
+    todonext
+    // Ugh... this transaction is becoming a clusterfuck. Basically, we have to fix the obvious error when try to
+    //  swap out OutsideReferences, which clearly won't work due to recurrence, AND we need to also make it
+    //  abstract enough to handle the HashValue.nullSwappingWith, so we can make find's checks of nullSwappingWith
+    //  transactional, allowing find to correctly retry if any swaps (well really deletes of swapped values) may have happened.
+    union {
+        OutsideReference nullToDelete;
+        // We take ownership of this, because we have to, or else we can't ensure the pointer won't be recurrent.
+        InsideReference* refToDelete;
+    };
+    // targetToDelete is set to 0 when it has been applied
+    OutsideReference* targetToDelete;
+} DeleteInsertState;
+#pragma pack(pop)
+CASSERT(sizeof(DeleteInsertState) == 16);
+
+
+#pragma pack(push, 1)
+typedef __declspec(align(16)) struct {
     // slotsCount is immutable (obviously)
     uint64_t slotsCount;
     uint64_t logSlotsCount;
+
+    // ATTENTION! ALL transition to Null, or 0 have to go through deleteState, EXCEPT for moves,
+    //  which are allowed to forcefully remove data, and force function to try to fix it post-hoc.
+    // This is needed so inserts can tell if it is possible a value was deleted before them
+    //  (making them no longer connect to their base index, and so not findable).
+    //  It is not possible to tell this by iterating, as it is possible that as we iterate
+    //  values are added, and then deleted, following our iteration.
+    DeleteInsertState deleteState;
 
     // Values and the underlying memory valuePool takes from are both taken from the rest of the allocation.
     AtomicSlot* slots;
@@ -149,40 +178,20 @@ typedef __declspec(align(16)) struct {
 CASSERT(sizeof(MoveStateInner) == 16);
 
 #pragma pack(push, 1)
+typedef __declspec(align(16)) struct {
+    // Below here is initialized to 0
+    uint64_t indexToSwapPlusOne;
+    OutsideReference valueToSwap;
+} DeleteStateInner;
+#pragma pack(pop)
+CASSERT(sizeof(DeleteStateInner) == 16);
+
+#pragma pack(push, 1)
 typedef struct {
-    uint64_t type;
-    union {
-        struct {
-            // type = 1, move table (does entire table move)
-            //  (newAllocation must be prepared correctly before the operation is added)
-            todonext
-            // newAllocation must populate all of the initial slots with GetNextNull
-            OutsideReference newAllocation;
-            // Must be initialized with sourceSlot as GetNextNull
-            MoveStateInner moveState;
-        };
-        struct {
-            // type = 2, remove entry
-            //  Upon completing this operation threads will try to swap this operation
-            //      out for another operation with indexToRemove=indexToSwapPlusOne and valueToRemove=valueToSwap,
-            //      unless valueToSwap is 0.
-            uint64_t indexToRemove;
-            OutsideReference valueToRemove;
-            // Below here is initialized to 0
-            uint64_t indexToSwapPlusOne;
-            OutsideReference valueToSwap;
-        };
-        // Inserts depend on all the indexes between them and the base index (including the base index) being
-        //  non-zero. So upon an insert, if operations have been applied, we have to search again. This may result
-        //  in duplicate inserts. So, we mark inside a value as "maybe duplicate", and then reset that if we
-        //  insert without operations in between, OR if we verify the insert without having any operations
-        //  inserted. And verifying we can even handle our inserted value being moved around.
-        //  - And we can even handle holes being inserted before us by adding a delete of our added value, and then
-        //      inserting it again.
-        //  - And we can even handle moves by searching for our insert to see if we added it
-        //  - Actually... I think we can always recover (unless the inserting thread crashes)... so... maybe we don't
-        //      even need a "maybe duplicate flag"?
-    };
+    // type = 1, move table (does entire table move)
+    OutsideReference newAllocation;
+    // Must be initialized with sourceSlot as GetNextNull
+    MoveStateInner moveState;
 } Operation;
 #pragma pack(pop)
 
@@ -191,7 +200,7 @@ typedef __declspec(align(16)) struct {
     // This actually also resides in our value mem pool, and THAT is the true owner of this.
     //  (we could duplicate it, but there's no need)
     OutsideReference currentAllocation;
-    // This is replaced with a GetNextNULL, never with 0
+    // This is replaced with a GetNextNull, never with 0
     // Operation*
     OutsideReference currentOperation;
 } TransactionState;
@@ -199,9 +208,6 @@ typedef __declspec(align(16)) struct {
 CASSERT(sizeof(TransactionState) == 16);
 
 
-
-// Values rounded up to 64 bit increments, as we can't really store less
-#define AtomicHashTableSlotSize(VALUE_SIZE) (sizeof(AtomicSlot) - sizeof(AtomicUnit2) + ((VALUE_SIZE) + sizeof(uint64_t) - 1) / sizeof(uint64_t) * sizeof(uint64_t) * 2)
 
 // Should be initialized as:
 //  AtomicHashTable2 table = AtomicHashTableDefault(VALUE_SIZE, void (*deleteValue)(void* value));
@@ -211,7 +217,7 @@ CASSERT(sizeof(TransactionState) == 16);
     VALUE_SIZE + sizeof(HashValue), \
     2, \
     deleteValue, \
-    {}, \
+    { {}, BASE_NULL }, \
     MemPoolFixedDefault(), \
 }
 #pragma pack(push, 1)
@@ -234,7 +240,6 @@ typedef __declspec(align(16)) struct {
     //  for example, from the shrink threshold to just under the grow threshold. This should not
     //  break the code as long as our grow threshold is below 50% (so shrinking instead of growing
     //  is still valid).
-
     uint64_t slotsReserved;
 
 } AtomicHashTable2;

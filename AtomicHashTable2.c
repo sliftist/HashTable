@@ -205,18 +205,6 @@ int atomicHashTable2_updateReserved(
     return 0;
 }
 
-todonext;
-// Actually... we can store AtomicHashTable2.state in the allocation, which gets rid of all dynamic allocations except the main one...
-//  (I guess we would store the move information for the new allocation, in the current allocation)
-
-todonext;
-// Update this so that that it can handle do work moves (that are before every
-//  external operation, and should do a fixed number of moves), AND
-//  block moves (moves that move a block of continous values, and the 0 after them,
-//  that way an operation can operation on a continous section.)
-// And then also, start triggering it based on slotsReservedWithNulls, and have it
-//  maintain slotsReservedWithNulls? That way it will trigger with no size change,
-//  and only function to remove nulls.
 
 // Returns 0 if moves were applied, but curAlloc and newAlloc are still relevant,
 //  and returns 1 if the move has finished
@@ -299,7 +287,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
                     continue;
                 }
 
-                todonext
+                //todonext
                 // Crap... this actually doesn't work. We have to atomically move it,
                 //  which requires moving the ref count into the underlying inside reference.
                 //  Which we have code to do... I think...
@@ -307,16 +295,28 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 //  AND reduce the ref count to 0. Hmm... I think we should just expose a function which
                 //  lets us try to reduce to ref count to 0, and then only swap with values that have a ref count
                 //  of 0, making the swap perfectly safe...
-                todonext
-                // So yeah, expose a function to reduce the ref count to 0.
 
-                if(InterlockedCompareExchange64(
-                    (LONG64*)pSource,
-                    &setSourceValue.valueForSet,
-                    &sourceValue.valueForSet
-                ) != sourceValue.valueForSet) {
+                //todonext
+                // Or maybe... try to ReplaceOutside with a version of the outside reference that has ref count set to 0,
+                //  and isNull set.
+
+                // This... freezes pSource, no one will ever change it after this. AND, it reduces the outside ref count to 0
+                //  first, so we don't break any outstanding references. HOWEVER! It doesn't break the pointer, and it doesn't
+                //  technically destroy the outside reference (as in, the outside reference's reference to the inner reference
+                //  is kept alive). So... it means even if this thread fails, the next thread can pick up after it, trivially.
+
+                setSourceValue.count = 0;
+                if(!Reference_ReplaceOutsideStealOutside(
+                    pSource,
+                    sourceRef,
+                    setSourceValue
+                )) {
+                    Reference_Release(pSource, sourceRef);
                     continue;
                 }
+                Reference_Release(pSource, sourceRef);
+
+                sourceValue = setSourceValue;
             }
             
             // If it is BASE_NULL1, it is because it was BASE_NULL and we changed it, so leave that null
@@ -585,7 +585,6 @@ int AtomicHashTable2_findInner(
     AtomicHashTable2* this,
     uint64_t hash,
     FindResult* valuesFound,
-    uint64_t* pValuesFoundCur,
     uint64_t* pValuesFoundLimit,
     OutsideReference* tableRefSource,
     void* callbackContext,
@@ -598,10 +597,11 @@ int AtomicHashTable2_findInner(
     AtomicHashTableBase* curAlloc = Reference_GetValue(curAllocRef);
 
     uint64_t valuesFoundLimitBefore = *pValuesFoundLimit;
-    int result = AtomicHashTable2_findInner2(this, curAlloc, hash, valuesFound, pValuesFoundCur, pValuesFoundLimit);
+    
+    uint64_t valuesFoundCur = 0;
+    int result = AtomicHashTable2_findInner2(this, curAlloc, hash, valuesFound, &valuesFoundCur, pValuesFoundLimit);
         
     if(result > 0) {
-        uint64_t valuesFoundCur = *pValuesFoundCur;
         for(uint64_t i = 0; i < valuesFoundCur; i++) {
             Reference_Release(valuesFound[i].refSource, valuesFound[i].ref);
         }
@@ -611,14 +611,13 @@ int AtomicHashTable2_findInner(
             return result;
         }
 
-        result = AtomicHashTable2_findInner(this, hash, valuesFound, pValuesFoundCur, pValuesFoundLimit, &curAlloc->newAllocation);
+        result = AtomicHashTable2_findInner(this, hash, valuesFound, pValuesFoundLimit, &curAlloc->newAllocation, callbackContext, callback);
 
         Reference_Release(&this->currentAllocation, curAllocRef);
 
         return result;
     }
 
-    uint64_t valuesFoundCur = *pValuesFoundCur;
     for(uint64_t i = 0; i < valuesFoundCur; i++) {
         void* value = (byte*)valuesFound[i].value + sizeof(HashValue);
         callback(callbackContext, value);
@@ -631,9 +630,38 @@ int AtomicHashTable2_findInner(
     return 0;
 }
 
+
 todonext;
 // Write the outside find wrapper, probably with a pool for valuesFound, or maybe stack allocated first?
 //  (and also check the ref source for 0 really quick before we even call findInner)
+int AtomicHashTable2_find(
+    AtomicHashTable2* this,
+    uint64_t hash,
+    void* callbackContext,
+    // May return results that don't equal the given hash, so a deep comparison should be done on the value
+	//	to determine if it is the one you want.
+	// (and obviously, may call this callback multiple times for one call, but not more than one time per call
+    //  for the same value, assuming no value is added to the table more than once).
+    void(*callback)(void* callbackContext, void* value)
+) {
+    uint64_t valuesFoundLimit = 10;
+    while(true) {
+        FindResult* valuesFound = MemPoolFixed_Allocate(&this->findValuePool, sizeof(FindResult) * valuesFoundLimit, hash);
+        if(!valuesFound) {
+            OnError(3);
+            return 3;
+        }
+        uint64_t valuesFoundLimitLast = valuesFoundLimit;
+        int result = AtomicHashTable2_findInner(this, hash, valuesFound, &valuesFoundLimit, &this->currentAllocation, callbackContext, callback);
+        if(result != 1 || valuesFoundLimit != valuesFoundLimitLast) {
+            MemPoolFixed_Free(&this->findValuePool, valuesFound);
+            if(result != 1) {
+                return result;
+            }
+            valuesFound = MemPoolFixed_Allocate(&this->findValuePool, sizeof(FindResult) * valuesFoundLimit, hash);
+        }
+    }
+}
 
 
 
@@ -821,7 +849,6 @@ int AtomicHashTable2_removeInner(
             loopCount++;
             if(loopCount > 10) {
                 atomicHashTable2_updateReservedUndo(this, table, -1, -1);
-                destroyUniqueOutsideRef(&valueOutsideRef);
                 Reference_Release(&table->newAllocation, newTableRef);
                 // Too many loops around the table...
                 OnError(9);
@@ -831,19 +858,43 @@ int AtomicHashTable2_removeInner(
     }
 }
 
+int AtomicHashTable2_remove(
+	AtomicHashTable2* this,
+	uint64_t hash,
+	void* callbackContext,
+	// On true, removes the value from the table
+    //  May be called multiple times for the value for one call.
+	bool(*callback)(void* callbackContext, void* value)
+) {
+    while(true) {
+        InsideReference* tableRef = Reference_Acquire(&this->currentAllocation);
+        if(!tableRef) {
+            return 0;
+        }
+        int result = AtomicHashTable2_removeInner(this, hash, callbackContext, callback, tableRef);
+        Reference_Release(&this->currentAllocation, tableRef);
+        if(result == 1) continue;
+        return result;
+    }
+}
 
 
 
 
 
-uint64_t DebugAtomicHashTable2_reservedSize(AtomicHashTable2* self) {
-    return self->slotsReserved;
+uint64_t DebugAtomicHashTable2_reservedSize(AtomicHashTable2* this) {
+    InsideReference* tableRef = Reference_Acquire(&this->currentAllocation);
+    if(!tableRef) return 0;
+    AtomicHashTableBase* table = Reference_GetValue(tableRef);
+    uint64_t slotsReserved = table->slotsReserved;
+    Reference_Release(&this->currentAllocation, tableRef);
+    return slotsReserved;
 }
 uint64_t DebugAtomicHashTable2_allocationSize(AtomicHashTable2* this) {
-    InsideReference* curRef = Reference_Acquire(&this->currentAllocation.ref);
-    if(!curRef) {
-        return 0;
-    }
-    AtomicHashTableBase* table = curRef->pointer;
-    return table->slotsCount;
+    InsideReference* tableRef = Reference_Acquire(&this->currentAllocation);
+    if(!tableRef) return 0;
+    AtomicHashTableBase* table = Reference_GetValue(tableRef);
+    uint64_t slotsCount = table->slotsCount;
+    Reference_Release(&this->currentAllocation, tableRef);
+    return slotsCount;
 }

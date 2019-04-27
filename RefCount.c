@@ -15,7 +15,7 @@
 
 static OutsideReference emptyReference = { 0 };
 
-static OutsideReference PREV_NULL = BASE_NULL_LAST;
+static OutsideReference PREV_NULL = BASE_NULL_LAST_CONST;
 OutsideReference GetNextNull() {
     OutsideReference value;
     value.valueForSet = InterlockedIncrement64((LONG64*)&PREV_NULL.valueForSet);
@@ -189,7 +189,7 @@ bool releaseInsideReference(InsideReference* insideRef) {
 
     // Remove nodes that have no more external references
     while(true) {
-        todonext
+        todonext;
         // Yeah... so, when we are swapping prevRedirectValue->nextRedirectValue... that is dangerous,
         //  because anyone with a pointer to prevRedirectValue (through prevRedirectValue->prevRedirectValue->nextRedirectValue),
         //  won't be able to follow the list... so... we have to think about this more...
@@ -442,7 +442,7 @@ void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef)
     releaseInsideReference(insideRef);
 }
 
-bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef) {
+bool Reference_ReplaceOutsideInner(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef, bool freeOriginalOutsideRef) {
     if(IsOutsideRefCorrupt(*pOutsideRef)) return false;
     if(IsInsideRefCorrupt(pInsideRef)) return false;
 
@@ -485,13 +485,9 @@ bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pI
 			continue;
 		}
 
-        if(newInsideRef) {
-            InterlockedAdd64((LONG64*)newInsideRef, 1ll << COUNT_OFFSET_BITS);
-        }
-
         // Now that the outside ref is atomically gone, we can remove the outside's own ref to the inside ref
         //  (this is NOT the reference the caller has, this is the outside reference's own ref, completely different)
-        if(releaseInsideReference(pInsideRef)) {
+        if(freeOriginalOutsideRef && releaseInsideReference(pInsideRef)) {
             // If our reference's own reference was the last reference, that means the caller lied about
             //  having a reference, and bad stuff is going to happen...
             OnError(3);
@@ -511,10 +507,17 @@ bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pI
     }
     return false;
 }
+bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef) {
+    return Reference_ReplaceOutsideInner(pOutsideRef, pInsideRef, newOutsideRef, true);
+}
+bool Reference_ReplaceOutsideStealOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef) {
+    return Reference_ReplaceOutsideInner(pOutsideRef, pInsideRef, newOutsideRef, false);
+}
+
 bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
     return Reference_ReplaceOutside(pOutsideRef, pInsideRef, emptyReference);
 }
-bool Reference_DestroyOutsideMakeNull(OutsideReference* outsideRef, InsideReference* insideRef) {
+bool Reference_DestroyOutsideMakeNull(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
     return Reference_ReplaceOutside(pOutsideRef, pInsideRef, BASE_NULL);
 }
 
@@ -532,7 +535,7 @@ bool Reference_SetOutside(OutsideReference* pOutsideRef, InsideReference* pInsid
         // The ref count on a nullptr can be positive. We will never release this ref, so it doesn't matter, just wipe it out
         //if(outsideRef.count != 0) return false;
 
-        InterlockedIncrement64((LONG64*)&pInsideRef->count);
+        InterlockedIncrement64((LONG64*)&pInsideRef->countFullValue);
 
         OutsideReference outsideRefOriginal = outsideRef;
         outsideRef.count = 0;

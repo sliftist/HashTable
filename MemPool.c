@@ -1,5 +1,8 @@
 #include "MemPool.h"
 
+todonext
+// Implementations of all mem pools.
+
 void* MemoryPool_Allocate(MemoryPool* this) {
     for(uint64_t i = 0; i < MEMORY_POOL_MAX_VALUES; i++) {
         void* value = this->values[i];

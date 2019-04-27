@@ -1,5 +1,6 @@
 #include "MemPool.h"
 #include "RefCount.h"
+#include "MemPoolImpls.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -260,21 +261,20 @@ typedef __declspec(align(16)) struct {
 #define AtomicHashTableDefault(VALUE_SIZE, deleteValue) { \
     VALUE_SIZE,\
     VALUE_SIZE + sizeof(HashValue), \
-    2, \
     deleteValue, \
-    { {}, BASE_NULL }, \
     MemPoolFixedDefault(), \
 }
 #pragma pack(push, 1)
-typedef __declspec(align(16)) struct {
+typedef struct {
     // (in bytes)
     uint64_t VALUE_SIZE;
     uint64_t HASH_VALUE_SIZE;
 
-    uint64_t nextUniqueId;
     void (*deleteValue)(void* value);
 
-    OutsideReference currentAllocation;   
+    MemPoolFixed findValuePool;
+
+    OutsideReference currentAllocation;
 
 } AtomicHashTable2;
 #pragma pack(pop)

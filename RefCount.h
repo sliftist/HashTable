@@ -90,7 +90,8 @@ CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
 #define BASE_NULL7 ((OutsideReference){ 7, 0, 1 })
 #define BASE_NULL8 ((OutsideReference){ 8, 0, 1 })
 #define BASE_NULL9 ((OutsideReference){ 9, 0, 1 })
-#define BASE_NULL_LAST ((OutsideReference){ 10, 0, 1  })
+#define BASE_NULL_LAST_CONST { 10, 0, 1  }
+#define BASE_NULL_LAST ((OutsideReference) BASE_NULL_LAST_CONST )
 
 OutsideReference GetNextNull();
 void* Reference_GetValue(InsideReference* ref);
@@ -145,6 +146,12 @@ bool Reference_DestroyOutside(OutsideReference* outsideRef, InsideReference* ins
 // Makes the outsideRef BASE_NULL after it destroys it, instead of 0
 //  returns true on success
 bool Reference_DestroyOutsideMakeNull(OutsideReference* outsideRef, InsideReference* insideRef);
+
+//  returns true on success
+bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef);
+
+// We need this in one specific place...
+bool Reference_ReplaceOutsideStealOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef);
 
 
 // dest must be zeroed out, OR previously an outside ref destroyed by DestroyReference

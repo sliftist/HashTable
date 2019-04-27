@@ -49,6 +49,9 @@ typedef struct InsideReference InsideReference;
 //  on the value anyway.
 // Also, because it uses an expression, outsideRef obviously can't be a shared value...
 // Also, doesn't compare against nullptr InsideReferences...
+
+#define COUNT_OFFSET_BITS (BITS_IN_ADDRESS_SPACE)
+
 #if defined(WINDOWS) && defined(KERNEL)
 #define FAST_CHECK_POINTER(outsideRef, insideRef) (!(outsideRef).isNull && (outsideRef).pointerClipped == ((uint64_t)(insideRef) & ((1ll << BITS_IN_ADDRESS_SPACE) - 1)))
 #else
@@ -67,10 +70,8 @@ typedef struct InsideReference InsideReference;
 typedef struct {
     union {
         struct {
-            
             uint64_t pointerClipped : BITS_IN_ADDRESS_SPACE;
             uint64_t count : 64 - BITS_IN_ADDRESS_SPACE - 1;
-            // Special metadata flag, for use if you need an extra metadata bit, and don't want to exceed 64 bits.
             uint64_t isNull : 1;
         };
         uint64_t valueForSet;
@@ -79,7 +80,17 @@ typedef struct {
 #pragma pack(pop)
 CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
 
-#define BASE_NULL() { 0, 0, 1 }
+#define BASE_NULL ((OutsideReference){ 0, 0, 1 })
+#define BASE_NULL1 ((OutsideReference){ 1, 0, 1 })
+#define BASE_NULL2 ((OutsideReference){ 2, 0, 1 })
+#define BASE_NULL3 ((OutsideReference){ 3, 0, 1 })
+#define BASE_NULL4 ((OutsideReference){ 4, 0, 1 })
+#define BASE_NULL5 ((OutsideReference){ 5, 0, 1 })
+#define BASE_NULL6 ((OutsideReference){ 6, 0, 1 })
+#define BASE_NULL7 ((OutsideReference){ 7, 0, 1 })
+#define BASE_NULL8 ((OutsideReference){ 8, 0, 1 })
+#define BASE_NULL9 ((OutsideReference){ 9, 0, 1 })
+#define BASE_NULL_LAST ((OutsideReference){ 10, 0, 1  })
 
 OutsideReference GetNextNull();
 void* Reference_GetValue(InsideReference* ref);
@@ -131,13 +142,15 @@ void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef)
 // Must have an inside reference to be called, but does not free inside reference
 //  returns true on success
 bool Reference_DestroyOutside(OutsideReference* outsideRef, InsideReference* insideRef);
+// Makes the outsideRef BASE_NULL after it destroys it, instead of 0
+//  returns true on success
+bool Reference_DestroyOutsideMakeNull(OutsideReference* outsideRef, InsideReference* insideRef);
 
 
 // dest must be zeroed out, OR previously an outside ref destroyed by DestroyReference
 // Must have an inside reference to be called, and does not free inside reference
 //  returns true on success
 bool Reference_SetOutside(OutsideReference* outsideRef, InsideReference* insideRef);
-
 
 #ifdef __cplusplus
 }

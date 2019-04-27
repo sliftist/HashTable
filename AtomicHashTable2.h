@@ -5,6 +5,29 @@
 extern "C" {
 #endif
 
+// TODO: Oh... if we actually spread out moves, over many operations, we can just use tombstone deleting, and
+//  then trigger moving once our effective fill rate hits a certain limit, and move from the same size to the
+//  same size allocation... because moving can filter out tombstones...
+//  - Moving over time requires better checking for consistency during a move
+//      - Because values don't move insertions are trivial to check to see if they've been inserted
+//      - Oh... but deletions... how can we tell if a block has been moved? Hmm... maybe...
+//          we just shouldn't spread out moves? It is okay if insertions and deletions are sometimes slower,
+//          as long as finds are fast...
+//todonext;
+// Hmm... how can finds work with moves? Messing up block starts is a problem...
+//  - Oh, we can have two reserved null values, one that is swapped with non 0 values, and a different
+//  one for 0 values.
+//      - And then... this actually helps support partial moves, because it means...
+//          - If you iterate over both blocks (one maybe partially moved), then you will always get every entry,
+//              because for something to be removed from the first block it will have to already be in the second...
+//todonext;
+// Oh.. but deletes... how can we be sure something is deleted? I guess... we can tell if the move
+//  range overlapped with both blocks we searched, and if it didn't, then we are fine. Oh, and
+//  we can tell if either of our blocks are borderline moved
+//  - Actually... maybe we should just make it so if anything finds any moved null values
+//  while searching it should help with moving just until its block gets moved, and then
+//  it should try to access the list again.
+//      - Although even then, delete will still need to do extra checks...
 
 //todonext
 // During contention holes appear in continous blocks in the hash table. So... clearly some of our code is wrong.
@@ -42,6 +65,11 @@ extern "C" {
 //  Just like a find during a move, or deletion, will know to retry. And an insertion will retry if a move,
 //  or deletion happens. And we even retry a delete if a delete happens.
 
+todonext;
+// Oh... so, if we see isNull flag set, and it isn't BASE_NULL1, then we help with the move
+//  (BASE_NULL1 is the tombstone marker)
+
+
 #pragma pack(push, 1)
 typedef struct {
     uint64_t deleted;
@@ -57,18 +85,25 @@ typedef struct {
 #pragma pack(push, 1)
 typedef struct {
     // HashValue*
-    // If isNull then this is a skip value, so we have to keep searching
+    // Usually this is a real pointer, 0, BASE_NULL (the tombstone).
+    //  If it is any other form of isNull, it means it has been moved, and we should go try to apply
+    //  the move algorithm until we finish moving everything in our block.
     OutsideReference value;
 } AtomicSlot;
 #pragma pack(pop)
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
-    todonext
+    //todonext
     // Ugh... this transaction is becoming a clusterfuck. Basically, we have to fix the obvious error when try to
     //  swap out OutsideReferences, which clearly won't work due to recurrence, AND we need to also make it
     //  abstract enough to handle the HashValue.nullSwappingWith, so we can make find's checks of nullSwappingWith
     //  transactional, allowing find to correctly retry if any swaps (well really deletes of swapped values) may have happened.
+    // Oh... the ref to delete has be an outside reference too, but a reference we own. And then when we wipe out targetToDelete,
+    //  we have to always put a null reference in nullToDelete, so we always have a unique value
+    //  - The intermediate outside reference won't be good enough to give us our delete version HOWEVER, anyone that sees
+    //      it will have to apply it, and in applying it they will have to acquire the reference, which will protect us
+    //      from hanging writes in application. And then after we apply it our delete version WILL be good enough, so... it will all work...
     union {
         OutsideReference nullToDelete;
         // We take ownership of this, because we have to, or else we can't ensure the pointer won't be recurrent.
@@ -80,29 +115,6 @@ typedef __declspec(align(16)) struct {
 #pragma pack(pop)
 CASSERT(sizeof(DeleteInsertState) == 16);
 
-
-#pragma pack(push, 1)
-typedef __declspec(align(16)) struct {
-    // slotsCount is immutable (obviously)
-    uint64_t slotsCount;
-    uint64_t logSlotsCount;
-
-    // ATTENTION! ALL transition to Null, or 0 have to go through deleteState, EXCEPT for moves,
-    //  which are allowed to forcefully remove data, and force function to try to fix it post-hoc.
-    // This is needed so inserts can tell if it is possible a value was deleted before them
-    //  (making them no longer connect to their base index, and so not findable).
-    //  It is not possible to tell this by iterating, as it is possible that as we iterate
-    //  values are added, and then deleted, following our iteration.
-    DeleteInsertState deleteState;
-
-    // Values and the underlying memory valuePool takes from are both taken from the rest of the allocation.
-    AtomicSlot* slots;
-    // Value count equals slot count. Because we always have extra slots,
-    //  and if we run out of values we should first run out of slotsReserved.
-    MemPoolHashed* valuePool;
-
-} AtomicHashTableBase;
-#pragma pack(pop)
 
 
 // TODO: Make reference counting optional, as sometimes we won't even need it
@@ -159,6 +171,10 @@ typedef __declspec(align(16)) struct {
 } AtomicUnit2;
 #pragma pack(pop)
 
+// When deleting we replace values with BASE_NULL
+// When moving we replace 0s with BASE_NULL2
+// When moving we replace non-0s with BASE_NULL3
+// We default new allocations to BASE_NULL4
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
@@ -168,11 +184,12 @@ typedef __declspec(align(16)) struct {
     //  atomic state should be faster?
     uint32_t nextSourceSlot;
     int32_t destOffset;
-    // Set to 0 when we increment nextSourceSlot, and then read in while reading nextSourceSlot.
-    // Unique, because the destination is populate with GetNextNull
-    //  As we only read this one, and only populate it once per nextSourceSlot, moves
-    //  can't introduce hanging inserts.
-    OutsideReference destSlot;
+
+    // If BASE_NULL then we skip setting it
+    //  We own this sourceValue (it is moved correctly), so to move
+    //  it into the slot we need to get a reference and create a new outside reference, and then
+    //  the thread that swaps this out for 0 has to destroy this outside reference.
+    OutsideReference sourceValue;
 } MoveStateInner;
 #pragma pack(pop)
 CASSERT(sizeof(MoveStateInner) == 16);
@@ -188,7 +205,7 @@ CASSERT(sizeof(DeleteStateInner) == 16);
 
 #pragma pack(push, 1)
 typedef struct {
-    // type = 1, move table (does entire table move)
+    //AtomicHashTableBase*
     OutsideReference newAllocation;
     // Must be initialized with sourceSlot as GetNextNull
     MoveStateInner moveState;
@@ -199,6 +216,7 @@ typedef struct {
 typedef __declspec(align(16)) struct {
     // This actually also resides in our value mem pool, and THAT is the true owner of this.
     //  (we could duplicate it, but there's no need)
+    //AtomicHashTableBase*
     OutsideReference currentAllocation;
     // This is replaced with a GetNextNull, never with 0
     // Operation*
@@ -206,6 +224,33 @@ typedef __declspec(align(16)) struct {
 } TransactionState;
 #pragma pack(pop)
 CASSERT(sizeof(TransactionState) == 16);
+
+
+
+#pragma pack(push, 1)
+typedef __declspec(align(16)) struct {
+    // slotsCount is immutable (obviously)
+    // TODO: Try setting these to const, and seeing if it makes the compiler optimize
+    uint64_t slotsCount;
+    uint64_t logSlotsCount;
+
+    // Values and the underlying memory valuePool takes from are both taken from the rest of the allocation.
+    AtomicSlot* slots;
+    // Value count equals slot count. Because we always have extra slots,
+    //  and if we run out of values we should first run out of slotsReserved.
+    MemPoolHashed* valuePool;
+
+    // Initialized to 0
+    MoveStateInner moveState;
+    
+    //AtomicHashTableBase*
+    OutsideReference newAllocation;
+    
+    uint64_t slotsReserved;
+    uint64_t slotsReservedWithNulls;
+
+} AtomicHashTableBase;
+#pragma pack(pop)
 
 
 
@@ -229,18 +274,7 @@ typedef __declspec(align(16)) struct {
     uint64_t nextUniqueId;
     void (*deleteValue)(void* value);
 
-    TransactionState state;
-    MemPoolFixed operationPool;
-
-    // As slotsReserved isn't inside of allocationsState (there isn't enough room),
-    //  it means there is a slight race condition. If one thread wants to shrink the time
-    //  between seeing slotsReserved and changing allocationsState is not safe, and therefore
-    //  slotsReserved can change drastically. If it changes enough to require an allocation change
-    //  then the exchange will fail, but it can change enough to not require an allocation change,
-    //  for example, from the shrink threshold to just under the grow threshold. This should not
-    //  break the code as long as our grow threshold is below 50% (so shrinking instead of growing
-    //  is still valid).
-    uint64_t slotsReserved;
+    OutsideReference currentAllocation;   
 
 } AtomicHashTable2;
 #pragma pack(pop)

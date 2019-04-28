@@ -112,13 +112,12 @@ bool Reference_IsNull(uint64_t);
 void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPointer, uint64_t size, uint64_t hash);
 
 // Makes it so future Reference_Acquire calls that would return oldRef now return newRef (for all OutsideReferences).
-// Returns true on success, or false if it has already been redirected.
-bool Reference_RedirectReference(
+// If this is called multiple times on the same oldRef, the same newRef must be given, or else things will break.
+void Reference_RedirectReference(
     // Must be acquired first
     // If already redirected, fails and returns false.
     InsideReference* oldRef,
-    // Must be allocated normally, and having the value, pool, etc, set as desired.
-    //  This must be exclusive to this thread.
+    // Allocated normally, and having the value, pool, etc, set as desired.
     InsideReference* newRef
 );
 

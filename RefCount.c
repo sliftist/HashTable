@@ -46,18 +46,10 @@ struct InsideReference {
     MemPool* pool;
 
     // Means, the underlying value should be read from nextRedirectValue
-    // NOTE: Of course, this means values may be in multiple locations at once. So either values have to be immutable,
-    //  or you have to have detection for values being moved, OR you just have to make it so previous values being read is fine.
-    //  (although we do make guarantees about making it so any new references obtained receive the freshest value at that time,
-    //  which makes this mostly moot, as long as writing and moving are synchronized via some external atomic technique).
     OutsideReference nextRedirectValue;
 
-    // Means something else is pointing to us for its value. This is important as it allows us to prevent
-    //  hanging references from forming infinitely long chains, and instead allows us to shrink the chains
-    //  to only contain the current, and hanging reference.
-    //  - And long chains is bad for everyone, as any reference that has moved likely has an implicit referenec
-    //      to its MemPool... and so if we don't shrink long chains we could easily start leaking all allocations,
-    //      just because one thread crashed once.
+    // Used to update nextRedirectValue of all of our nodes, as we can't free any nodes
+    //  if a previous node has a nextRedirectValue pointing to them.
     OutsideReference prevRedirectValue;
 };
 #pragma pack(pop)
@@ -153,180 +145,179 @@ bool XchgOutsideReference(
     return InterlockedCompareExchange64((LONG64*)structAddress, *(LONG64*)structNew, *(LONG64*)structOriginal) == *(LONG64*)structOriginal;
 }
 
-bool Reference_RedirectReference(
+void Reference_RedirectReferenceInner(
+    // Must be acquired first
+    // If already redirects, fails and returns false.
+    InsideReference* oldRef,
+    // Must be allocated normally, and have the value set as desired
+    InsideReference* newRef,
+    // If this is passed, frees oldRef on return.
+    OutsideReference* oldRefSource
+) {
+    if(IsInsideRefCorrupt(oldRef)) return;
+    if(IsInsideRefCorrupt(newRef)) return;
+
+  
+    // Basically a faster Reference_SetOutside (avoids extra dereference checks, because we know we already have a reference)
+    InterlockedIncrement64((LONG64*)&oldRef->countFullValue);
+    OutsideReference newRefPrevRedirectValue;
+    newRefPrevRedirectValue.valueForSet = InterlockedCompareExchange64(
+        (LONG64*)&newRef->prevRedirectValue,
+        &oldRef,
+        &emptyReference
+    );
+    #ifdef DEBUG
+    if(!FAST_CHECK_POINTER(newRefPrevRedirectValue, oldRef)) {
+        InterlockedIncrement64((LONG64*)&oldRef->countFullValue);
+        // Redirect was called with the same of newRef, but different oldRefs... This should never happen.
+        OnError(4);
+        return 4;
+    }
+    #endif
+    if(newRefPrevRedirectValue.valueForSet != 0) {
+        InterlockedDecrement64((LONG64*)&oldRef->countFullValue);
+    }
+    
+    
+    // Another faster Reference_SetOutside?
+    InterlockedIncrement64((LONG64*)&newRef->countFullValue);
+    OutsideReference oldRefNextRedirectValue;
+    oldRefNextRedirectValue.valueForSet = InterlockedCompareExchange64(
+        (LONG64*)&oldRef->nextRedirectValue,
+        &newRef,
+        &emptyReference
+    );
+    #ifdef DEBUG
+    if(!FAST_CHECK_POINTER(oldRefNextRedirectValue, newRef)) {
+        InterlockedDecrement64((LONG64*)&newRef->countFullValue);
+        // Redirect was called with the same of oldRef, but different newRefs... This should never happen.
+        OnError(4);
+        return 4;
+    }
+    #endif
+    if(oldRefNextRedirectValue.valueForSet != 0) {
+        InterlockedDecrement64((LONG64*)&newRef->countFullValue);
+    }
+
+    InsideReference* prevPrev = Reference_Acquire(&oldRef->prevRedirectValue);
+
+    // Eh... it's annoying to get rid of recursion here, it would require making it so oldRef->prevRedirectValue
+    //  moves it's count inside, so release can release against the emptyReference, letting us release oldRef
+    //  and still be able to release prevPrev safely. But... recursion here isn't so bad... so it should be fine...
+    Reference_RedirectReferenceInner(prevPrev, newRef, &oldRef->prevRedirectValue);
+
+    if(oldRefSource) {
+        Reference_Release(oldRefSource, oldRef);
+    }
+}
+
+void Reference_RedirectReference(
     // Must be acquired first
     // If already redirects, fails and returns false.
     InsideReference* oldRef,
     // Must be allocated normally, and have the value set as desired
     InsideReference* newRef
 ) {
-    if(IsInsideRefCorrupt(oldRef)) return false;
-    if(IsInsideRefCorrupt(newRef)) return false;
-
-   
-    // faster Reference_SetOutside
-    InterlockedIncrement64((LONG64*)&oldRef->countFullValue);
-    newRef->prevRedirectValue.valueForSet = oldRef;
-
-
-    newRef->count++;
-    OutsideReference newOutsideRef;
-    newOutsideRef.valueForSet = newRef;
-    bool didRedirect = XchgOutsideReference(&oldRef->nextRedirectValue, &emptyReference, &newOutsideRef);
-    if(didRedirect) {
-        return true;
-    }
-
-    newRef->count--;
-
-    Reference_DestroyOutside(&newRef->prevRedirectValue, oldRef);
-
-    return false;
+    Reference_RedirectReferenceInner(oldRef, newRef, nullptr);
 }
+
+InsideReference* Reference_AcquireInside(OutsideReference* pRef) {
+    InsideReference* ref = Reference_Acquire(pRef);
+    if(!ref) return nullptr;
+    InterlockedIncrement64((LONG64*)&ref->countFullValue);
+    Reference_Releases(pRef, ref);
+    return ref;
+}
+
+
 
 bool releaseInsideReference(InsideReference* insideRef) {
     if(IsInsideRefCorrupt(insideRef)) return false;
 
-    // Remove nodes that have no more external references
+    // Consider if we are only alive because of prevRedirectValue references to us.
     while(true) {
-        todonext;
-        // Yeah... so, when we are swapping prevRedirectValue->nextRedirectValue... that is dangerous,
-        //  because anyone with a pointer to prevRedirectValue (through prevRedirectValue->prevRedirectValue->nextRedirectValue),
-        //  won't be able to follow the list... so... we have to think about this more...
+        // If we don't have a next value, then we are the most recent, and so there are no prevRedirectValues to find and remove.
+        //  Hmm... is it possible for our previous to not be able to destruct because we are referencing to it,
+        //  and for some reason the only time it lost it's real reference it couldn't remove our prevRedirectValue
+        //  to it? Hmm... maybe...
+        if(insideRef->nextRedirectValue.valueForSet == 0) break;
+        
+        if(insideRef->count != 2) break;
+        // 2 references, meaning the one we are about to remove, and 1 from a prevRedirectValue pointing to us.
 
-        // Hmm... maybe make it truly a singly linked list, with jumps to the head?
+        // We could re-enter here with no prevRedirectValue pointing to us. But that is fine... we will just do a wasteful search.
+        //  And once we get here, we know there are no non-internal references to us, as we always start with a prevRedirectValue,
+        //  so 2 here means there are none, and we only wipe out all prevRedirectValue that point to us in here, so...
+        //  we can't reach 2 again because of external references...
 
-        if(!insideRef->rearranging) {
-            if(PACKED_POINTER_GET_POINTER(insideRef->nextRedirectValue)) {
-                if(PACKED_POINTER_GET_POINTER(insideRef->prevRedirectValue)) {
-                    if(insideRef->countFullValue == 3) {
-                        // Set rearranging to 1
-                        if(InterlockedCompareExchange64(&insideRef->countFullValue, (1ll << 63) | 3, 3) != 3) {
-                            continue;
-                        }
-
-                        // Wait... does this work? What if something follows nextRedirectValue inside Acquire? We didn't really clone prevRedirectValue
-                        //  correctly... so... I think we need to clone prevRedirectValue correct to get this to work.
-                        // TODO: Actually clone prevRedirectValue properly, making a new outside reference, instead of pretending
-                        //  no one else will change it while we increment it...
-
-                        OutsideReference prevOutsideRef;
-                        prevOutsideRef.valueForSet = InterlockedAdd64((LONG64*)&insideRef->prevRedirectValue, 1ll << COUNT_OFFSET_BITS);
-                        InsideReference* prev = PACKED_POINTER_GET_POINTER(prevOutsideRef);
-                        if(!prev) {
-                            insideRef->rearranging = 0;
-                            continue;
-                        }
-
-                        OutsideReference nextOutsideRef;
-                        nextOutsideRef.valueForSet = InterlockedAdd64((LONG64*)&insideRef->nextRedirectValue, 1ll << COUNT_OFFSET_BITS);
-                        InsideReference* next = PACKED_POINTER_GET_POINTER(nextOutsideRef);
-                        if(!next) {
-                            insideRef->rearranging = 0;
-                            Reference_Release(&insideRef->prevRedirectValue, prev);
-                            continue;
-                        }
-
-                        // Set prev->rearranging to 1
-                        uint64_t prevCountFullValue = prev->countFullValue;
-                        if(InterlockedCompareExchange64(&prev->countFullValue, (1ll << 63) | prevCountFullValue, prevCountFullValue) != prevCountFullValue) {
-                            // Probably prev->rearranging, so abort
-                            insideRef->rearranging = 0;
-                            Reference_Release(&insideRef->prevRedirectValue, prev);
-                            Reference_Release(&insideRef->nextRedirectValue, next);
-                            break;
-                        }
-
-
-                        // Set next->rearranging to 1
-                        uint64_t nextCountFullValue = next->countFullValue;
-                        if(InterlockedCompareExchange64(&next->countFullValue, (1ll << 63) | nextCountFullValue, nextCountFullValue) != nextCountFullValue) {
-                            // Probably next->rearranging, so abort
-                            insideRef->rearranging = 0;
-                            prev->rearranging = 0;
-                            Reference_Release(&insideRef->prevRedirectValue, prev);
-                            Reference_Release(&insideRef->nextRedirectValue, next);
-                            break;
-                        }
-
-                        // We now have exclusive access to our node, and our siblings. So... we can remove our node now...
-
-                        if(!Reference_ReplaceOutside(&prev->nextRedirectValue, insideRef, nextOutsideRef)) {
-                            // Shouldn't happen, because rearranging is exclusively set nextRedirectValue should still point to us
-                            OnError(9);
-                            insideRef->rearranging = 0;
-                            prev->rearranging = 0;
-                            next->rearranging = 0;
-                            Reference_Release(&insideRef->prevRedirectValue, prev);
-                            Reference_Release(&insideRef->nextRedirectValue, next);
-                            break;
-                        }
-
-                        if(!Reference_ReplaceOutside(&next->prevRedirectValue, insideRef, prevOutsideRef)) {
-                            // Shouldn't happen, because rearranging is exclusively set nextRedirectValue should still point to us
-                            // Hmm... I don't think we can really cleanup next->prevRedirectValue
-                            // And then, we treat this the same as a regular successful destruction.
-                            OnError(9);
-                        }
-
-                        // Replace prev first, as having a next but no prev is valid, but the other way around isn't.
-                        if(!Reference_ReplaceOutside(&insideRef->prevRedirectValue, prev, GetNextNull())) {
-                            // Shouldn't happen, rearranging should exclusively hold this
-                            OnError(9);
-                        }
-                        if(!Reference_ReplaceOutside(&insideRef->nextRedirectValue, next, GetNextNull())) {
-                            // Shouldn't happen, rearranging should exclusively hold this
-                            OnError(9);
-                        }
-
-                        insideRef->rearranging = 0;
-                        prev->rearranging = 0;
-                        next->rearranging = 0;
-                        Reference_Release(&insideRef->prevRedirectValue, prev);
-                        Reference_Release(&insideRef->nextRedirectValue, next);
-                    }
-                } else {
-                    // We have no previous, so we just deattach a single node
-                    if(insideRef->count == 2) {
-                        if(InterlockedCompareExchange64(&insideRef->countFullValue, (1ll << 63) | 2, 2) != 2) {
-                            continue;
-                        }
-
-                        OutsideReference nextOutsideRef;
-                        nextOutsideRef.valueForSet = InterlockedAdd64((LONG64*)&insideRef->nextRedirectValue, 1ll << COUNT_OFFSET_BITS);
-                        InsideReference* next = PACKED_POINTER_GET_POINTER(nextOutsideRef);
-                        if(!next) {
-                            insideRef->rearranging = 0;
-                            continue;
-                        }
-
-                        // Set next->rearranging to 1
-                        uint64_t nextCountFullValue = next->countFullValue;
-                        if(InterlockedCompareExchange64(&next->countFullValue, (1ll << 63) | nextCountFullValue, nextCountFullValue) != nextCountFullValue) {
-                            // Probably next->rearranging, so abort
-                            insideRef->rearranging = 0;
-                            Reference_Release(&insideRef->nextRedirectValue, next);
-                            break;
-                        }
-
-                        if(!Reference_ReplaceOutside(&next->prevRedirectValue, insideRef, GetNextNull())) {
-                            // Shouldn't happen, rearranging should exclusively hold this
-                            OnError(9);
-                        }
-
-                        if(!Reference_ReplaceOutside(&insideRef->nextRedirectValue, insideRef, GetNextNull())) {
-                            // Shouldn't happen, rearranging should exclusively hold this
-                            OnError(9);
-                        }
-
-                        insideRef->rearranging = 0;
-                        next->rearranging = 0;
-                        Reference_Release(&insideRef->nextRedirectValue, next);
-                    }
-                }
-            }
+        // Hold 3 references to ourself, so we can't re-enter, even if someone else
+        //  freed the prevRedirectValue pointing to us.
+        if(InterlockedCompareExchange64(
+            (LONG64*)&insideRef->countFullValue,
+            4,
+            2
+        ) != 2) {
+            continue;
         }
-        break;
+
+        InsideReference* prevRedirect = nullptr;
+        if(!insideRef->prevRedirectValue.valueForSet) {
+            // Then... we should replace anything pointing to us with just 0...
+            // Also... the only way for nothing to have a prevRedirectValue to us, is if at one time we had only 2 references,
+            //  1 being the prevRedirectValue, and 1 freed before returning... so we don't have to worry about gaining new
+            //  outside references while looking for our prevRedirectValue, because more can't occur.
+        } else {
+            OutsideReference refForSet;
+            refForSet.valueForSet = InterlockedAdd64((LONG64*)&insideRef->prevRedirectValue, 1ll << COUNT_OFFSET_BITS);
+            if(refForSet.isNull || !refForSet.pointerClipped) {
+                InterlockedAdd64((LONG64*)&insideRef->countFullValue, -2);
+                continue;
+            }
+            InsideReference* prevRedirect = (void*)refForSet.pointerClipped;
+
+            InterlockedAdd64((LONG64*)&prevRedirect->countFullValue, 3);
+
+            if(!FAST_CHECK_POINTER(insideRef->prevRedirectValue, prevRedirect)) {
+                // Oh... our previous has likely changed, so we need to use the most recent. If insideRef->prevRedirectValue was the same
+                //  then we would know it would stay the same, because we increased the ref count by so much...
+                InterlockedAdd64((LONG64*)&prevRedirect->countFullValue, -2);
+                releaseInsideReference(prevRedirect);
+                continue;
+            }
+
+            Reference_Release((LONG64*)&insideRef->prevRedirectValue, prevRedirect);
+            // Now we have 3 reference, all inside, to prevRedirect, 2 of which we hold as a lock, and 1 which are going to use to
+            //  make an outside reference.
+        }
+
+        // Goes to the start of the list, as nextRedirectValue is kept pointing to the most recent node, not the opposite of prevRedirectValue.
+        InsideReference* searchNode = Reference_AcquireInside(&insideRef->nextRedirectValue);
+        // Oh... while searching we need to turn our references into inside references, because the outside reference
+        //  storage locations may be freed...
+        while(searchNode) {
+            if(FAST_CHECK_POINTER(searchNode->prevRedirectValue, insideRef)) {
+                OutsideReference prevRedirectRef;
+                // Turn the inside reference into an outside reference
+                prevRedirectRef.valueForSet = (uint64_t)prevRedirect;
+                if(!Reference_ReplaceOutside(&searchNode->prevRedirectValue, insideRef, prevRedirectRef)) {
+                    InterlockedAdd64((LONG64*)&insideRef->countFullValue, -2);
+                    InterlockedAdd64((LONG64*)&prevRedirect->countFullValue, -2);
+                    releaseInsideReference(searchNode);
+                    releaseInsideReference(prevRedirect);
+                    continue;
+                }
+                
+                InterlockedAdd64((LONG64*)&insideRef->countFullValue, -2);
+                InterlockedAdd64((LONG64*)&prevRedirect->countFullValue, -1);
+                releaseInsideReference(searchNode);
+                releaseInsideReference(prevRedirect);
+                break;
+            }
+
+            InsideReference* prevSearchNode = searchNode;
+            searchNode = Reference_AcquireInside(&searchNode->prevRedirectValue);
+            releaseInsideReference(prevRedirect);
+        }
     }
 
 

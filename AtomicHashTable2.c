@@ -15,7 +15,8 @@ uint64_t log2RoundDown(uint64_t v) {
 	return log2(v * 2) - 1;
 }
 
-#define SIZE_PER_COUNT(table) (table->HASH_VALUE_SIZE + InsideReferenceSize + MemPoolHashed_VALUE_OVERHEAD + sizeof(AtomicSlot))
+#define SIZE_PER_VALUE_ALLOC(table) (table->VALUE_SIZE + sizeof(HashValue) + InsideReferenceSize + MemPoolHashed_VALUE_OVERHEAD)
+#define SIZE_PER_COUNT(table) (SIZE_PER_VALUE_ALLOC(table) + sizeof(AtomicSlot))
 
 uint64_t minSlotCount(AtomicHashTable2* this) {
     uint64_t sizePerCount = SIZE_PER_COUNT(this);
@@ -184,7 +185,8 @@ int atomicHashTable2_updateReserved(
     }
 
     newTable->slotsCount = newSlotCount;
-    newTable->logSlotsCount = log2(newSlotCount);
+    uint64_t logSlotsCount = log2(newSlotCount);
+    newTable->logSlotsCount = logSlotsCount;
     newTable->slots = (void*)((byte*)newTable + sizeof(AtomicHashTableBase));
     newTable->valuePool = (void*)((byte*)newTable->slots + sizeof(AtomicSlot) * newSlotCount);
 
@@ -192,7 +194,7 @@ int atomicHashTable2_updateReserved(
         newTable->slots[i].value = BASE_NULL4;
     }
 
-    MemPoolHashed pool = MemPoolHashedDefault(this->VALUE_SIZE, newSlotCount, newAllocation, this, atomicHashTable2_memPoolFreeCallback);
+    MemPoolHashed pool = MemPoolHashedDefault(SIZE_PER_VALUE_ALLOC(this), newSlotCount, logSlotsCount, newAllocation, this, atomicHashTable2_memPoolFreeCallback);
     *newTable->valuePool = pool;
 
     if(InterlockedCompareExchange64(
@@ -286,19 +288,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 if(!FAST_CHECK_POINTER(sourceValue, sourceRef)) {
                     continue;
                 }
-
-                //todonext
-                // Crap... this actually doesn't work. We have to atomically move it,
-                //  which requires moving the ref count into the underlying inside reference.
-                //  Which we have code to do... I think...
-                // And actually! This whole thing of setting isNull doesn't work... We need to... both set isNull,
-                //  AND reduce the ref count to 0. Hmm... I think we should just expose a function which
-                //  lets us try to reduce to ref count to 0, and then only swap with values that have a ref count
-                //  of 0, making the swap perfectly safe...
-
-                //todonext
-                // Or maybe... try to ReplaceOutside with a version of the outside reference that has ref count set to 0,
-                //  and isNull set.
 
                 // This... freezes pSource, no one will ever change it after this. AND, it reduces the outside ref count to 0
                 //  first, so we don't break any outstanding references. HOWEVER! It doesn't break the pointer, and it doesn't
@@ -631,9 +620,6 @@ int AtomicHashTable2_findInner(
 }
 
 
-todonext;
-// Write the outside find wrapper, probably with a pool for valuesFound, or maybe stack allocated first?
-//  (and also check the ref source for 0 really quick before we even call findInner)
 int AtomicHashTable2_find(
     AtomicHashTable2* this,
     uint64_t hash,

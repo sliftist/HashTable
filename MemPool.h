@@ -2,8 +2,6 @@
 
 #include "environment.h"
 
-#define MEMORY_POOL_MAX_VALUES 3
-
 #ifdef __cplusplus
 extern "C" {
 #endif

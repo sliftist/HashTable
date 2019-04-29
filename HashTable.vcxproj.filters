@@ -18,28 +18,10 @@
     <ClCompile Include="main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="simple_table.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="TransactionQueue.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="TransactionQueueHelpers.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="AtomicHelpers.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="AtomicHashTable.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="ReferenceCounter.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="mersenne-twister.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="AtomicHashTableDebug.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Timing.c">
@@ -49,9 +31,6 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="RefCount.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="TransApply.c">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="AtomicHashTable2.c">
@@ -68,37 +47,16 @@
     <ClInclude Include="mersenne-twister.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="simple_table.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="TransactionQueue.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="TransactionQueueHelpers.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="environment.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="AtomicHelpers.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="AtomicHashTable.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="ReferenceCounter.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="AtomicHashTableDebug.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="Timing.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="RefCount.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="TransApply.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="AtomicHashTable2.h">
@@ -108,6 +66,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="MemPool.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MemPoolImpls.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

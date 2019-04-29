@@ -1,5 +1,8 @@
 #include "MemPool.h"
 #include "MemPoolImpls.h"
+#include "AtomicHelpers.h"
+
+MemPoolSystem memPoolSystem = MemPoolSystemDefault();
 
 void* MemPoolFixed_Allocate(MemPoolRecycle* this, uint64_t size, uint64_t hash) {
     // Try reusing an existing free entry
@@ -64,20 +67,20 @@ void* MemPoolFixed_Allocate(MemPoolRecycle* this, uint64_t size, uint64_t hash) 
 }
 void MemPoolFixed_Free(MemPoolRecycle* this, void* value) {
     for(uint64_t i = 0; i < MemPoolFixed_Allocations; i++) {
-        MemPoolRecycle_Entry value = this->allocations[i];
-        if(value.allocation == value) {
-            if(value.free) {
+        MemPoolRecycle_Entry entry = this->allocations[i];
+        if(entry.allocation == value) {
+            if(entry.free) {
                 // Attempted double free of value, this is bad, as we just got lucky to catch this,
                 //  and wouldn't if the allocation got moved out of allocations due to too many threads,
                 //  or just too many concurrent allocations.
                 OnError(4);
                 return;
             }
-            MemPoolRecycle_Entry newValue = value;
+            MemPoolRecycle_Entry newValue = entry;
             newValue.free = 1;
             if(InterlockedCompareExchangeStruct128(
                 &this->allocations[i],
-                &value,
+                &entry,
                 &newValue
             )) {
                 return;
@@ -123,12 +126,12 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
     while(true) {
         MemPoolHashed_InternalEntry* entry = (void*)(valueStart + index * pool->VALUE_SIZE);
         if(!entry->allocated) {
-            if(InterlockedCompareExchange(
-                &entry->allocated,
+            if(InterlockedCompareExchange64(
+                (LONG64*)&entry->allocated,
                 1,
                 0
             ) == 0) {
-                InterlockedIncrement((LONG64*)&pool->totalAllocationsOutstanding);
+                InterlockedIncrement64((LONG64*)&pool->totalAllocationsOutstanding);
                 return (byte*)entry + sizeof(MemPoolHashed_InternalEntry);
             }
         }
@@ -164,7 +167,7 @@ void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
     //  - And actually... our reserved count can't propogate before our allocated changed, can it?
     entry->allocated = 0;
 
-    uint64_t outstandingAfter = InterlockedDecrement((LONG64*)&pool->totalAllocationsOutstanding);
+    uint64_t outstandingAfter = InterlockedDecrement64((LONG64*)&pool->totalAllocationsOutstanding);
     if(outstandingAfter == 0 && pool->destructed) {
         memPoolHashed_DestroyOutsideRef(pool);
     }
@@ -179,7 +182,7 @@ void MemPoolHashed_Destruct(MemPoolHashed* pool) {
     }
 }
 bool MemPoolHashed_IsInPool(MemPoolHashed* pool, void* address) {
-    bool result = pool <= address && address < ((byte*)pool + sizeof(MemPoolHashed) + pool->VALUE_SIZE * pool->VALUE_COUNT);
+    bool result = (uint64_t)pool <= (uint64_t)address && (uint64_t)address < (uint64_t)((byte*)pool + sizeof(MemPoolHashed) + pool->VALUE_SIZE * pool->VALUE_COUNT);
     #ifdef DEBUG
     if(result) {
         byte* valueStart = (byte*)pool + sizeof(MemPoolHashed);

@@ -126,7 +126,7 @@ bool Reference_HasBeenRedirected(InsideReference* ref) {
     if(IsInsideRefCorrupt(ref)) return false;
 
     // Include nulls, as they are how we mark something as destructed, but still redirected.
-    return ref->nextRedirectValue.valueForSet;
+    return ref->nextRedirectValue.valueForSet != 0;
 }
 
 void* Reference_GetValue(InsideReference* ref) {
@@ -163,16 +163,17 @@ void Reference_RedirectReferenceInner(
     OutsideReference newRefPrevRedirectValue;
     newRefPrevRedirectValue.valueForSet = InterlockedCompareExchange64(
         (LONG64*)&newRef->prevRedirectValue,
-        &oldRef,
-        &emptyReference
+        (LONG64)oldRef,
+        (LONG64)emptyReference.valueForSet
     );
     #ifdef DEBUG
     if(!FAST_CHECK_POINTER(newRefPrevRedirectValue, oldRef)) {
         InterlockedIncrement64((LONG64*)&oldRef->countFullValue);
         // Redirect was called with the same of newRef, but different oldRefs... This should never happen.
         OnError(4);
-        return 4;
+        return;
     }
+
     #endif
     if(newRefPrevRedirectValue.valueForSet != 0) {
         InterlockedDecrement64((LONG64*)&oldRef->countFullValue);
@@ -184,15 +185,15 @@ void Reference_RedirectReferenceInner(
     OutsideReference oldRefNextRedirectValue;
     oldRefNextRedirectValue.valueForSet = InterlockedCompareExchange64(
         (LONG64*)&oldRef->nextRedirectValue,
-        &newRef,
-        &emptyReference
+        (LONG64)newRef,
+        (LONG64)emptyReference.valueForSet
     );
     #ifdef DEBUG
     if(!FAST_CHECK_POINTER(oldRefNextRedirectValue, newRef)) {
         InterlockedDecrement64((LONG64*)&newRef->countFullValue);
         // Redirect was called with the same of oldRef, but different newRefs... This should never happen.
         OnError(4);
-        return 4;
+        return;
     }
     #endif
     if(oldRefNextRedirectValue.valueForSet != 0) {
@@ -225,7 +226,7 @@ InsideReference* Reference_AcquireInside(OutsideReference* pRef) {
     InsideReference* ref = Reference_Acquire(pRef);
     if(!ref) return nullptr;
     InterlockedIncrement64((LONG64*)&ref->countFullValue);
-    Reference_Releases(pRef, ref);
+    Reference_Release(pRef, ref);
     return ref;
 }
 
@@ -285,7 +286,7 @@ bool releaseInsideReference(InsideReference* insideRef) {
                 continue;
             }
 
-            Reference_Release((LONG64*)&insideRef->prevRedirectValue, prevRedirect);
+            Reference_Release(&insideRef->prevRedirectValue, prevRedirect);
             // Now we have 3 reference, all inside, to prevRedirect, 2 of which we hold as a lock, and 1 which are going to use to
             //  make an outside reference.
         }
@@ -342,7 +343,7 @@ InsideReference* Reference_Acquire(OutsideReference* pRef) {
     //  so it won't continue to build up over time.
     refForSet.valueForSet = InterlockedAdd64((LONG64*)pRef, 1ll << COUNT_OFFSET_BITS);
 
-    InsideReference* ref = PACKED_POINTER_GET_POINTER(refForSet);
+    InsideReference* ref = (void*)PACKED_POINTER_GET_POINTER(refForSet);
     if(!ref) return nullptr;
     if(IsInsideRefCorrupt(ref)) return nullptr;
 

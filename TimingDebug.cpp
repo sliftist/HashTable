@@ -4,8 +4,6 @@
 #include "Environment.h"
 #include "Timing.h"
 
-TimeTrackerRoot rootTimer = { 0 };
-
 void Timing_StartRoot(TimeTrackerRoot* root) {
 	root->startTime = GetTime();
     if(root->startTimeNanoSeconds) {

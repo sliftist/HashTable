@@ -1,5 +1,7 @@
 #include "Timing.h"
 
+TimeTrackerRoot rootTimer = { 0 };
+
 uint64_t GetTime() {
     //unsigned int cpuid;
 	//return __rdtscp(&cpuid);

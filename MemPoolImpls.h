@@ -7,8 +7,11 @@
 extern "C" {
 #endif
 
+typedef void*(*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
+typedef void(*Free)(MemPool* pool, void* value);
+
 #define MemPoolFixed_Allocations 8
-#define MemPoolFixedDefault() { MemPoolFixed_Allocate, MemPoolFixed_Free }
+#define MemPoolFixedDefault() { (Allocate)MemPoolFixed_Allocate, (Free)MemPoolFixed_Free }
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
@@ -33,7 +36,7 @@ void MemPoolFixed_Free(MemPoolRecycle* pool, void* value);
 
 
 
-#define MemPoolSystemDefault() { MemPoolSystem_Allocate, MemPoolSystem_Free }
+#define MemPoolSystemDefault() { (Allocate)MemPoolSystem_Allocate, (Free)MemPoolSystem_Free }
 #pragma pack(push, 1)
 typedef struct {
     void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
@@ -44,7 +47,9 @@ typedef struct {
 void* MemPoolSystem_Allocate(MemPoolSystem* pool, uint64_t size, uint64_t hash);
 void MemPoolSystem_Free(MemPoolSystem* pool, void* value);
 
-MemPoolSystem memPoolSystem = MemPoolSystemDefault();
+extern MemPoolSystem memPoolSystem;
+
+
 
 #pragma pack(push, 1)
 typedef struct {
@@ -54,7 +59,7 @@ typedef struct {
 
 #define MemPoolHashed_VALUE_OVERHEAD (sizeof(MemPoolHashed_InternalEntry))
 // VALUE_SIZE must already include MemPoolHashed_VALUE_OVERHEAD, (as you need to include it when making our allocation anyway...)
-#define MemPoolHashedDefault(VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, freeCallbackContext, freeCallback) { MemPoolHashed_Allocate, MemPoolHashed_Free, freeCallbackContext, freeCallback, VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, 0, 1 }
+#define MemPoolHashedDefault(VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, freeCallbackContext, freeCallback) { (Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, freeCallbackContext, freeCallback, VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, 0, 1 }
 #pragma pack(push, 1)
 typedef struct {
     void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);

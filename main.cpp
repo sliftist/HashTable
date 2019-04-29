@@ -22,8 +22,6 @@
 
 #include "mersenne-twister.h"
 
-#include "simple_table.h"
-
 #include <immintrin.h>
 
 
@@ -190,427 +188,15 @@ void SpawnThread(
 
 
 
-
-#include "TransactionQueue.h"
-#include "TransactionQueueHelpers.h"
-
-//#define VALUE_COUNT 25
-//#define THREAD_COUNT 10
-//uint64_t count = 1000 * 10;
-
-//#define VALUE_COUNT 1
-//#define THREAD_COUNT 1
-//uint64_t count = 10;
-
-#define VALUE_COUNT 10
-#define THREAD_COUNT 1
-uint64_t count = 1000 * 100;
-
-uint64_t writesPerTransaction = VALUE_COUNT;
-TransactionQueue transactions = { 0 };
-
-#pragma pack(push, 1)
-typedef struct {
-	int values[VALUE_COUNT];
-} BaseStruct;
-#pragma pack(pop)
-
-
-#pragma pack(push, 1)
-union __declspec(align(16)) TypeName {
-	AtomicUnit units[sizeof(BaseStruct) / BYTES_PER_TRANSACTION];
-	// The base struct is exposed to make it easy to get offsets
-	BaseStruct v;
-};
-#pragma pack(pop)
-
-TypeName InstanceName = { 0 };
-
-
-//todonext
-// Make some nice macros to use with TransactionQueue to allow
-//	1) Wrapping a static struct to make it union with memory 4x larger than it
-//	2) Apply gets, which will get the data from the fragmented pattern, back into regular values, taking the offset
-//		from the struct to know the position
-//	3) Apply sets, spread the values out, AND THEN CALL insertWrite (or maybe just return TransactionChange)
-//	4) AND THEN change the union so it also adds a dynamic allocation table? And understands that some writes will
-//		need to go to that table?
-//		- Hmm... it does kind of need to know about the table, or else it won't know how to generate the dataIndex for
-//			creating TransactionChanges. But... is this too much? Hmm... maybe it can just handle everything?,
-//			and even provide the underlying applyChange function, and it can even automatically insert
-//			index moves, and deal with partial moves, AND it can even allocate new memory... but it will need
-//			some help doing that, as it won't really know how 'full' any allocation is, as that depends on
-//			if its a compressed list, a hash table, etc...
-//TransactionQueue
-
-void inside() {
-	for (int i = 0; i < count; i++) {
-		int result = TransactionQueue_ApplyWrite(
-			&transactions,
-			&InstanceName,
-			[](void* writeContext, auto c, auto insert, auto finish) {
-				TypeName* v = (TypeName*)writeContext;
-				for (int i = 0; i < writesPerTransaction; i++) {
-					int newValue = Get_int32_t(v->units, v->v.values + i) + 1;
-					int result = Set_int32_t(c, insert, v->units, v->v.values + i, newValue);
-
-					/*
-					//int newValue = v->units[i].value + 1;
-					TransactionChange change;
-					TransactionChange_set_dataIndex(&change, i);
-					change.newValue = newValue;
-					int result = insert(c, change);
-					//*/
-
-					if (result != 0) return result;
-				}
-				return finish(c);
-			},
-			&InstanceName,
-			ApplyStructChange
-		);
-		if (result != 0) {
-			printf("ApplyWrite failure, %d\n", result);
-		}
-	}
-};
-
-void writeInfo(const char* name, CallTimes* times) {
-	printf("%s %llu calls, %f per call, %llu untimed\n",
-		name,
-		times->timedCalls,
-		(double)times->time / times->timedCalls,
-		times->untimedCalls
-	);
-}
-
-void runTransactionTest() {
-
-	auto start = std::chrono::high_resolution_clock::now();
-
-	HANDLE threads[THREAD_COUNT];
-	for (int i = 0; i < THREAD_COUNT; i++) {
-		SpawnThread(
-			&threads[i],
-			nullptr,
-			[](auto context) -> DWORD {
-				try {
-					inside();
-				}
-				catch (...) {
-					printf("error\n");
-				}
-				return 0;
-			}
-		);
-	}
-
-	// WaitForMultipleObjects is garbage as it has a max of 64, so... don't use it.
-	for (int i = 0; i < THREAD_COUNT; i++) {
-		WaitForSingleObject(threads[i], INFINITE);
-	}
-
-	TypeName* v = (TypeName*)&InstanceName;
-	for (int i = 0; i < VALUE_COUNT; i++) {
-		int value = Get_int32_t(v->units, &v->v.values[i]);
-		if (value != THREAD_COUNT * count) {
-			printf("value=%llu\n", (uint64_t)value);
-		}
-	}
-
-
-	
-	auto end = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> time = end - start;
-	std::chrono::seconds s{ 1 };
-
-	uint64_t totalCount = count * THREAD_COUNT * writesPerTransaction;
-
-	printf("Seconds %fs, %fns per for %llu\n",
-		time.count(),
-		((double)time.count() * 1000 * 1000 * 1000 / totalCount),
-		totalCount
-	);
-
-	printf("retryLoopCount=%llu\n", transactions.retryLoopCount);
-
-	printf("retries per apply=%f\n", (double)transactions.retryLoopCount / transactions.applyCallCount);
-	printf("retries per dequeue=%f\n", (double)transactions.retryLoopCount / transactions.dequeueCount);
-	if (transactions.hardFails > 0) {
-		printf("hardFails=%llu\n", transactions.hardFails);
-	}
-
-	
-	CancellableLock& d = transactions.writeLock;
-	printf("work loop count=%llu\n", d.workFinishedCount);
-	printf("work loop count per retry=%f\n", (double)d.workFinishedCount / transactions.retryLoopCount);
-	printf("work per loop\t\t=%f\n", (double)d.workTime / d.workFinishedCount);
-	printf("blockedTime per loop\t=%f\n", (double)d.blockedTime / d.workFinishedCount);
-	printf("lock failures per loop\t=%f\n", (double)d.lockFailures / d.workFinishedCount);
-	printf("unneeded cancels per loop=%f\n", (double)d.unneededCancels / d.workFinishedCount);
-	printf("polls per loop=%f\n", (double)d.waitPollCount / d.workFinishedCount);
-	printf("ticks to wait=%llu\n", d.ticksToWait);
-}
-
 extern "C" {
 	void OnErrorInner(int code, const char* name, unsigned long long line) {
 		printf("Error %d, %s:%llu\n", code, name, line);
 	}
 }
 
-int matches2 = 0;
-int dataValue;
-void runReadTest() {
-	int readCount = 1024 * 1024 * 10;
-
-	unsigned char* data = (unsigned char*)malloc(readCount);
-	randomBytes((unsigned char*)data, readCount, 0x7cdd44b7cdd44b);
-
-	uint64_t totalCount = readCount * VALUE_COUNT;
-
-
-	int result = TransactionQueue_ApplyWrite(
-		&transactions,
-		&InstanceName,
-		[](void* writeContext, auto c, auto insert, auto finish) {
-			TypeName* v = (TypeName*)writeContext;
-			for (int i = 0; i < VALUE_COUNT; i++) {
-				int result = Set_int32_t(c, insert, v->units, &v->v.values[i], i);
-				if (result != 0) return result;
-			}
-
-			return finish(c);
-		},
-		&InstanceName,
-		ApplyStructChange
-	);
-	if (result != 0) {
-		printf("ApplyWrite failure, %d\n", result);
-	}
-
-
-	int values[VALUE_COUNT];
-	for (int i = 0; i < VALUE_COUNT; i++) {
-		values[i] = i;
-	}
-
-
-	auto start = std::chrono::high_resolution_clock::now();
-
-	int matches1 = 0;
-	//*
-	for (int x = 0; x < readCount; x++) {
-		int dataValue = data[x];
-		//BaseStruct* v = (BaseStruct*)&InstanceName;
-		for (int i = 0; i < VALUE_COUNT; i++) {
-			//int value = Get_Int32(v, &v->values[i]);
-			int value = values[i];
-			if (value == dataValue) {
-				matches1++;
-			}
-		}
-	}
-	//*/
-
-	
-	/*
-	for (int x = 0; x < readCount; x++) {
-		dataValue = data[x];
-		TransactionQueue_RunGetter(
-			&transactions,
-			&InstanceName,
-			[](void* getContext) {
-				BaseStruct* v = (BaseStruct*)getContext;
-				for (int i = 0; i < VALUE_COUNT; i++) {
-					int value = Get_Int32(v, &v->values[i]);
-					if (value == dataValue) {
-						matches2++;
-					}
-				}
-				return 0;
-			},
-			&InstanceName,
-			ApplyStructChange
-		);
-	}
-	*/
-
-	printf("match1 %d, match2 %d\n", matches1, matches2);
-
-
-	auto end = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> time = end - start;
-	std::chrono::seconds s{ 1 };
-
-
-	printf("Seconds %fs, %fns per for %llu\n",
-		time.count(),
-		((double)time.count() * 1000 * 1000 * 1000 / totalCount),
-		totalCount
-	);
-}
-
-
-void allocTest() {
-	uint64_t count = 1024 * 1024 * 10;
-
-	auto start = std::chrono::high_resolution_clock::now();
-
-	uint64_t hash = 0;
-
-	for (int i = 0; i < count; i++) {
-		void* memory = malloc(4);
-		hash += (uint64_t)memory;
-		free(memory);
-	}
 
 
 
-	auto end = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> time = end - start;
-	std::chrono::seconds s{ 1 };
-
-	printf("hash %llu\n", hash);
-
-
-	printf("Seconds %fs, %fns per for %llu\n",
-		time.count(),
-		((double)time.count() * 1000 * 1000 * 1000 / count),
-		count
-	);
-}
-
-#include "ReferenceCounter.h"
-void runRefTest() {
-//#define NATIVE_ALLOC
-
-	uint64_t count = 1024 * 1024;
-
-	uint64_t* pointers = (uint64_t*)malloc(count * sizeof(uint64_t));
-
-
-	auto start = std::chrono::high_resolution_clock::now();
-
-	uint64_t hash = 0;
-
-	// Also code rolling allocations too, where we always keep a minimum around,
-	//	but then allocate and unallocate within that, always the oldest one
-
-	for (int i = 0; i < count; i++) {
-		if (i == count / 2) {
-			int l = 0;
-		}
-		void* p;
-#ifdef NATIVE_ALLOC
-		p = malloc(sizeof(uint64_t));
-		*(uint64_t*)p = (count - i);
-		pointers[i] = (uint64_t)p;
-#else
-		uint64_t smallPointer = AllocateAsSmallPointer(sizeof(uint64_t), &p);
-		pointers[i] = smallPointer;
-#endif
-		*(uint64_t*)p = (count - i);
-		hash += pointers[i];
-	}
-
-	for (int i = 0; i < count; i++) {
-		void* p;
-#ifdef NATIVE_ALLOC
-		p = (void*)pointers[i];
-#else
-		uint64_t smallPointer = pointers[i];
-		p = SafeReferenceSmallPointer64(&smallPointer);
-		DereferenceSmallPointer(smallPointer);
-#endif
-		hash += *(uint64_t*)p;
-#ifdef NATIVE_ALLOC
-		free(p);
-#else
-		DereferenceSmallPointer(smallPointer);
-#endif
-	}
-
-	auto end = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> time = end - start;
-	std::chrono::seconds s{ 1 };
-
-	printf("hash %llu\n", hash);
-
-	printf("Search efficiency %f\n", (double)debug_getPointerTable()->searchStarts / debug_getPointerTable()->searchIterations);
-
-
-	printf("Seconds %fs, %fns per for %llu\n",
-		time.count(),
-		((double)time.count() * 1000 * 1000 * 1000 / count),
-		count
-	);
-}
-
-void runRefTest2() {
-	#define NATIVE_ALLOC
-
-	uint64_t count = 1;
-	uint64_t bytes = 1024 * 1024;
-
-	uint64_t* pointers = (uint64_t*)malloc(bytes * sizeof(uint64_t));
-
-
-	auto start = std::chrono::high_resolution_clock::now();
-
-	uint64_t hash = 0;
-
-	// Also code rolling allocations too, where we always keep a minimum around,
-	//	but then allocate and unallocate within that, always the oldest one
-
-	for (int k = 0; k < bytes; k++) {
-		void* p;
-#ifdef NATIVE_ALLOC
-		p = malloc(sizeof(uint64_t));
-		*(uint64_t*)p = (count - k);
-		pointers[k] = (uint64_t)p;
-#else
-		uint64_t smallPointer = AllocateAsSmallPointer(sizeof(uint64_t), &p);
-		pointers[k] = smallPointer;
-#endif
-		*(uint64_t*)p = (count - k);
-		hash += pointers[k];
-	}
-
-	/*
-	for (int k = 0; k < count * bytes; k++) {
-		int i = k % bytes;
-		
-#ifdef NATIVE_ALLOC
-		free((void*)pointers[i]);
-		pointers[i] = (uint64_t)malloc(sizeof(uint64_t));
-#else
-		DereferenceSmallPointer(pointers[i]);
-		void* p;
-		pointers[i] = AllocateAsSmallPointer(sizeof(uint64_t), &p);
-#endif
-		hash += pointers[i];
-	}
-	//*/
-
-	auto end = std::chrono::high_resolution_clock::now();
-	std::chrono::duration<double> time = end - start;
-	std::chrono::seconds s{ 1 };
-
-	printf("hash %llu\n", hash);
-
-	uint64_t totalCount = count * bytes;
-	printf("Search efficiency %f\n", (double)debug_getPointerTable()->searchIterations / debug_getPointerTable()->searchStarts);
-	printf("malloc calls %f\n", (double)debug_getPointerTable()->mallocCalls / totalCount);
-
-	
-	printf("Seconds %fs, %fns per for %llu\n",
-		time.count(),
-		((double)time.count() * 1000 * 1000 * 1000 / totalCount),
-		totalCount
-	);
-}
-
-#include "AtomicHashTable.h"
 #include "AtomicHashTable2.h"
 
 
@@ -637,74 +223,10 @@ typedef struct {
 	uint64_t b;
 	uint64_t c;
 } Item;
-void testAdd(AtomicHashTable& table, uint64_t a, uint64_t b, uint64_t c) {
-	Item* item;
-	uint32_t itemSmallPointer = (uint32_t)AllocateAsSmallPointer(sizeof(Item), (void**)&item);
-	item->a = a;
-	item->b = b;
-	item->c = c;
-	uint64_t hash = getHash(a, b);
-	ErrorTop(AtomicHashTable_insert(&table, hash, itemSmallPointer));
-}
 
-uint64_t testRemove(AtomicHashTable& table, Item* item) {
-	uint64_t hash = getHash(item->a, item->b);
-	typedef struct {
-		Item item;
-		uint64_t count;
-	} Context;
-	Context context = { 0 };
-	context.item = *item;
-	int result = (AtomicHashTable_remove(&table, hash, &context, [](void* callbackContextVoid, void* valueVoid){
-		Context* context = (Context*)callbackContextVoid;
-		Item* item = &context->item;
-		Item* other = (Item*)valueVoid;
-		int shouldRemove = (int)(item->a == other->a && item->b == other->b);
-		if (shouldRemove) {
-			context->count++;
-		}
-		return shouldRemove;
-	}));
-	ErrorTop(result);
-	return context.count;
-}
-Item testGetSome(AtomicHashTable& table, Item* item) {
-	uint64_t hash = getHash(item->a, item->b);
-	typedef struct {
-		Item itemIn;
-		Item itemOut;
-	} Context;
-	Context context = { 0 };
-	context.itemIn = *item;
-
-	ErrorTop(AtomicHashTable_find(&table, hash, &context, [](void* contextVoid, void* valueAny) {
-		Context* context = (Context*)contextVoid;
-		Item* value = (Item*)valueAny;
-		if (context->itemIn.a == value->a && context->itemIn.b == value->b) {
-			context->itemOut = *value;
-		}
-	}));
-	return context.itemOut;
-}
-uint64_t testGetCount(AtomicHashTable& table, uint64_t a, uint64_t b) {
-
-	typedef struct {
-		Item item;
-		uint64_t count;
-	} Context;
-	Context context = { 0 };
-	context.item.a = a;
-	context.item.b = b;
-
-	uint64_t hash = getHash(a, b);
-	ErrorTop(AtomicHashTable_find(&table, hash, &context, [](void* contextAny, void* value){
-		Context* context = (Context*)contextAny;
-		Item* item = (Item*)value;
-		if (context->item.a == item->a && context->item.b == item->b) {
-			context->count++;
-		}
-	}));
-	return context.count;
+void deleteItem(void* itemVoid) {
+	Item* item = (Item*)itemVoid;
+	delete item;
 }
 
 #include <functional>
@@ -728,10 +250,6 @@ public:
 };
 
 
-void deleteItem(void* itemVoid) {
-	Item* item = (Item*)itemVoid;
-	delete item;
-}
 
 void testAdd2(AtomicHashTable2& table, uint64_t a, uint64_t b, uint64_t c) {
 	Item* item = new Item();
@@ -809,120 +327,7 @@ bool AssertEqualInner(uint64_t test, uint64_t correct, const char* file, unsigne
 	return true;
 }
 
-void runAtomicHashTableTestInner(AtomicHashTable& table) {
-	testAdd(table, 0, 1, 2);
-	{
-		Item item = { 0 };
-		item.a = 0;
-		item.b = 1;
-		item.c = 2;
-		uint64_t v = testGetSome(table, &item).c;
-		AssertEqual(2, v);
-	}
-	{
-		Item item = { 0 };
-		item.a = 0;
-		item.b = 1;
-		item.c = 2;
-		uint64_t v = testGetSome(table, &item).c;
-		AssertEqual(2, v);
-	}
-}
 
-
-
-typedef struct {
-	uint64_t fillCount;
-	PointersSnapshot* snapshot;
-	AtomicHashTable* table;
-} TableSnapshot;
-
-TableSnapshot GetSnapshot(AtomicHashTable& table) {
-	return { DebugAtomicHashTable_properties(&table).currentFillCount, Debug_GetPointersSnapshot(), &table };
-}
-
-int CompareSnapshot(TableSnapshot info) {
-	
-	AssertEqual(info.fillCount, DebugAtomicHashTable_properties(info.table).currentFillCount);
-
-	PointersSnapshotDelta delta = Debug_ComparePointersSnapshot(info.snapshot);
-	if(delta.changeType) {
-		if(delta.changeType == 1) {
-			printf("Removed pointer size %llu allocated at %s:%llu, value %llu\n", delta.entry.size, delta.entry.fileName, delta.entry.line, delta.entry.smallPointerNumber);
-		} else if(delta.changeType == 2) {
-			printf("Added pointer size %llu allocated at %s:%llu, value %llu\n", delta.entry.size, delta.entry.fileName, delta.entry.line, delta.entry.smallPointerNumber);
-		} else if(delta.changeType == 3) {
-			printf("Changed ref count of pointer size %llu, by %llu, allocated at %s:%llu, value %llu\n", delta.entry.size, delta.refCountDelta, delta.entry.fileName, delta.entry.line, delta.entry.smallPointerNumber);
-		}
-	}
-	return delta.changeType;
-}
-
-void testHashLeaksRefs() {
-	//todonext
-	// Change all code to use AtomicHashTable2 instead, with non of the snapshot code
-	//	(but maybe start with linear adding and removing code)
-	AtomicHashTable table = { 0 };
-
-	auto zeroState = GetSnapshot(table);
-	
-	runAtomicHashTableTestInner(table);
-	auto afterRun = GetSnapshot(table);
-	AtomicHashTable_dtor(&table);
-
-	CompareSnapshot(zeroState);
-
-	runAtomicHashTableTestInner(table);
-	CompareSnapshot(afterRun);
-}
-
-void testHashChurnVar(int variation) {
-	uint64_t stride = 10;
-	uint64_t totalCount = 1000;
-
-	//stride = 1;
-	//totalCount = 100;
-
-	Item* items = (Item*)malloc(totalCount * sizeof(Item));
-	if (variation == 0) {
-		memset(items, 1, totalCount * sizeof(Item));
-	}
-	if (variation == 1) {
-		randomBytes((unsigned char*)items, (int)(totalCount * sizeof(Item)), 0x7cdd44b);
-	}
-
-	AtomicHashTable2 table = AtomicHashTableDefault(sizeof(Item), deleteItem);
-
-	TableSnapshot firstInsert = { 0 };
-
-	for (uint64_t i = 0; i < totalCount; i += stride) {
-		for (uint64_t j = 0; j < stride; j++) {
-			Item* item = &items[i + j];
-			testAdd2(table, item->a, item->b, item->c);
-			int wtf = 0;
-		}
-		
-		for (int j = 0; j < stride; j++) {
-			Item* item = &items[i + j];
-			AssertEqual(testGetSome2(table, *item).c, item->c);
-			int wtf = 0;
-		}
-		for (int j = 0; j < stride; j++) {
-			Item* item = &items[i + j];
-			testRemove2(table, *item);
-			int wtf = 0;
-		}
-	}
-
-	uint64_t allocSize = DebugAtomicHashTable2_allocationSize(&table);
-	for(uint64_t i = 0; i < allocSize; i++) {
-		AtomicHashTable2_remove(&table, i, nullptr, [](void* x, void* value){ x; value; return true; } );
-	}
-}
-void testHashChurn() {
-	testHashChurnVar(0);
-	testHashChurnVar(1);
-}
 
 
 
@@ -1494,6 +899,7 @@ typedef struct {
 } Test;
 #pragma pack(pop)
 
+#include "MemPoolImpls.h"
 
 void runRefCountTests() {	
 	Test test = { 0 };
@@ -1523,7 +929,7 @@ void runRefCountTests() {
 			memset(values, 0, itemCount * sizeof(OutsideReference));
 			for (int i = 0; i < itemCount; i++) {
 				Value* value;
-				Reference_Allocate(sizeof(Value), &values[i], (void**)&value);
+				Reference_Allocate((MemPool*)&memPoolSystem, &values[i], (void**)&value, sizeof(Value), 0);
 				value->value = 0;
 				value->thread = t;
 			}
@@ -1537,22 +943,22 @@ void runRefCountTests() {
 					InsideReference* value = Reference_Acquire(&sharedValues[i]);
 					if (value) {
 						Reference_DestroyOutside(&sharedValues[i], value);
-						Reference_Release(&sharedValues[i], value, nullptr);
+						Reference_Release(&sharedValues[i], value);
 					}
 					
 					Reference_SetOutside(&sharedValues[i], ourValue);
-					Reference_Release(&values[i], ourValue, nullptr);
+					Reference_Release(&values[i], ourValue);
 				}
 
 				// For all of our values which are still in the shared values, increment their value
 				for (int i = 0; i < itemCount; i++) {
 					InsideReference* value = Reference_Acquire(&sharedValues[i]);
 					if (value) {
-						Value* v = (Value*)value->pointer;
+						Value* v = (Value*)Reference_GetValue(value);
 						if (v->thread == t) {
 							v->value++;
 						}
-						Reference_Release(&sharedValues[i], value, nullptr);
+						Reference_Release(&sharedValues[i], value);
 					}
 				}
 
@@ -1560,11 +966,11 @@ void runRefCountTests() {
 				for (int i = 0; i < itemCount; i++) {
 					InsideReference* value = Reference_Acquire(&sharedValues[i]);
 					if (value) {
-						Value* v = (Value*)value->pointer;
+						Value* v = (Value*)Reference_GetValue(value);
 						if (v->thread == t) {
 							Reference_DestroyOutside(&sharedValues[i], value);
 						}
-						Reference_Release(&sharedValues[i], value, nullptr);
+						Reference_Release(&sharedValues[i], value);
 					}
 				}
 			}
@@ -1572,12 +978,12 @@ void runRefCountTests() {
 			uint64_t totalCount = 0;
 			for (int i = 0; i < itemCount; i++) {
 				InsideReference* value = Reference_Acquire(&values[i]);
-				Value* v = (Value*)value->pointer;
+				Value* v = (Value*)Reference_GetValue(value);
 				
 				totalCount += v->value;
 
 				Reference_DestroyOutside(&values[i], value);
-				Reference_Release(&values[i], value, nullptr);
+				Reference_Release(&values[i], value);
 			}
 
 			printf("sum(value[%d])=%lld\n", t, totalCount);

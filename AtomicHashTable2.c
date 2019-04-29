@@ -2,6 +2,7 @@
 
 #include "bittricks.h"
 #include "Timing.h"
+#include "AtomicHelpers.h"
 
 #define RETURN_ON_ERROR(x) { int returnOnErrorResult = x; if(returnOnErrorResult != 0) return returnOnErrorResult; }
 
@@ -30,6 +31,7 @@ uint64_t minSlotCount(AtomicHashTable2* this) {
 }
 uint64_t getTableSize(AtomicHashTable2* this, uint64_t slotCount) {
     uint64_t tableSize = SIZE_PER_COUNT(this) * slotCount;
+	return tableSize;
 }
 
 
@@ -53,65 +55,23 @@ uint64_t newGrowSize(AtomicHashTable2* this, uint64_t slotCount, uint64_t fillCo
 
 
 void destroyUniqueOutsideRef(OutsideReference* ref)  {
-    void* temp = Reference_Acquire(&ref);
+    void* temp = Reference_Acquire(ref);
     if(!temp) return;
-    Reference_DestroyOutside(&ref, temp);
-    Reference_Release(&ref, temp);
+    Reference_DestroyOutside(ref, temp);
+    Reference_Release(ref, temp);
     ref->valueForSet = 0;
 }
 
 void atomicHashTable2_memPoolFreeCallback(AtomicHashTable2* this, InsideReference* ref) {
     if(!Reference_HasBeenRedirected(ref)) {
         // And if it hasn't, it never will be, as the free callback is only called when all outside and inside references are gone...
-        void* userValue = (byte*)ref + sizeof(InsideReference) + sizeof(HashValue);
+        void* userValue = (byte*)ref + InsideReferenceSize + sizeof(HashValue);
         this->deleteValue(userValue);
     }
 }
 
 // Has to be a value copied from shared storage, or else this will race...
 #define IS_VALUE_MOVED(value) (value.isNull && value.valueForSet != BASE_NULL.valueForSet)
-
-// Called when we want to reserve entries, and after we find we didn't use all of the entries we reserved,
-//  because we reused some null entries instead.
-//  (should not be called in a retry loop, should only be called after or before?)
-int atomicHashTable2_mutateReserved(
-    AtomicHashTable2* this,
-    OutsideReference** curAllocRefOutsideOut,
-    InsideReference** curAllocRefOut,
-    AtomicHashTableBase** curAllocOut,
-    int64_t reservedDelta,
-    int64_t reservedWithNullsDelta
-) {
-    InsideReference* curAllocRef = *curAllocRefOut;
-    if(!curAllocRef) {
-        InsideReference* curAllocRef = Reference_Acquire(&this->currentAllocation);
-        AtomicHashTableBase* curAlloc = Reference_GetValue(curAllocRef);
-    }
-
-
-    
-    if(curAlloc->newAllocation.valueForSet) {
-        // Then there is no point is changing the reserved, 
-        return;
-    }
-
-    if(!this->currentAllocation.valueForSet) {
-        *curAllocRefOutsideOut = nullptr;
-        *curAllocRefOut = nullptr;
-        *curAllocOut = nullptr;
-        return 0;
-    }
-}
-
-int atomicHashTable2_moveSome(
-    AtomicHashTable2* this,
-    OutsideReference** curAllocRefOutsideOut,
-    InsideReference** curAllocRefOut,
-    AtomicHashTableBase** curAllocOut,
-    uint64_t countToMove
-) {
-
-}
 
 
 
@@ -179,7 +139,7 @@ int atomicHashTable2_updateReserved(
     OutsideReference newAllocation;
     AtomicHashTableBase* newTable;
     uint64_t tableSize = getTableSize(this, newSlotCount);
-    Reference_Allocate(&memPoolSystem, &newAllocation, newTable, tableSize, 0);
+    Reference_Allocate((MemPool*)&memPoolSystem, &newAllocation, &newTable, tableSize, 0);
     if(!newTable) {
         return 3;
     }
@@ -256,9 +216,11 @@ int atomicHashTable2_applyMoveTableOperationInner(
             // Hmm... this really puts a lot on Reference_RedirectReference, but... it should be fine... as long as the caller
             //  makes sure newAlloc is inside of curAlloc, then curAlloc can only redirect once,
             //  AND this actually makes it so this->currentAllocation gets automatically updated when Reference_Acquire is called.
-            Reference_RedirectReference(curAlloc, newAlloc);
+            
+			InsideReference* newAllocRef = (void*)((byte*)newAlloc - InsideReferenceSize);
 
-            Reference_DestroyOutsideMakeNull(&curAlloc->newAllocation, newAlloc);
+            Reference_RedirectReference((void*)((byte*)curAlloc - InsideReferenceSize), newAllocRef);
+            Reference_DestroyOutsideMakeNull(&curAlloc->newAllocation, newAllocRef);
 
             return 1;
         }
@@ -273,9 +235,9 @@ int atomicHashTable2_applyMoveTableOperationInner(
             if(sourceValue.valueForSet == BASE_NULL.valueForSet) {
                 if(InterlockedCompareExchange64(
                     (LONG64*)pSource,
-                    &BASE_NULL1,
-                    &BASE_NULL
-                ) != BASE_NULL.valueForSet) {
+                    (LONG64)BASE_NULL1.valueForSet,
+					(LONG64)BASE_NULL.valueForSet
+                ) != (LONG64)BASE_NULL.valueForSet) {
                     continue;
                 }
             }
@@ -347,7 +309,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 OutsideReference newValueRef = { 0 };
                 uint64_t hash = value->hash;
                 HashValue* newValue = nullptr;
-                Reference_Allocate(&newAlloc->valuePool, &newValueRef, &newValue, this->HASH_VALUE_SIZE, hash);
+                Reference_Allocate((MemPool*)&newAlloc->valuePool, &newValueRef, &newValue, this->HASH_VALUE_SIZE, hash);
                 if(!newValue) {
                     Reference_Release(&pMoveState->sourceValue, valueRef);
                     return 3;
@@ -387,7 +349,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 continue;
             }
 
-            if(!MemPoolHashed_IsInPool(&newAlloc->valuePool, valueRef)) {
+            if(!MemPoolHashed_IsInPool(newAlloc->valuePool, valueRef)) {
                 Reference_Release(&pMoveState->sourceValue, valueRef);
                 continue;
             }
@@ -526,7 +488,7 @@ int AtomicHashTable2_findInner2(
         }
 
         if(value.valueForSet == 0) {
-            Reference_Release(&this->currentAllocation, table);
+            Reference_Release(&this->currentAllocation, (void*)((byte*)table - InsideReferenceSize));
             return 0;
         }
         if(value.valueForSet != BASE_NULL.valueForSet) {
@@ -674,26 +636,13 @@ int AtomicHashTable2_insertInner(
         newTable = Reference_GetValue(newTableRef);
         int moveResult = atomicHashTable2_applyMoveTableOperationInner(this, table, newTable);
         if(moveResult > 0) {
-            Reference_Release(&table->newAllocation, newTable);
+            Reference_Release(&table->newAllocation, newTableRef);
             atomicHashTable2_updateReservedUndo(this, table, -1, -1);
             return moveResult;
         }
     }
 
     OutsideReference valueOutsideRef = { 0 };
-    HashValue* hashValue = nullptr;
-    Reference_Allocate(&table->valuePool, &valueOutsideRef, &hashValue, this->HASH_VALUE_SIZE, hash);
-    if(!hashValue) {
-        atomicHashTable2_updateReservedUndo(this, table, -1, -1);
-        Reference_Release(&table->newAllocation, newTableRef);
-        return 3;
-    }
-    memcpy(
-        (byte*)hashValue + sizeof(HashValue),
-        value,
-        this->VALUE_SIZE
-    );
-    hashValue->hash = hash;
     
     uint64_t index = getSlotBaseIndex(table, hash);
     uint64_t loopCount = 0;
@@ -719,6 +668,21 @@ int AtomicHashTable2_insertInner(
         }
 
         if(valueRef.valueForSet == 0 || valueRef.valueForSet == BASE_NULL.valueForSet) {
+            HashValue* hashValue = nullptr;
+            // We use index here instead of hash, that way the allocator doesn't have it iterate over the filled slots like we did, to save some time...
+            Reference_Allocate((MemPool*)&table->valuePool, &valueOutsideRef, &hashValue, this->HASH_VALUE_SIZE, index << (64 - table->logSlotsCount));
+            if(!hashValue) {
+                atomicHashTable2_updateReservedUndo(this, table, -1, -1);
+                Reference_Release(&table->newAllocation, newTableRef);
+                return 3;
+            }
+            memcpy(
+                (byte*)hashValue + sizeof(HashValue),
+                value,
+                this->VALUE_SIZE
+            );
+            hashValue->hash = hash;
+
             // Is safe, because we are replacing a non-reference value (and NOT something move is dealing with either, so
             //  it is really safe).
             if(InterlockedCompareExchange64(
@@ -787,7 +751,7 @@ int AtomicHashTable2_removeInner(
         newTable = Reference_GetValue(newTableRef);
         int moveResult = atomicHashTable2_applyMoveTableOperationInner(this, table, newTable);
         if(moveResult > 0) {
-            Reference_Release(&table->newAllocation, newTable);
+            Reference_Release(&table->newAllocation, newTableRef);
             return moveResult;
         }
     }
@@ -842,6 +806,10 @@ int AtomicHashTable2_removeInner(
             }
         }
     }
+
+	// Unreachable
+	OnError(13);
+	return 0;
 }
 
 int AtomicHashTable2_remove(

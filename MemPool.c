@@ -1,8 +1,27 @@
 #include "MemPool.h"
 #include "MemPoolImpls.h"
 #include "AtomicHelpers.h"
+#include "environment.h"
 
 MemPoolSystem memPoolSystem = MemPoolSystemDefault();
+
+void* zeroAlloc(uint64_t size) {
+    byte* memory = malloc(size);
+    if(memory != 0) {
+        memset(memory, 0, size);
+    }
+    return memory;
+}
+
+void* MemPoolSystem_Allocate(MemPoolSystem* pool, uint64_t size, uint64_t hash) {
+    return zeroAlloc(size);
+}
+void MemPoolSystem_Free(MemPoolSystem* pool, void* value) {
+    if(!value) return;
+    free(value);
+}
+
+
 
 void* MemPoolFixed_Allocate(MemPoolRecycle* this, uint64_t size, uint64_t hash) {
     // Try reusing an existing free entry
@@ -16,14 +35,18 @@ void* MemPoolFixed_Allocate(MemPoolRecycle* this, uint64_t size, uint64_t hash) 
                 &value,
                 &newValue
             )) {
+                memset(value.allocation, 0, value.size);
                 return value.allocation;
             }
         }
     }
 
-    void* allocation = malloc(size);
+    void* allocation = zeroAlloc(size);
+	if (!allocation) {
+		return nullptr;
+	}
 
-    // Try displacing a smaller freed entry
+    // Try displacing a smaller freed entry to store it
     for(uint64_t i = 0; i < MemPoolFixed_Allocations; i++) {
         MemPoolRecycle_Entry value = this->allocations[i];
         if(!value.allocation || value.free && value.size < size) {
@@ -45,7 +68,7 @@ void* MemPoolFixed_Allocate(MemPoolRecycle* this, uint64_t size, uint64_t hash) 
         }
     }
 
-    // Try displacing a smaller allocated entry
+    // Try displacing a smaller allocated entry to store it
     for(uint64_t i = 0; i < MemPoolFixed_Allocations; i++) {
         MemPoolRecycle_Entry value = this->allocations[i];
         if(value.allocation && !value.free && value.size < size) {
@@ -66,6 +89,7 @@ void* MemPoolFixed_Allocate(MemPoolRecycle* this, uint64_t size, uint64_t hash) 
     return allocation;
 }
 void MemPoolFixed_Free(MemPoolRecycle* this, void* value) {
+    if(!value) return;
     for(uint64_t i = 0; i < MemPoolFixed_Allocations; i++) {
         MemPoolRecycle_Entry entry = this->allocations[i];
         if(entry.allocation == value) {
@@ -96,12 +120,6 @@ void MemPoolFixed_Free(MemPoolRecycle* this, void* value) {
 }
 
 
-void* MemPoolSystem_Allocate(MemPoolSystem* pool, uint64_t size, uint64_t hash) {
-    return malloc(size);
-}
-void MemPoolSystem_Free(MemPoolSystem* pool, void* value) {
-    free(value);
-}
 
 void memPoolHashed_DestroyOutsideRef(MemPoolHashed* pool) {
     InsideReference* ref = Reference_Acquire(&pool->holderOutsideReference);
@@ -111,15 +129,20 @@ void memPoolHashed_DestroyOutsideRef(MemPoolHashed* pool) {
         return;
     }
     Reference_DestroyOutside(&pool->holderOutsideReference, ref);
-    Reference_Release(&pool->holderOutsideReference, ref);
+    Reference_Release(&emptyReference, ref);
 }
 
 void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) {
-    if(size != pool->VALUE_SIZE) {
-        // Invalid input, size must equal the size the pool was initialized with.
+    if(size != pool->VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD) {
+        // Invalid input, size must equal the size the pool was initialized with (- MemPoolHashed_VALUE_OVERHEAD, which we use)
         OnError(2);
         return nullptr;
     }
+	// Tried to allocate after destruct was called...
+	if (pool->destructed) {
+		// This is a valid necessary race condition, so we just have to return nullptr.
+		return nullptr;
+	}
     uint64_t index = hash >> (64 - pool->VALUE_COUNT_LOG);
     uint64_t loopCount = 0;
     byte* valueStart = (byte*)pool + sizeof(MemPoolHashed);
@@ -150,9 +173,10 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
     return nullptr;
 }
 void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
+    if(!value) return;
     // So... interestingly enough, because our pool is continous, we CAN TELL where the value is, just by the pointer.
     //  Cool...
-    MemPoolHashed_InternalEntry* entry = (void*)((byte*)value - sizeof(MemPoolHashed));
+    MemPoolHashed_InternalEntry* entry = (void*)((byte*)value - sizeof(MemPoolHashed_InternalEntry));
     if(!entry->allocated) {
         // Double free? Bad, we can't always catch this...
         OnError(5);
@@ -175,8 +199,14 @@ void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
 // When we have no more outstanding allocations, AND are destructed, we destroy holderOutsideReference.
 //  (and that's all this does, it doesn't prevent allocations or anything, I don't think that is required...)
 void MemPoolHashed_Destruct(MemPoolHashed* pool) {
-    // Again, I don't think this needs a memory barrier
-    pool->destructed = 1;
+    if(InterlockedCompareExchange64(
+        (LONG64*)&pool->destructed,
+        1,
+        0
+    ) != 0) {
+        // Destruct may be called multiple times
+        return;
+    }
     if(pool->totalAllocationsOutstanding == 0) {
         memPoolHashed_DestroyOutsideRef(pool);
     }
@@ -186,7 +216,7 @@ bool MemPoolHashed_IsInPool(MemPoolHashed* pool, void* address) {
     #ifdef DEBUG
     if(result) {
         byte* valueStart = (byte*)pool + sizeof(MemPoolHashed);
-        if(((uint64_t)address - (uint64_t)valueStart) % pool->VALUE_SIZE != 0) {
+        if(((uint64_t)address - (uint64_t)valueStart - MemPoolHashed_VALUE_OVERHEAD) % pool->VALUE_SIZE != 0) {
             // address is not aligned, so... it is not something we returned, it is a random address.
             //  Are you passing random addresses? Do you think you can use a random address in the pool? You clearly can't...
             OnError(5);

@@ -59,7 +59,7 @@ typedef struct {
 
 #define MemPoolHashed_VALUE_OVERHEAD (sizeof(MemPoolHashed_InternalEntry))
 // VALUE_SIZE must already include MemPoolHashed_VALUE_OVERHEAD, (as you need to include it when making our allocation anyway...)
-#define MemPoolHashedDefault(VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, freeCallbackContext, freeCallback) { (Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, freeCallbackContext, freeCallback, VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, 0, 1 }
+#define MemPoolHashedDefault(VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, freeCallbackContext, freeCallback) { (Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, freeCallbackContext, freeCallback, VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, 0, 0 }
 #pragma pack(push, 1)
 typedef struct {
     void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);

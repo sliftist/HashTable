@@ -42,6 +42,9 @@ struct InsideReference;
 typedef struct InsideReference InsideReference;
 #define InsideReferenceSize 32
 
+#ifdef DEBUG
+extern bool IsSingleThreadedTest;
+#endif
 
 
 // Creates an expression to fast check a reference and a pointer. May fail due to redirect though,
@@ -74,6 +77,14 @@ typedef struct {
             uint64_t count : 64 - BITS_IN_ADDRESS_SPACE - 1;
             uint64_t isNull : 1;
         };
+        struct {
+            uint64_t spacerForFastCount : BITS_IN_ADDRESS_SPACE;
+            // Presumably it is faster to set fastCount than count, in the very rare cases we are constructing an OutsideReference
+            //  an explicitly setting the count (faster because setting count has to wipe out the high bit to not intersect with null,
+            //  but most of the time we KNOW the count won't be that high, so we should be able to just set fastCount and not
+            //  worry about the highest bit setting isNull to 1).
+            uint64_t fastCount : 64 - BITS_IN_ADDRESS_SPACE;
+        };
         uint64_t valueForSet;
     };
 } OutsideReference;
@@ -95,6 +106,9 @@ CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
 
 OutsideReference GetNextNull();
 void* Reference_GetValue(InsideReference* ref);
+
+// Assumes ref isn't NULL
+#define Reference_GetValueFast(ref) ((void*)((byte*)(ref) + InsideReferenceSize))
 
 bool Reference_HasBeenRedirected(InsideReference* ref);
 
@@ -128,13 +142,22 @@ void Reference_RedirectReference(
 
 // If the reference has been freed (or was never initialized), we return nullptr (but if we return an InsideReference,
 //  its pointer is always valid, so does not need to be null checked).
-InsideReference* Reference_Acquire(OutsideReference* ref);
+// This __forceinline has been profiled, and it does significantly decrease the number of instructions, and has
+//  a measurable impact on speed, making _find calls about 6% faster. I think with this being inline the
+//  number of instructions for this call is usually around 9-12, so any time it isn't inline this specific call takes
+//  far more instructions, even if only because of the call instruction
+__forceinline InsideReference* Reference_Acquire(OutsideReference* ref);
 
 
+// Must be passed if a Reference_Release call is freeing a reference count it knows has been moved to the inside reference.
+extern OutsideReference emptyReference;
 
 // Outside reference may be knowingly wiped out, we will just ignore it and then release the inside reference.
 //  Always pass an outsideRef, even if you know it has been wiped out.
 void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef);
+
+// insideRef must be non-nullptr
+void Reference_ReleaseFast(OutsideReference* outsideRef, InsideReference* insideRef);
 
 
 // Destroys this outside ref to the inside ref (which if it is the last outside ref, and there are no more inside references, will result
@@ -157,6 +180,11 @@ bool Reference_ReplaceOutsideStealOutside(OutsideReference* pOutsideRef, InsideR
 // Must have an inside reference to be called, and does not free inside reference
 //  returns true on success
 bool Reference_SetOutside(OutsideReference* outsideRef, InsideReference* insideRef);
+
+void DestroyUniqueOutsideRef(OutsideReference* ref);
+
+// Returns true on success
+bool Reference_ReduceToZeroOutsideRefs(OutsideReference* ref);
 
 #ifdef __cplusplus
 }

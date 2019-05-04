@@ -226,7 +226,7 @@ typedef struct {
 
 void deleteItem(void* itemVoid) {
 	Item* item = (Item*)itemVoid;
-	delete item;
+	//delete item;
 }
 
 #include <functional>
@@ -252,13 +252,13 @@ public:
 
 
 void testAdd2(AtomicHashTable2& table, uint64_t a, uint64_t b, uint64_t c) {
-	Item* item = new Item();
-	item->a = a;
-	item->b = b;
-	item->c = c;
+	Item item;
+	item.a = a;
+	item.b = b;
+	item.c = c;
 	uint64_t hash = getHash(a, b);
 
-	ErrorTop(AtomicHashTable2_insert(&table, hash, item));
+	ErrorTop(AtomicHashTable2_insert(&table, hash, &item));
 }
 
 
@@ -473,14 +473,16 @@ void testSizingVar(int variation) {
 				context.item.b = j + itemCount;
 
 				uint64_t hash = hashes[j];
-				// This call takes maybe ~170 instructions. Which seems like a lot.
-				AtomicHashTable2_find(&table, hash, &context, [](void* contextAny, void* value) {
+				// This call takes around 28 instructions, with the loop taking around 15 instructions
+				int result = AtomicHashTable2_find(&table, hash, &context, [](void* contextAny, void* value) {
 					Context* context = (Context*)contextAny;
 					Item* item = (Item*)value;
 					if (context->item.a == item->a && context->item.b == item->b) {
 						context->count++;
 					}
 				});
+
+				ErrorTop(result);
 
 				AssertEqual(context.count, 0);
 			}
@@ -1000,7 +1002,13 @@ void runRefCountTests() {
 
 void runAtomicHashTableTest() {
 	// TODO: Add a debug wrapper for malloc and free, so we can track the number of allocations, and run tests to make sure we don't leak allocations.
+	#ifdef DEBUG
+	IsSingleThreadedTest = true;
+	#endif
 	testSizing();
+	#ifdef DEBUG
+	IsSingleThreadedTest = false;
+	#endif
 	//testHashChurn();
 	/*
 	testHashLeaksRefs();

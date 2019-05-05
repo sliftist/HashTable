@@ -6,11 +6,15 @@
 #define DEBUG
 #endif
 
+#ifdef DEBUG
 #ifdef _MSC_VER
 #define breakpoint() __debugbreak()
 #define WINDOWS
 #else
 #define breakpoint() asm("int $3")
+#endif
+#else
+#define breakpoint() ;
 #endif
 
 

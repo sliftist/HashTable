@@ -224,6 +224,7 @@ typedef struct {
 	uint64_t c;
 } Item;
 
+// TODO: Oh, pass Item** in, so we will actually be simulating dynamic allocation and memory management.
 void deleteItem(void* itemVoid) {
 	Item* item = (Item*)itemVoid;
 	//delete item;
@@ -377,6 +378,9 @@ void testTableMultiThreads(
 
 
 void testSizingVar(int variation) {
+	//todonext
+	// Do all single threaded tests, and then do multithreaded tests, in debug and release...
+
 	uint64_t factor = 1;
 	uint64_t itemCount;
 	
@@ -395,7 +399,12 @@ void testSizingVar(int variation) {
 	}
 	else if(variation == 2) {
 		//itemCount = (1ll << 23);
+		// Requires 64GB of memory to work, but after struggling at lot at 64GB, it will free ~20GB, then the remaining ~60GB when it finishes
+		#ifdef DEBUG
+		itemCount = (1ll << 20);
+		#else
 		itemCount = (1ll << 26);
+		#endif
 	}
 	else {
 		itemCount = (1ll << 14);
@@ -550,13 +559,14 @@ void testSizingVar(int variation) {
 	if (variation == 2 || variation == 3) {
 		Timing_EndRootPrint(&rootTimer, itemCount * factor);
 	}
+	printf("\t%f search pressure (1 means there were no hash collisions)\n", (double)table.searchLoops / (double)table.searchStarts);
 }
 void testSizing() {
-	//testSizingVar(0);
+	testSizingVar(0);
 	testSizingVar(1);
-	//testSizingVar(3);
+	testSizingVar(3);
 
-	// Tests to make sure we can scale large
+	// Test to make sure we can scale large
 	//testSizingVar(2);
 }
 
@@ -1001,21 +1011,21 @@ void runRefCountTests() {
 
 
 void runAtomicHashTableTest() {
+	/*
 	// TODO: Add a debug wrapper for malloc and free, so we can track the number of allocations, and run tests to make sure we don't leak allocations.
 	#ifdef DEBUG
 	IsSingleThreadedTest = true;
 	#endif
+
 	testSizing();
+	testHashChurn2();
+
 	#ifdef DEBUG
 	IsSingleThreadedTest = false;
 	#endif
-	//testHashChurn();
-	/*
-	testHashLeaksRefs();
-	testHashChurn2();
-	*/
-
-	//testTableMultiThreads(4, 0, 1, threadedChurn);
+	//*/
+	testTableMultiThreads(4, 0, 1, threadedChurn);
+	//testTableMultiThreads(4, 1, 1, threadedChurn);
 
 	//todonext
 	// Oh, test with multiple threads... obviously...

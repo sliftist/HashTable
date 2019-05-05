@@ -127,11 +127,15 @@ void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPoint
 
 // Makes it so future Reference_Acquire calls that would return oldRef now return newRef (for all OutsideReferences).
 // If this is called multiple times on the same oldRef, the same newRef must be given, or else things will break.
+// Returns false if it didn't redirect, and newRef should be destroyed.
 void Reference_RedirectReference(
     // Must be acquired first
     // If already redirected, fails and returns false.
     InsideReference* oldRef,
     // Allocated normally, and having the value, pool, etc, set as desired.
+    //  Shouldn't be used after this. Instead acquire an outside reference with the old ref, which will
+    //  give you the most updated redirected reference (which very well might not be this, as this
+    //  redirect could fail).
     InsideReference* newRef
 );
 

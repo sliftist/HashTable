@@ -6,6 +6,16 @@
 extern "C" {
 #endif
 
+// All functions return > 0 on error. You might start to encounter a lot of errors if your system runs out of memory.
+//  Technically it is possible to grow a table big enough that it can't be shrunk, however in practice I don't see this happening.
+//  To grow we need to hold on 2 steps of allocations at once, so if it is ever possible to hold those two allocations, it will probably
+//  be possible in the future.
+// TODO: Change resizing behavior, so if we get stuck at a larger size we... recover somehow?
+// TODO: Add support for greater table capacities when memory usage becomes very high. Or maybe just allow changing the capacity target per table?
+
+// TODO: High value sizes allow low slot count, and whenever the core count is much higher than the slot count it is
+//  much more likely for our retry loops to hit their limits. So... we should add some kind of minimum slot count?
+//  Or... something...
 
 #pragma pack(push, 1)
 typedef struct {
@@ -79,6 +89,7 @@ typedef __declspec(align(16)) struct {
 
 
 
+
 // Should be initialized as:
 //  AtomicHashTable2 table = AtomicHashTableDefault(VALUE_SIZE, void (*deleteValue)(void* value));
 
@@ -99,6 +110,13 @@ typedef struct {
     void (*deleteValue)(void* value);
 
     OutsideReference currentAllocation;
+
+    // Disabling this instrumentation makes our fastest case about 30% faster. But it is already basically a NOOP, and
+    //  checking if our hash algorithm is bad in realtime is very useful...
+    #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+    uint64_t searchStarts;
+    uint64_t searchLoops;
+    #endif
 
 } AtomicHashTable2;
 #pragma pack(pop)
@@ -151,6 +169,9 @@ __forceinline bool atomicHashTable2_fastNotContains(
 
             uint64_t loops = 0;
             while(true) {
+                #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+                InterlockedIncrement64((LONG64*)&self->searchLoops);
+                #endif
                 OutsideReference value = table->slots[index].value;
                 if(value.valueForSet == 0) {
 					Reference_ReleaseFast(&self->currentAllocation, tableRef);
@@ -206,6 +227,9 @@ __forceinline int AtomicHashTable2_find(
     //  for the same value, assuming no value is added to the table more than once).
     void(*callback)(void* callbackContext, void* value)
 ) {
+    #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+    InterlockedIncrement64((LONG64*)&self->searchStarts);
+    #endif
     if(atomicHashTable2_fastNotContains(self, hash)) { return 0; }
     return atomicHashTable2_findFull(self, hash, callbackContext, callback);
 }
@@ -215,6 +239,9 @@ inline int AtomicHashTable2_findWithMatches(
     void* callbackContext,
     void(*callback)(void* callbackContext, void* value)
 ) {
+    #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+    InterlockedIncrement64((LONG64*)&self->searchStarts);
+    #endif
     return atomicHashTable2_findFull(self, hash, callbackContext, callback);
 }
 

@@ -155,7 +155,9 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
                 0
             ) == 0) {
                 InterlockedIncrement64((LONG64*)&pool->totalAllocationsOutstanding);
-                return (byte*)entry + sizeof(MemPoolHashed_InternalEntry);
+                byte* allocation = (byte*)entry + sizeof(MemPoolHashed_InternalEntry);
+                memset(allocation, 0, size);
+                return allocation;
             }
         }
         index = (index + 1) % pool->VALUE_COUNT;
@@ -174,8 +176,7 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
 }
 void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
     if(!value) return;
-    // So... interestingly enough, because our pool is continous, we CAN TELL where the value is, just by the pointer.
-    //  Cool...
+    // So... interestingly enough, because our pool is continous, we CAN TELL where the value is, just by the pointer. Cool...
     MemPoolHashed_InternalEntry* entry = (void*)((byte*)value - sizeof(MemPoolHashed_InternalEntry));
     if(!entry->allocated) {
         // Double free? Bad, we can't always catch this...

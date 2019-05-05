@@ -17,6 +17,15 @@ uint64_t log2RoundDown(uint64_t v) {
 	return log2(v * 2) - 1;
 }
 
+// 3 64 bits for indirection, 1 for pool, 1 for ref count, 1 for hash and 1 to know if the allocation is free.
+//  Way to save space:
+//  - The indirection could be on offset, as every value in each table redirects to the same thing, so that would work. It would also make moving a lot faster,
+//      and we could potentially use that to redesign our redirection, maybe not even having to call redirect on every value. But... it is nice to have
+//      redirect be abstract, and changing it now is too much work.
+//  - The pool could be passed in everywhere, but that is a massive headache, and although that might use less memory, it will almost certainly slow down the code.
+//  - The ref count could be less, but it's holding structure has to be 64 bit aligned anyway.
+//  - The hash could be less than 64 bits, but... the downside by increasing hash collisions isn't worth it. If anything we should make hashing use 128 bits.
+//  - To know if the allocation is free we could move that to a parallel bit packed structure, reducing that to 1 bit, but... the benefit is marginal.
 #define SIZE_PER_VALUE_ALLOC(table) (table->VALUE_SIZE + sizeof(HashValue) + InsideReferenceSize + MemPoolHashed_VALUE_OVERHEAD)
 #define SIZE_PER_COUNT(table) (SIZE_PER_VALUE_ALLOC(table) + sizeof(AtomicSlot))
 
@@ -113,19 +122,19 @@ int atomicHashTable2_updateReserved(
 
     uint64_t newSlotCount = 0;
     uint64_t curSlotCount = curAlloc ? curAlloc->slotsCount : 0;
-    uint64_t slotsReserved = curAlloc ? curAlloc->slotsReservedWithNulls : 1;
-    newSlotCount = newShrinkSize(this, curSlotCount, slotsReserved);
-    newSlotCount = newSlotCount ? newSlotCount : newGrowSize(this, curSlotCount, slotsReserved);
+    uint64_t slotsReservedNulls = curAlloc ? curAlloc->slotsReservedWithNulls : 1;
+    uint64_t slotsReservedNoNulls = curAlloc ? curAlloc->slotsReserved : 1;
+    newSlotCount = newShrinkSize(this, curSlotCount, slotsReservedNoNulls);
+    newSlotCount = newSlotCount ? newSlotCount : newGrowSize(this, curSlotCount, slotsReservedNulls);
     if(!newSlotCount || newSlotCount == curSlotCount) {
         return 0;
     }
 
-    // Again with slotsReserved, which will be the value of slotsReservedWithNulls after we move
-    slotsReserved = curAlloc ? curAlloc->slotsReserved : 1;
-    newSlotCount = newShrinkSize(this, curSlotCount, slotsReserved);
-    newSlotCount = newSlotCount ? newSlotCount : newGrowSize(this, curSlotCount, slotsReserved);
+    // Again with but now to get the actual size needed after a move (so after nulls, as in tombstones, are removed).
+    newSlotCount = newShrinkSize(this, curSlotCount, slotsReservedNoNulls);
+    newSlotCount = newSlotCount ? newSlotCount : newGrowSize(this, curSlotCount, slotsReservedNoNulls);
     if(!newSlotCount) {
-        newSlotCount = curAlloc->slotsReserved;
+        newSlotCount = curAlloc->slotsCount;
     }
 
     if(curAlloc && !curAlloc->finishedMovingInto) {
@@ -355,6 +364,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
                     Reference_Release(&pMoveState->sourceValue, valueRef);
                     return 3;
                 }
+
                 newValue->hash = hash;
                 memcpy(
                     (byte*)newValue + sizeof(HashValue),
@@ -367,13 +377,13 @@ int atomicHashTable2_applyMoveTableOperationInner(
                     valueRef,
                     newValueRefInside
                 );
-                moveState.sourceValue.pointerClipped = (uint64_t)newValueRefInside;
 
                 Reference_Release(&pMoveState->sourceValue, valueRef);
 
                 // Reference_Acquire will update sourceValue to the redirected reference,
                 //  which allows us to destroy our previous outside reference.
                 valueRef = Reference_Acquire(&pMoveState->sourceValue);
+                moveState.sourceValue.pointerClipped = (uint64_t)valueRef;
 
                 Reference_DestroyOutside(&newValueRef, newValueRefInside);
                 Reference_Release(&emptyReference, newValueRefInside);
@@ -491,7 +501,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 if(growing) {
                     destBlockEnd = destBlockEnd * 2;
                 } else if(shrinking) {
-                    breakpoint();
+                    //breakpoint();
                     destBlockEnd = destBlockEnd / 2;
                 }
                 uint64_t sourceBlockStart = moveState.sourceBlockStart != UINT32_MAX ? moveState.sourceBlockStart : curSourceIndex;
@@ -584,6 +594,9 @@ int atomicHashTable2_findInner4(
     uint64_t index = getSlotBaseIndex(table, hash);
     uint64_t loopCount = 0;
     while(true) {
+        #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+        InterlockedIncrement64((LONG64*)&this->searchLoops);
+        #endif
         OutsideReference* pValue = &table->slots[index].value;
         OutsideReference value = *pValue;
         if(IS_VALUE_MOVED(value)) {
@@ -681,9 +694,9 @@ int atomicHashTable2_findInner2(
             }
             RETURN_ON_ERROR(moveResult);
         }
-    }
-    if(result == 1) {
-        return atomicHashTable2_findInner3(this, hash, valuesFound, pValuesFoundLimit, callbackContext, callback, newTable);
+        if(result == 1) {
+            return atomicHashTable2_findInner3(this, hash, valuesFound, pValuesFoundLimit, callbackContext, callback, newTable);
+        }
     }
     return result;
 }
@@ -779,6 +792,9 @@ int AtomicHashTable2_insertInner2(
     uint64_t index = getSlotBaseIndex(table, hash);
     uint64_t loopCount = 0;
     while(true) {
+        #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+        InterlockedIncrement64((LONG64*)&this->searchLoops);
+        #endif
         OutsideReference* pValue = &table->slots[index].value;
         OutsideReference valueRef = *pValue;
 
@@ -859,14 +875,18 @@ int AtomicHashTable2_insertInner(
             }
             RETURN_ON_ERROR(moveResult);
         }
-    }
-    if(result == 1) {
-        return AtomicHashTable2_insertInner2(this, hash, value, newTable);
+        if(result == 1) {
+            return AtomicHashTable2_insertInner2(this, hash, value, newTable);
+        }
     }
     return result;
 }
 
 int AtomicHashTable2_insert(AtomicHashTable2* this, uint64_t hash, void* value) {
+    #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+    InterlockedIncrement64((LONG64*)&this->searchStarts);
+    #endif
+
     if(!this->currentAllocation.valueForSet) {
         // Trigger initial resize, so currentAllocation always has a value.
         atomicHashTable2_updateReserved(this, nullptr, &this->currentAllocation, 0, 0);
@@ -910,6 +930,9 @@ int atomicHashTable2_removeInner2(
     uint64_t index = getSlotBaseIndex(table, hash);
     uint64_t loopCount = 0;
     while(true) {
+        #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+        InterlockedIncrement64((LONG64*)&this->searchLoops);
+        #endif
         OutsideReference* pValue = &table->slots[index].value;
         OutsideReference valueRef = *pValue;
 
@@ -980,9 +1003,9 @@ int atomicHashTable2_removeInner(
             }
             RETURN_ON_ERROR(moveResult);
         }
-    }
-    if(result == 1) {
-        return atomicHashTable2_removeInner2(this, hash, callbackContext, callback, newTable);
+        if(result == 1) {
+            return atomicHashTable2_removeInner2(this, hash, callbackContext, callback, newTable);
+        }
     }
     return result;
 }
@@ -995,6 +1018,9 @@ int AtomicHashTable2_remove(
     //  May be called multiple times for the value for one call.
 	bool(*callback)(void* callbackContext, void* value)
 ) {
+    #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+    InterlockedIncrement64((LONG64*)&this->searchStarts);
+    #endif
     while(true) {
         InsideReference* tableRef = Reference_Acquire(&this->currentAllocation);
         AtomicHashTableBase* table = Reference_GetValue(tableRef);

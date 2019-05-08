@@ -18,7 +18,7 @@ bool Reference_ReplaceOutsideInner(OutsideReference* pOutsideRef, InsideReferenc
 
 InsideReference* Reference_AcquireInternal(OutsideReference* pRef, bool redirect);
 
-OutsideReference emptyReference = { 0 };
+const OutsideReference emptyReference = { 0 };
 
 static OutsideReference PREV_NULL = BASE_NULL_LAST_CONST;
 OutsideReference GetNextNull() {
@@ -188,7 +188,7 @@ void Reference_RedirectReference(
     newRefPrevRedirectValue.valueForSet = InterlockedCompareExchange64(
         (LONG64*)&newRef->prevRedirectValue,
         (LONG64)oldRef,
-        (LONG64)emptyReference.valueForSet
+        (LONG64)0
     );
     #ifdef DEBUG
     if(newRefPrevRedirectValue.valueForSet != 0 && !FAST_CHECK_POINTER(newRefPrevRedirectValue, oldRef)) {
@@ -210,7 +210,7 @@ void Reference_RedirectReference(
     oldRefNextRedirectValue.valueForSet = InterlockedCompareExchange64(
         (LONG64*)&oldRef->nextRedirectValue,
         (LONG64)newRef,
-        (LONG64)emptyReference.valueForSet
+        (LONG64)0
     );
 
     if(oldRefNextRedirectValue.valueForSet != 0) {
@@ -472,9 +472,15 @@ InsideReference* Reference_Acquire(OutsideReference* pRef) {
         return Reference_AcquireInternal(pRef, true);
     }
 
+    // Having zero refs doesn't mean being 0, because of nulls, so... we set the ref count to zero explicitly...
+    OutsideReference zeroRefs = refForSet;
+    zeroRefs.count = 0;
+
+    // If this fails either we were wiped out and gained a value, or another acquire run, in which case it will
+    //  perform this anyway, and we will eventually be reset by some thread (probably).
     InterlockedCompareExchange64(
         (LONG64*)pRef,
-        0,
+        zeroRefs.valueForSet,
         refForSet.valueForSet + (1ll << COUNT_OFFSET_BITS)
     );
 
@@ -494,8 +500,10 @@ void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPoint
     outRef->pointerClipped = (uint64_t)ref;
 
     // Count of 1, for the OutsideReference
-    ref->count = 1;
+    ref->countFullValue = 1;
     ref->pool = pool;
+    ref->nextRedirectValue.valueForSet = 0;
+    ref->prevRedirectValue.valueForSet = 0;
 
     *outPointer = (void*)((byte*)ref + InsideReferenceSize);
 }

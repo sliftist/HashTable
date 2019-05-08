@@ -51,15 +51,12 @@ extern MemPoolSystem memPoolSystem;
 
 
 
-#pragma pack(push, 1)
-typedef struct {
-    uint64_t allocated;
-} MemPoolHashed_InternalEntry;
-#pragma pack(pop)
-
-#define MemPoolHashed_VALUE_OVERHEAD (sizeof(MemPoolHashed_InternalEntry))
-// VALUE_SIZE must already include MemPoolHashed_VALUE_OVERHEAD, (as you need to include it when making our allocation anyway...)
+// TODO: We only use 1 bit, so change the places that use this to only use 1 bit, instead of 1 byte
+#define MemPoolHashed_VALUE_OVERHEAD (1)
+// VALUE_SIZE must already include MemPoolHashed_VALUE_OVERHEAD, (as you need to include it when making our allocation anyway...),
+//  also either zero out our memory, or call MemPoolHashed_Initialize(pool).
 #define MemPoolHashedDefault(VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, freeCallbackContext, freeCallback) { (Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, freeCallbackContext, freeCallback, VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, 0, 0 }
+
 #pragma pack(push, 1)
 typedef struct {
     void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
@@ -78,9 +75,14 @@ typedef struct {
     uint64_t totalAllocationsOutstanding;
     uint64_t destructed;
 
-    // The memory after the end of the struct is an array of values, of count VALUE_COUNT and size VALUE_SIZE
+    // The memory after the end of the struct is...
+    //  size of (VALUE_COUNT + 7) / 8, parallel bits which indicate if values are in use
+    //  an array of values, of count VALUE_COUNT and size VALUE_SIZE
 } MemPoolHashed;
 #pragma pack(pop)
+
+void MemPoolHashed_Initialize(MemPoolHashed* pool);
+
 void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash);
 void MemPoolHashed_Free(MemPoolHashed* pool, void* value);
 // When we have no more outstanding allocations, AND are destructed, we destroy holderOutsideReference.

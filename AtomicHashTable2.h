@@ -13,6 +13,9 @@ extern "C" {
 // TODO: Change resizing behavior, so if we get stuck at a larger size we... recover somehow?
 // TODO: Add support for greater table capacities when memory usage becomes very high. Or maybe just allow changing the capacity target per table?
 
+// TODO: We need to add support for a dedicated malloc thread, so we can have a malloc prepared ahead of time,
+//  which lets us greatly reduce our worst case behavior.
+
 // TODO: High value sizes allow low slot count, and whenever the core count is much higher than the slot count it is
 //  much more likely for our retry loops to hit their limits. So... we should add some kind of minimum slot count?
 //  Or... something...
@@ -37,6 +40,8 @@ typedef struct {
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
+
+    // (initialized to UINT32_MAX)
     uint32_t nextSourceSlot;
 
 	// TODO: We can actually make sourceBlockStart be more than 64 bits, and then make nextSourceSlot be an offset instead (that
@@ -48,7 +53,6 @@ typedef __declspec(align(16)) struct {
     //  cases with 100% collisions can be O(1), and other cases faster too)
 	uint32_t sourceBlockStart;
 
-    // If BASE_NULL then we skip setting it
     //  We own this sourceValue (it is moved correctly), so to move
     //  it into the slot we need to get a reference and create a new outside reference, and then
     //  the thread that swaps this out for 0 has to destroy this outside reference.
@@ -69,6 +73,7 @@ typedef __declspec(align(16)) struct {
 
     // Values and the underlying memory valuePool takes from are both taken from the rest of the allocation.
     AtomicSlot* slots;
+    
     // Value count equals slot count. Because we always have extra slots,
     //  and if we run out of values we should first run out of slotsReserved.
     MemPoolHashed* valuePool;
@@ -166,6 +171,7 @@ __forceinline bool atomicHashTable2_fastNotContains(
         AtomicHashTableBase* table = (AtomicHashTableBase*)Reference_GetValueFast(tableRef);
         if(!table->newAllocation.valueForSet) {
             uint64_t index = atomicHashTable_getSlotBaseIndex(table, hash);
+            uint64_t startIndex = index;
 
             uint64_t loops = 0;
             while(true) {
@@ -174,6 +180,7 @@ __forceinline bool atomicHashTable2_fastNotContains(
                 #endif
                 OutsideReference value = table->slots[index].value;
                 if(value.valueForSet == 0) {
+                    printf("Fast not contains from %llu of %llu of %llu\n", startIndex, index, hash);
 					Reference_ReleaseFast(&self->currentAllocation, tableRef);
                     return 1;
                 }
@@ -230,7 +237,7 @@ __forceinline int AtomicHashTable2_find(
     #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
     InterlockedIncrement64((LONG64*)&self->searchStarts);
     #endif
-    if(atomicHashTable2_fastNotContains(self, hash)) { return 0; }
+    //if(atomicHashTable2_fastNotContains(self, hash)) {return 0;}
     return atomicHashTable2_findFull(self, hash, callbackContext, callback);
 }
 inline int AtomicHashTable2_findWithMatches(

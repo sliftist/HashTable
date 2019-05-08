@@ -14,7 +14,8 @@
 #define breakpoint() asm("int $3")
 #endif
 #else
-#define breakpoint() ;
+//#define breakpoint() ;
+#define breakpoint() __debugbreak()
 #endif
 
 

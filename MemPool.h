@@ -10,7 +10,7 @@ struct MemPool;
 typedef struct MemPool MemPool;
 #pragma pack(push, 1)
 struct MemPool {
-    // Pool must/does zero out memory it allocates
+    // Pool does not initialize memory
     void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
     void (*Free)(MemPool* pool, void* value);
 };

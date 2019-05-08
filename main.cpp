@@ -376,6 +376,55 @@ void testTableMultiThreads(
 	}
 }
 
+uint64_t groupSum;
+uint64_t groupCount;
+uint64_t groupMax;
+uint64_t tickSum;
+uint64_t tickCount;
+uint64_t tickMax;
+void tickGroupStart() {
+	groupSum = 0;
+	groupCount = 0;
+	groupMax = 0;
+}
+
+uint64_t tickStartTime = 0;
+void tickStart() {
+	tickStartTime = GetTime();
+}
+void tickEnd() {
+	uint64_t tickEndTime = GetTime();
+	uint64_t curTime = tickEndTime - tickStartTime;
+	groupSum += curTime;
+	groupCount++;
+	groupMax = max(groupMax, curTime);
+
+	if (curTime > 108915300) {
+		//breakpoint();
+	}
+
+	tickSum += curTime;
+	tickCount++;
+	tickMax = max(tickMax, curTime);
+}
+void printPercentTick(const char* tickName, AtomicHashTable2& table, double fraction) {
+	uint64_t count = DebugAtomicHashTable2_reservedSize(&table);
+	uint64_t maxCount = DebugAtomicHashTable2_allocationSize(&table);
+	printf("%s at %f%% %llu/%llu, %llu time %f%% of all, %llu average time, %f%% average of all, max %fX average, %f%% tick max of worst max, worst %f%%\n",
+		tickName, fraction * 100, count, maxCount,
+		tickSum,
+		(double)tickSum / groupSum * 100,
+		tickSum / tickCount,
+		(double)(tickSum / tickCount) / (groupSum / groupCount) * 100,
+		(double)tickMax / (tickSum / tickCount),
+		(double)tickMax / groupMax * 100,
+		(double)tickMax / tickSum * 100
+	);
+	tickSum = 0;
+	tickCount = 0;
+	tickMax = 0;
+}
+
 
 void testSizingVar(int variation) {
 	//todonext
@@ -419,15 +468,19 @@ void testSizingVar(int variation) {
 		Timing_StartRoot(&rootTimer);
 	}
 
+	tickGroupStart();
 	for (uint64_t i = 0; i < itemCount; i++) {
+		if (i == 209714) {
+			//breakpoint();
+		}
+		tickStart();
 		testAdd2(table, i, i, i);
 		testAdd2(table, i, i, i);
+		tickEnd();
 
 		if (variation == 2) {
 			if (i % (itemCount / 100) == 0) {
-				uint64_t count = DebugAtomicHashTable2_reservedSize(&table);
-				uint64_t maxCount = DebugAtomicHashTable2_allocationSize(&table);
-				printf("Add at %f%% %llu/%llu\n", (double)(i + 1) / itemCount * 100, count, maxCount);
+				printPercentTick("Add", table, (double)(i + 1) / itemCount);
 			}
 		}
 
@@ -439,16 +492,10 @@ void testSizingVar(int variation) {
 		}
 	}
 
+	tickGroupStart();
 	if (variation == 0 || variation == 2 || variation == 3) {
 		for (uint64_t j = 0; j < itemCount; j++) {
-			if (variation == 2) {
-				if (j % (itemCount / 100) == 0) {
-					uint64_t count = DebugAtomicHashTable2_reservedSize(&table);
-					uint64_t maxCount = DebugAtomicHashTable2_allocationSize(&table);
-					printf("Check at %f%% %llu/%llu\n", (double)(j + 1) / itemCount * 100, count, maxCount);
-				}
-			}
-
+			tickStart();
 			{
 				uint64_t count = testGetCount2(table, j + itemCount, j + itemCount);
 				AssertEqual(count, 0);
@@ -456,6 +503,13 @@ void testSizingVar(int variation) {
 			{
 				uint64_t count = testGetCount2(table, j, j);
 				AssertEqual(count, 2);
+			}
+			tickEnd();
+
+			if (variation == 2) {
+				if (j % (itemCount / 100) == 0) {
+					printPercentTick("Check", table, (double)(j + 1) / itemCount);
+				}
 			}
 		}
 	}
@@ -521,22 +575,17 @@ void testSizingVar(int variation) {
 	}
 
 
+	tickGroupStart();
 	for (uint64_t i = 0; i < itemCount; i++) {
-		if (variation == 2) {
-			if (i % (itemCount / 100) == 0) {
-				uint64_t count = DebugAtomicHashTable2_reservedSize(&table);
-				uint64_t maxCount = DebugAtomicHashTable2_allocationSize(&table);
-				printf("Remove at %f%% %llu/%llu\n", (double)(i + 1) / itemCount * 100, count, maxCount);
-			}
-		}
-
 		Item item = { 0 };
 		item.a = i;
 		item.b = i;
 		item.c = i;
 		// TODO: Oh, the remove count can easily be higher, as it is possible the function will be called many times
 		//	for the same value (because of contention).
+		tickStart();
 		uint64_t removeCount = testRemove2(table, item);
+		tickEnd();
 		AssertEqual(removeCount, 2);
 
 		if (variation == 0) {
@@ -545,6 +594,12 @@ void testSizingVar(int variation) {
 			}
 			for (uint64_t j = i + 1; j < itemCount; j++) {
 				AssertEqual(testGetCount2(table, j, j), 2);
+			}
+		}
+
+		if (variation == 2) {
+			if (i % (itemCount / 100) == 0) {
+				printPercentTick("Remove", table, (double)(i + 1) / itemCount);
 			}
 		}
 	}
@@ -569,6 +624,9 @@ void testSizing() {
 	// Test to make sure we can scale large
 	//testSizingVar(2);
 }
+
+void* getValueHash(OutsideReference& ref) { return ((ref).valueForSet == 0 || (ref).isNull) ? 0 : (void*)(*(uint64_t*)((ref).pointerClipped + 32)); }
+#define val(table, index) getValueHash(((AtomicHashTableBase*)(table.currentAllocation.pointerClipped + 32))->slots[index].value)
 
 #include <vector>
 void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIndex = 0) {
@@ -613,8 +671,14 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 		if((decision >= 0 || itemsAdded.size() == 0) && itemsNotAdded.size() > 0) {
 			index = index % itemsNotAdded.size();
 			Item item = itemsNotAdded.at(index);
+			uint64_t hash = getHash(item.a, item.b);
 			testAdd2(table, item.a, item.b, item.c);
-			AssertEqual(testGetCount2(table, item.a, item.b), 1);
+			uint64_t count = testGetCount2(table, item.a, item.b);
+			if (count != 1) {
+				breakpoint();
+				AssertEqual(testGetCount2(table, item.a, item.b), 1);
+			}
+			
 			AssertEqual(testGetSome2(table, item).c, item.c);
 			itemsNotAdded.erase(itemsNotAdded.begin() + index);
 			itemsAdded.push_back(item);
@@ -636,6 +700,7 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 		{
 			for (uint64_t j = 0; j < itemsAdded.size(); j++) {
 				Item item = itemsAdded.at(j);
+				uint64_t hash = getHash(item.a, item.b);
 				uint64_t count = testGetCount2(table, item.a, item.b);
 				if (count != 1) {
 					uint64_t count2 = testGetCount2(table, item.a, item.b);
@@ -1024,6 +1089,7 @@ void runAtomicHashTableTest() {
 	IsSingleThreadedTest = false;
 	#endif
 	//*/
+	printf("ran single threaded tests\n");
 	testTableMultiThreads(4, 0, 1, threadedChurn);
 	//testTableMultiThreads(4, 1, 1, threadedChurn);
 

@@ -5,16 +5,12 @@
 
 MemPoolSystem memPoolSystem = MemPoolSystemDefault();
 
-void* zeroAlloc(uint64_t size) {
-    byte* memory = malloc(size);
-    if(memory != 0) {
-        memset(memory, 0, size);
-    }
-    return memory;
-}
-
 void* MemPoolSystem_Allocate(MemPoolSystem* pool, uint64_t size, uint64_t hash) {
-    return zeroAlloc(size);
+	//uint64_t time = GetTime();
+    void* allocation = malloc(size);
+	//time = GetTime() - time;
+	//printf("Alloc of %lluMB Took %llu million cycles\n", size / 1024 / 1024, time / 1024 / 1024);
+	return allocation;
 }
 void MemPoolSystem_Free(MemPoolSystem* pool, void* value) {
     if(!value) return;
@@ -35,13 +31,12 @@ void* MemPoolFixed_Allocate(MemPoolRecycle* this, uint64_t size, uint64_t hash) 
                 &value,
                 &newValue
             )) {
-                memset(value.allocation, 0, value.size);
                 return value.allocation;
             }
         }
     }
 
-    void* allocation = zeroAlloc(size);
+    void* allocation = malloc(size);
 	if (!allocation) {
 		return nullptr;
 	}
@@ -120,6 +115,9 @@ void MemPoolFixed_Free(MemPoolRecycle* this, void* value) {
 }
 
 
+void MemPoolHashed_Initialize(MemPoolHashed* pool) {
+    memset((byte*)pool + sizeof(MemPoolHashed), 0, (pool->VALUE_COUNT + 7) / 8);
+}
 
 void memPoolHashed_DestroyOutsideRef(MemPoolHashed* pool) {
     InsideReference* ref = Reference_Acquire(&pool->holderOutsideReference);
@@ -145,18 +143,19 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
 	}
     uint64_t index = hash >> (64 - pool->VALUE_COUNT_LOG);
     uint64_t loopCount = 0;
-    byte* valueStart = (byte*)pool + sizeof(MemPoolHashed);
+    byte* allocatedBits = (byte*)pool + sizeof(MemPoolHashed);
     while(true) {
-        MemPoolHashed_InternalEntry* entry = (void*)(valueStart + index * pool->VALUE_SIZE);
-        if(!entry->allocated) {
-            if(InterlockedCompareExchange64(
-                (LONG64*)&entry->allocated,
-                1,
-                0
-            ) == 0) {
+        uint32_t* pAllocatedByte = (uint32_t*)&allocatedBits[index / 8];
+        uint32_t allocatedByte = *pAllocatedByte;
+        uint32_t allocated = allocatedByte & (1 << (index % 8));
+        if(!allocated) {
+            if(InterlockedCompareExchange(
+                (LONG32*)pAllocatedByte,
+                allocatedByte | (1 << (index % 8)),
+                allocatedByte
+            ) == allocatedByte) {
                 InterlockedIncrement64((LONG64*)&pool->totalAllocationsOutstanding);
-                byte* allocation = (byte*)entry + sizeof(MemPoolHashed_InternalEntry);
-                memset(allocation, 0, size);
+                byte* allocation = allocatedBits + (pool->VALUE_COUNT + 7) / 8 + index * pool->VALUE_SIZE;
                 return allocation;
             }
         }
@@ -176,9 +175,15 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
 }
 void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
     if(!value) return;
-    // So... interestingly enough, because our pool is continous, we CAN TELL where the value is, just by the pointer. Cool...
-    MemPoolHashed_InternalEntry* entry = (void*)((byte*)value - sizeof(MemPoolHashed_InternalEntry));
-    if(!entry->allocated) {
+    uint64_t offset = (uint64_t)value - (uint64_t)((byte*)pool + sizeof(MemPoolHashed) + (pool->VALUE_COUNT + 7) / 8);
+    if(offset % pool->VALUE_SIZE != 0) {
+        // Value isn't aligned, this isn't allowed
+        OnError(3);
+    }
+    uint64_t index = offset / pool->VALUE_SIZE;
+    uint32_t* pAllocated = &((byte*)pool + sizeof(MemPoolHashed))[index / 8];
+    byte isAllocated = *pAllocated & (1 << (index % 8));
+    if(!isAllocated) {
         // Double free? Bad, we can't always catch this...
         OnError(5);
         return;
@@ -186,11 +191,13 @@ void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
 
     pool->FreeCallback(pool->freeCallbackContext, value);
 
-    // Eh... we might run out of memory because we don't have a memory barrier here... which means our
-    //  frees may take a while to be visible, even when other interlocked operations make it inferrable
-    //  to other threads that there should be enough entries free... But... it should be fine...
-    //  - And actually... our reserved count can't propogate before our allocated changed, can it?
-    entry->allocated = 0;
+    while(true) {
+        uint32_t prevValue = *pAllocated;
+        uint32_t newValue = prevValue & ~(1 << (index % 8));
+        if(InterlockedCompareExchange(pAllocated, newValue, prevValue) == prevValue) {
+            break;
+        }
+    }
 
     uint64_t outstandingAfter = InterlockedDecrement64((LONG64*)&pool->totalAllocationsOutstanding);
     if(outstandingAfter == 0 && pool->destructed) {
@@ -213,11 +220,11 @@ void MemPoolHashed_Destruct(MemPoolHashed* pool) {
     }
 }
 bool MemPoolHashed_IsInPool(MemPoolHashed* pool, void* address) {
-    bool result = (uint64_t)pool <= (uint64_t)address && (uint64_t)address < (uint64_t)((byte*)pool + sizeof(MemPoolHashed) + pool->VALUE_SIZE * pool->VALUE_COUNT);
+    bool result = (uint64_t)pool <= (uint64_t)address && (uint64_t)address < (uint64_t)((byte*)pool + sizeof(MemPoolHashed) + (pool->VALUE_COUNT + 7) / 8 + pool->VALUE_SIZE * pool->VALUE_COUNT);
     #ifdef DEBUG
     if(result) {
-        byte* valueStart = (byte*)pool + sizeof(MemPoolHashed);
-        if(((uint64_t)address - (uint64_t)valueStart - MemPoolHashed_VALUE_OVERHEAD) % pool->VALUE_SIZE != 0) {
+        byte* valueStart = (byte*)pool + sizeof(MemPoolHashed) + (pool->VALUE_COUNT + 7) / 8;
+        if(((uint64_t)address - (uint64_t)valueStart) % pool->VALUE_SIZE != 0) {
             // address is not aligned, so... it is not something we returned, it is a random address.
             //  Are you passing random addresses? Do you think you can use a random address in the pool? You clearly can't...
             OnError(5);

@@ -56,9 +56,9 @@ extern bool IsSingleThreadedTest;
 #define COUNT_OFFSET_BITS (BITS_IN_ADDRESS_SPACE)
 
 #if defined(WINDOWS) && defined(KERNEL)
-#define FAST_CHECK_POINTER(outsideRef, insideRef) (!(outsideRef).isNull && (outsideRef).pointerClipped == ((uint64_t)(insideRef) & ((1ll << BITS_IN_ADDRESS_SPACE) - 1)))
+#define FAST_CHECK_POINTER(outsideRef, insideRef) (!(outsideRef).isNull ? (outsideRef).pointerClipped == ((uint64_t)(insideRef) & ((1ll << BITS_IN_ADDRESS_SPACE) - 1)) : (uint64_t)(insideRef) == nullptr)
 #else
-#define FAST_CHECK_POINTER(outsideRef, insideRef) (!(outsideRef).isNull && (outsideRef).pointerClipped == ((uint64_t)(insideRef)))
+#define FAST_CHECK_POINTER(outsideRef, insideRef) (!(outsideRef).isNull ? (outsideRef).pointerClipped == ((uint64_t)(insideRef)) : (uint64_t)(insideRef) == nullptr)
 #endif
 
 
@@ -103,6 +103,8 @@ CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
 #define BASE_NULL9 ((OutsideReference){ 9, 0, 1 })
 #define BASE_NULL_LAST_CONST { 10, 0, 1  }
 #define BASE_NULL_LAST ((OutsideReference) BASE_NULL_LAST_CONST )
+
+#define BASE_NULL_MAX ((OutsideReference){ UINT64_MAX, UINT64_MAX, UINT64_MAX })
 
 OutsideReference GetNextNull();
 void* Reference_GetValue(InsideReference* ref);
@@ -154,7 +156,7 @@ __forceinline InsideReference* Reference_Acquire(OutsideReference* ref);
 
 
 // Must be passed if a Reference_Release call is freeing a reference count it knows has been moved to the inside reference.
-extern OutsideReference emptyReference;
+extern const OutsideReference emptyReference;
 
 // Outside reference may be knowingly wiped out, we will just ignore it and then release the inside reference.
 //  Always pass an outsideRef, even if you know it has been wiped out.

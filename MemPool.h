@@ -17,6 +17,19 @@ struct MemPool {
 #pragma pack(pop)
 
 
+#define MemPoolSystemDefault() { (Allocate)MemPoolSystem_Allocate, (Free)MemPoolSystem_Free }
+#pragma pack(push, 1)
+typedef struct {
+    void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
+    void (*Free)(MemPool* pool, void* value);
+} MemPoolSystem;
+#pragma pack(pop)
+
+void* MemPoolSystem_Allocate(MemPoolSystem* pool, uint64_t size, uint64_t hash);
+void MemPoolSystem_Free(MemPoolSystem* pool, void* value);
+
+extern MemPoolSystem memPoolSystem;
+
 
 #ifdef __cplusplus
 }

@@ -38,28 +38,21 @@ typedef struct {
 } AtomicSlot;
 #pragma pack(pop)
 
+
 #pragma pack(push, 1)
-typedef __declspec(align(16)) struct {
+typedef struct {
+    union {
+        struct {
+            uint32_t sourceIndex;
 
-    // (initialized to UINT32_MAX)
-    uint32_t nextSourceSlot;
-
-	// TODO: We can actually make sourceBlockStart be more than 64 bits, and then make nextSourceSlot be an offset instead (that
-	//	is less 32 bits), that way we can support more than 2^32 values (but less than 2^32 block size, which is fine, as high block
-	//	sizes yield really bad behavior, and anything more than like... 2^10 block size should fail).
-    //  (UINT32_MAX to indicate it has no value)
-    // TODO: Also... if the offset is small, we will have bits to cache information on the last dest
-    //  block we iterated over, allowing for faster searching of dest index locations (making it so
-    //  cases with 100% collisions can be O(1), and other cases faster too)
-	uint32_t sourceBlockStart;
-
-    //  We own this sourceValue (it is moved correctly), so to move
-    //  it into the slot we need to get a reference and create a new outside reference, and then
-    //  the thread that swaps this out for 0 has to destroy this outside reference.
-    OutsideReference sourceValue;
+            // Set to UINT32_MAX before we have a dest
+            uint32_t destIndex;
+        };
+        uint64_t valueForSet;
+    };
 } MoveStateInner;
 #pragma pack(pop)
-CASSERT(sizeof(MoveStateInner) == 16);
+CASSERT(sizeof(MoveStateInner) == 8);
 
 
 
@@ -134,9 +127,11 @@ typedef struct {
 // We take ownership of value on insertion, and free it on removing it from the hashtable. So...
 //  if it is added twice, or used after removal, there will be a problem. You can try to remove
 //  it multiple times though, we will reference count it internally.
+// If it has been inserted 0 is returned, if non-0 is returned, the value will not have been inserted.
 // Returns 0 on success, and > 0 on failure
 int AtomicHashTable2_insert(AtomicHashTable2* self, uint64_t hash, void* value);
 
+// This function may have removed some of the values when an error is returned, or non of the values may have been removed.
 int AtomicHashTable2_remove(
 	AtomicHashTable2* self,
 	uint64_t hash,
@@ -161,6 +156,7 @@ int atomicHashTable2_findFull(
 
 #define atomicHashTable_getSlotBaseIndex(alloc, hash) ((hash) >> (64 - (alloc)->logSlotsCount))
 
+/*
 // internal
 __forceinline bool atomicHashTable2_fastNotContains(
     AtomicHashTable2* self,
@@ -218,6 +214,7 @@ __forceinline bool atomicHashTable2_fastNotContains(
     }
     return 0;
 }
+*/
 
 // This is optimized for the case when we don't find any matches, as this really needs to be fastest when used
 //  as a filter, and other cases will presumably spend more time in processing a match than it takes to find a match.

@@ -7,14 +7,19 @@ MemPoolSystem memPoolSystem = MemPoolSystemDefault();
 
 void* MemPoolSystem_Allocate(MemPoolSystem* pool, uint64_t size, uint64_t hash) {
 	//uint64_t time = GetTime();
+	//_CrtCheckMemory();
     void* allocation = malloc(size);
+	//_CrtCheckMemory();
 	//time = GetTime() - time;
-	//printf("Alloc of %lluMB Took %llu million cycles\n", size / 1024 / 1024, time / 1024 / 1024);
+	//printf("Allocation size %llu, %p\n", size, allocation);
 	return allocation;
 }
 void MemPoolSystem_Free(MemPoolSystem* pool, void* value) {
     if(!value) return;
+	//printf("Freeing %p\n", value);
+	//_CrtCheckMemory();
     free(value);
+	//_CrtCheckMemory();
 }
 
 
@@ -137,7 +142,7 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
         return nullptr;
     }
 	// Tried to allocate after destruct was called...
-	if (pool->destructed) {
+	if (pool->countForSet.destructed) {
 		// This is a valid necessary race condition, so we just have to return nullptr.
 		return nullptr;
 	}
@@ -154,8 +159,8 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
                 allocatedByte | (1 << (index % 8)),
                 allocatedByte
             ) == allocatedByte) {
-                InterlockedIncrement64((LONG64*)&pool->totalAllocationsOutstanding);
-                byte* allocation = allocatedBits + (pool->VALUE_COUNT + 7) / 8 + index * pool->VALUE_SIZE;
+                InterlockedIncrement64((LONG64*)&pool->countForSet.valueForSet);
+                byte* allocation = allocatedBits + (pool->VALUE_COUNT + 7) / 8 + index * (pool->VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD);
                 return allocation;
             }
         }
@@ -176,12 +181,14 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
 void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
     if(!value) return;
     uint64_t offset = (uint64_t)value - (uint64_t)((byte*)pool + sizeof(MemPoolHashed) + (pool->VALUE_COUNT + 7) / 8);
-    if(offset % pool->VALUE_SIZE != 0) {
+    if(offset % (pool->VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD) != 0) {
         // Value isn't aligned, this isn't allowed
         OnError(3);
     }
-    uint64_t index = offset / pool->VALUE_SIZE;
-    uint32_t* pAllocated = &((byte*)pool + sizeof(MemPoolHashed))[index / 8];
+    uint64_t index = offset / (pool->VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD);
+    // Yes, might access beyond our allocation with this, but... our allocation must be in at least increments of 32 bits
+    //  (at a system level), so this should be fine...
+    uint32_t* pAllocated = (uint32_t*)&((byte*)pool + sizeof(MemPoolHashed))[index / 8];
     byte isAllocated = *pAllocated & (1 << (index % 8));
     if(!isAllocated) {
         // Double free? Bad, we can't always catch this...
@@ -199,32 +206,58 @@ void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
         }
     }
 
-    uint64_t outstandingAfter = InterlockedDecrement64((LONG64*)&pool->totalAllocationsOutstanding);
-    if(outstandingAfter == 0 && pool->destructed) {
-        memPoolHashed_DestroyOutsideRef(pool);
+
+    while(true) {
+        AllocCount count = pool->countForSet;
+        AllocCount countNew = count;
+        if(countNew.totalAllocationsOutstanding == 0) {
+            // Double free?
+            OnError(9);
+            return;
+        }
+        countNew.totalAllocationsOutstanding--;
+        if(InterlockedCompareExchange64(
+            (LONG64*)&pool->countForSet.valueForSet,
+            countNew.valueForSet,
+            count.valueForSet
+        ) != count.valueForSet) {
+            continue;
+        }
+        if(countNew.destructed && countNew.totalAllocationsOutstanding == 0) {
+            memPoolHashed_DestroyOutsideRef(pool);
+        }
+        break;
     }
 }
 // When we have no more outstanding allocations, AND are destructed, we destroy holderOutsideReference.
 //  (and that's all this does, it doesn't prevent allocations or anything, I don't think that is required...)
+// - The caller MUST have a reference to the allocation while calling this.
 void MemPoolHashed_Destruct(MemPoolHashed* pool) {
-    if(InterlockedCompareExchange64(
-        (LONG64*)&pool->destructed,
-        1,
-        0
-    ) != 0) {
-        // Destruct may be called multiple times
-        return;
-    }
-    if(pool->totalAllocationsOutstanding == 0) {
-        memPoolHashed_DestroyOutsideRef(pool);
+    while(true) {
+        AllocCount count = pool->countForSet;
+        // Destruct may be called multiple times, as presumably the called has a reference to the allocation anyway...
+        if(count.destructed) return;
+        AllocCount countNew = count;
+        countNew.destructed = 1;
+        if(InterlockedCompareExchange64(
+            (LONG64*)&pool->countForSet.valueForSet,
+            countNew.valueForSet,
+            count.valueForSet
+        ) != count.valueForSet) {
+            continue;
+        }
+        if(countNew.destructed && countNew.totalAllocationsOutstanding == 0) {
+            memPoolHashed_DestroyOutsideRef(pool);
+        }
+        break;
     }
 }
 bool MemPoolHashed_IsInPool(MemPoolHashed* pool, void* address) {
-    bool result = (uint64_t)pool <= (uint64_t)address && (uint64_t)address < (uint64_t)((byte*)pool + sizeof(MemPoolHashed) + (pool->VALUE_COUNT + 7) / 8 + pool->VALUE_SIZE * pool->VALUE_COUNT);
+    bool result = (uint64_t)pool <= (uint64_t)address && (uint64_t)address < (uint64_t)((byte*)pool + sizeof(MemPoolHashed) + (pool->VALUE_COUNT + 7) / 8 + pool->VALUE_COUNT * (pool->VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD));
     #ifdef DEBUG
     if(result) {
         byte* valueStart = (byte*)pool + sizeof(MemPoolHashed) + (pool->VALUE_COUNT + 7) / 8;
-        if(((uint64_t)address - (uint64_t)valueStart) % pool->VALUE_SIZE != 0) {
+        if(((uint64_t)address - (uint64_t)valueStart) % (pool->VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD) != 0) {
             // address is not aligned, so... it is not something we returned, it is a random address.
             //  Are you passing random addresses? Do you think you can use a random address in the pool? You clearly can't...
             OnError(5);

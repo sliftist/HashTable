@@ -27,14 +27,29 @@ extern "C" {
 
 
 /*
+* We have an array of 624 32-bit values, and there are 31 unused bits, so we
+* have a seed value of 624*32-31 = 19937 bits.
+*/
+#define MERSENNE_SIZE 624
+
+// State for a singleton Mersenne Twister. If you want to make this into a
+// class, these are what you need to isolate.
+typedef struct {
+	uint32_t MT[MERSENNE_SIZE];
+	uint32_t MT_TEMPERED[MERSENNE_SIZE];
+	size_t index;
+} MTState;
+
+
+/*
 * Extract a pseudo-random unsigned 32-bit integer in the range 0 ... UINT32_MAX
 */
-uint32_t mersenne_rand_u32();
+uint32_t mersenne_rand_u32(MTState*);
 
 /*
 * Initialize Mersenne Twister with given seed value.
 */
-void mersenne_seed(uint32_t seed_value);
+void mersenne_seed(MTState*, uint32_t seed_value);
 
 
 

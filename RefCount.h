@@ -40,7 +40,9 @@ extern "C" {
 
 struct InsideReference;
 typedef struct InsideReference InsideReference;
-#define InsideReferenceSize 32
+//#define InsideReferenceSize 32
+#define EVENT_ID_COUNT 140
+#define InsideReferenceSize (32 + EVENT_ID_COUNT * 4 * 8 + 8)
 
 #ifdef DEBUG
 extern bool IsSingleThreadedTest;
@@ -101,7 +103,12 @@ CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
 #define BASE_NULL7 ((OutsideReference){ 7, 0, 1 })
 #define BASE_NULL8 ((OutsideReference){ 8, 0, 1 })
 #define BASE_NULL9 ((OutsideReference){ 9, 0, 1 })
-#define BASE_NULL_LAST_CONST { 10, 0, 1  }
+// We need this to be somewhat high, as we use it to identify pointers in null values even
+//  when the null values have the isNull set...
+//  - We could also take the approach of just immediately leaking any allocations that
+//      start before this, that way we can guarantee pointers don't get used with values less than this...
+#define MIN_POINTER_VALUE 1000
+#define BASE_NULL_LAST_CONST { MIN_POINTER_VALUE, 0, 1  }
 #define BASE_NULL_LAST ((OutsideReference) BASE_NULL_LAST_CONST )
 
 #define BASE_NULL_MAX ((OutsideReference){ UINT64_MAX, UINT64_MAX, UINT64_MAX })
@@ -113,6 +120,11 @@ void* Reference_GetValue(InsideReference* ref);
 #define Reference_GetValueFast(ref) ((void*)((byte*)(ref) + InsideReferenceSize))
 
 bool Reference_HasBeenRedirected(InsideReference* ref);
+
+//todonext
+// Remove unused functions, and see if any of the used functions can be simplified, or if any of the use cases
+//  of functions can be made more specific, instead of forcing our code to get things done in a roundabout way
+//  (which is slower, and more error prone).
 
 // We can tell the different between a valid pointer and null because null with have the highest bit set, the lower
 //  bits used for the count BUT THE COUNT WON'T BE LARGE ENOUGH TO REACH THE 2ND HIGHEST BIT! This should be true
@@ -130,7 +142,7 @@ void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPoint
 // Makes it so future Reference_Acquire calls that would return oldRef now return newRef (for all OutsideReferences).
 // If this is called multiple times on the same oldRef, the same newRef must be given, or else things will break.
 // Returns false if it didn't redirect, and newRef should be destroyed.
-void Reference_RedirectReference(
+void Reference_RedirectReferenceX(
     // Must be acquired first
     // If already redirected, fails and returns false.
     InsideReference* oldRef,
@@ -138,21 +150,35 @@ void Reference_RedirectReference(
     //  Shouldn't be used after this. Instead acquire an outside reference with the old ref, which will
     //  give you the most updated redirected reference (which very well might not be this, as this
     //  redirect could fail).
-    InsideReference* newRef
+    InsideReference* newRef,
+    const char* file,
+    uint64_t line
 );
+#define Reference_RedirectReference(oldRef, newRef) Reference_RedirectReferenceX(oldRef, newRef, __FILE__, __LINE__)
 
 
 // pointer should be directly used inside of InsideReference. The only reason a raw pointer isn't returned is
 //  to ensure that random pointers aren't passed back.
 
-
+// MAY change ref to be for a redirected value, as is required to allow proper destruction of an outside reference
+//  otherwise when you tried to acquire and then destroy an outside reference it wouldn't work, as the pointers wouldn't match...
 // If the reference has been freed (or was never initialized), we return nullptr (but if we return an InsideReference,
 //  its pointer is always valid, so does not need to be null checked).
-// This __forceinline has been profiled, and it does significantly decrease the number of instructions, and has
-//  a measurable impact on speed, making _find calls about 6% faster. I think with this being inline the
-//  number of instructions for this call is usually around 9-12, so any time it isn't inline this specific call takes
-//  far more instructions, even if only because of the call instruction
-__forceinline InsideReference* Reference_Acquire(OutsideReference* ref);
+//__forceinline InsideReference* Reference_Acquire(OutsideReference* ref);
+
+InsideReference* Reference_AcquireX(OutsideReference* pRef, const char* file, uint64_t line);
+#define Reference_Acquire(pRef) Reference_AcquireX(pRef, __FILE__, __LINE__)
+
+// Acquires the reference, even if it is null, as long as the pointer value is > BASE_NULL_LAST, and not BASE_NULL_MAX.
+// Does not follow redirections
+// Always makes its reference an inside reference
+//  - So it should be freed via Reference_Release(&emptyReference, insideRef);
+InsideReference* Reference_AcquireIfNullX(OutsideReference* ref, const char* file, uint64_t line);
+#define Reference_AcquireIfNull(ref) Reference_AcquireIfNullX(ref, __FILE__, __LINE__)
+
+// Sometimes through null, sometimes if. Should only be called if you set outsideRef to null, and aren't expecting it
+//  to not come back from null, as we don't fully check for isNull inside here.
+void Reference_DestroyThroughNull(OutsideReference* outsideRef, OutsideReference newNullValue);
 
 
 // Must be passed if a Reference_Release call is freeing a reference count it knows has been moved to the inside reference.
@@ -160,7 +186,8 @@ extern const OutsideReference emptyReference;
 
 // Outside reference may be knowingly wiped out, we will just ignore it and then release the inside reference.
 //  Always pass an outsideRef, even if you know it has been wiped out.
-void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef);
+void Reference_ReleaseX(OutsideReference* outsideRef, InsideReference* insideRef, const char* file, uint64_t line);
+#define Reference_Release(outsideRef, insideRef) Reference_ReleaseX(outsideRef, insideRef, __FILE__, __LINE__)
 
 // insideRef must be non-nullptr
 void Reference_ReleaseFast(OutsideReference* outsideRef, InsideReference* insideRef);
@@ -181,16 +208,30 @@ bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pI
 // We need this in one specific place...
 bool Reference_ReplaceOutsideStealOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef);
 
+// We need this in one specific place... It is used when moving to basically freeze the reference,
+//  and then access it by calling special functions which allow us to treat isNull values like regular references.
+bool Reference_ReduceToZeroRefsAndSetIsNull(OutsideReference* pOutsideRef, InsideReference* pInsideRef);
 
-// dest must be zeroed out, OR previously an outside ref destroyed by DestroyReference
-// Must have an inside reference to be called, and does not free inside reference
-//  returns true on success
-bool Reference_SetOutside(OutsideReference* outsideRef, InsideReference* insideRef);
+#define Reference_CreateOutsideReference(insideRef) Reference_CreateOutsideReferenceX(insideRef, __FILE__, __LINE__)
+OutsideReference Reference_CreateOutsideReferenceX(InsideReference* insideRef, const char* file, uint64_t line);
 
 void DestroyUniqueOutsideRef(OutsideReference* ref);
 
-// Returns true on success
-bool Reference_ReduceToZeroOutsideRefs(OutsideReference* ref);
+// Must be passed a reference obtained as an inside reference
+// Frees the argument reference, and always returns a reference (so you only need to free the result).
+InsideReference* Reference_FollowRedirectsX(InsideReference* ref, const char* file, uint64_t line);
+#define Reference_FollowRedirects(ref) Reference_FollowRedirectsX(ref, __FILE__, __LINE__)
+
+#ifdef DEBUG
+#define IsInsideRefCorrupt(pRef) IsInsideRefCorruptInner(pRef, false)
+#define IsOutsideRefCorrupt(ref) IsOutsideRefCorruptInner(ref)
+#else
+#define IsInsideRefCorrupt(pRef) false
+#define IsOutsideRefCorrupt(ref) false
+#endif
+
+bool IsInsideRefCorruptInner(InsideReference* pRef, bool allowFreed);
+bool IsOutsideRefCorruptInner(OutsideReference ref);
 
 #ifdef __cplusplus
 }

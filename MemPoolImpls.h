@@ -36,18 +36,6 @@ void MemPoolFixed_Free(MemPoolRecycle* pool, void* value);
 
 
 
-#define MemPoolSystemDefault() { (Allocate)MemPoolSystem_Allocate, (Free)MemPoolSystem_Free }
-#pragma pack(push, 1)
-typedef struct {
-    void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
-    void (*Free)(MemPool* pool, void* value);
-} MemPoolSystem;
-#pragma pack(pop)
-
-void* MemPoolSystem_Allocate(MemPoolSystem* pool, uint64_t size, uint64_t hash);
-void MemPoolSystem_Free(MemPoolSystem* pool, void* value);
-
-extern MemPoolSystem memPoolSystem;
 
 
 
@@ -56,6 +44,18 @@ extern MemPoolSystem memPoolSystem;
 // VALUE_SIZE must already include MemPoolHashed_VALUE_OVERHEAD, (as you need to include it when making our allocation anyway...),
 //  also either zero out our memory, or call MemPoolHashed_Initialize(pool).
 #define MemPoolHashedDefault(VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, freeCallbackContext, freeCallback) { (Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, freeCallbackContext, freeCallback, VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderOutsideReference, 0, 0 }
+
+#pragma pack(push, 1)
+typedef struct {
+    union {
+        struct {
+            uint64_t totalAllocationsOutstanding: 63;
+            uint64_t destructed: 1;
+        };
+        uint64_t valueForSet;
+    };
+} AllocCount;
+#pragma pack(pop)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -72,8 +72,7 @@ typedef struct {
     uint64_t VALUE_COUNT_LOG;
     OutsideReference holderOutsideReference;
 
-    uint64_t totalAllocationsOutstanding;
-    uint64_t destructed;
+    AllocCount countForSet;
 
     // The memory after the end of the struct is...
     //  size of (VALUE_COUNT + 7) / 8, parallel bits which indicate if values are in use

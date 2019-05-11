@@ -21,36 +21,21 @@
 // it on those).
 #define MT_UNROLL_MORE
 
-/*
-* We have an array of 624 32-bit values, and there are 31 unused bits, so we
-* have a seed value of 624*32-31 = 19937 bits.
-*/
-#define SIZE 624
 #define PERIOD 397
 #define DIFF 227
+#define SIZE MERSENNE_SIZE
 
 static const uint32_t MAGIC = 0x9908b0df;
-
-// State for a singleton Mersenne Twister. If you want to make this into a
-// class, these are what you need to isolate.
-typedef struct {
-	uint32_t MT[SIZE];
-	uint32_t MT_TEMPERED[SIZE];
-	size_t index;
-} MTState;
-
-MTState state;
-int stateIndexInitialized = 0;
 
 #define M32(x) (0x80000000 & x) // 32nd MSB
 #define L31(x) (0x7FFFFFFF & x) // 31 LSBs
 
 #define UNROLL(expr) \
-  y = M32(state.MT[i]) | L31(state.MT[i+1]); \
-  state.MT[i] = state.MT[expr] ^ (y >> 1) ^ ((((int32_t)(y) << 31) >> 31) & MAGIC); \
+  y = M32(state->MT[i]) | L31(state->MT[i+1]); \
+  state->MT[i] = state->MT[expr] ^ (y >> 1) ^ ((((int32_t)(y) << 31) >> 31) & MAGIC); \
   ++i;
 
-static void generate_numbers()
+static void generate_numbers(MTState* state)
 {
 	/*
 	* For performance reasons, we've unrolled the loop three times, thus
@@ -98,25 +83,25 @@ static void generate_numbers()
 
 	{
 		// i = 623, last step rolls over
-		y = M32(state.MT[SIZE - 1]) | L31(state.MT[0]);
-		state.MT[SIZE - 1] = state.MT[PERIOD - 1] ^ (y >> 1) ^ ((((int32_t)(y) << 31) >>
+		y = M32(state->MT[SIZE - 1]) | L31(state->MT[0]);
+		state->MT[SIZE - 1] = state->MT[PERIOD - 1] ^ (y >> 1) ^ ((((int32_t)(y) << 31) >>
 			31) & MAGIC);
 	}
 
 	// Temper all numbers in a batch
 	for (i = 0; i < SIZE; ++i) {
-		y = state.MT[i];
+		y = state->MT[i];
 		y ^= y >> 11;
 		y ^= y << 7 & 0x9d2c5680;
 		y ^= y << 15 & 0xefc60000;
 		y ^= y >> 18;
-		state.MT_TEMPERED[i] = y;
+		state->MT_TEMPERED[i] = y;
 	}
 
-	state.index = 0;
+	state->index = 0;
 }
 
-void mersenne_seed(uint32_t value)
+void mersenne_seed(MTState* state, uint32_t value)
 {
 	/*
 	* The equation below is a linear congruential generator (LCG), one of the
@@ -149,20 +134,20 @@ void mersenne_seed(uint32_t value)
 	* masking with 0xFFFFFFFF below.
 	*/
 
-	state.MT[0] = value;
-	state.index = SIZE;
+	state->MT[0] = value;
+	state->index = SIZE;
 
 	for (int i = 1; i<SIZE; ++i)
-		state.MT[i] = 0x6c078965 * (state.MT[i - 1] ^ state.MT[i - 1] >> 30) + i;
+		state->MT[i] = 0x6c078965 * (state->MT[i - 1] ^ state->MT[i - 1] >> 30) + i;
 }
 
-uint32_t mersenne_rand_u32() {
-	if (state.index == SIZE || !stateIndexInitialized) {
-		mersenne_seed(0x7cdd44b);
-		stateIndexInitialized = 1;
-		generate_numbers();
-		state.index = 0;
+uint32_t mersenne_rand_u32(MTState* state) {
+	if (state->index == SIZE) {
+		// Uh... this repeats a lot. Maybe... don't just repeat with the same seed?
+		mersenne_seed(state, 0x7cdd44b);
+		generate_numbers(state);
+		state->index = 0;
 	}
 
-	return state.MT_TEMPERED[state.index++];
+	return state->MT_TEMPERED[state->index++];
 }

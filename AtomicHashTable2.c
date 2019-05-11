@@ -31,7 +31,7 @@ uint64_t log2RoundDown(uint64_t v) {
 uint64_t minSlotCount(AtomicHashTable2* this) {
     uint64_t sizePerCount = SIZE_PER_COUNT(this);
     
-    uint64_t minCount = (PAGE_SIZE - sizeof(AtomicHashTableBase) - InsideReferenceSize - sizeof(MemPoolHashed)) / sizePerCount;
+    uint64_t minCount = (PAGE_SIZE * 100 - sizeof(AtomicHashTableBase) - InsideReferenceSize - sizeof(MemPoolHashed)) / sizePerCount;
 
     // Must be a power of 2, for getSlotBaseIndex
     minCount = 1ll << log2RoundDown(minCount);
@@ -39,7 +39,7 @@ uint64_t minSlotCount(AtomicHashTable2* this) {
     return minCount;
 }
 uint64_t getTableSize(AtomicHashTable2* this, uint64_t slotCount) {
-    uint64_t tableSize = SIZE_PER_COUNT(this) * slotCount + sizeof(AtomicHashTable2);
+    uint64_t tableSize = SIZE_PER_COUNT(this) * slotCount + sizeof(AtomicHashTableBase) + sizeof(MemPoolHashed);
 	return tableSize;
 }
 
@@ -71,10 +71,15 @@ void atomicHashTable2_memPoolFreeCallback(AtomicHashTable2* this, InsideReferenc
     }
 }
 
+//todonext
+// Wait... when we attempt to get a reference, we might temporarily turn a tombstone into having a count, which will make it look like it is moved?
+//  Crap...
+
 // Has to be a value copied from shared storage, or else this will race...
 //  (which is why we don't put parentheses around value, as if using it raw fails to compile, then it probably isn't a locally copied variable...)
-#define IS_VALUE_MOVED(value) (value.isNull && value.valueForSet != BASE_NULL.valueForSet)
-#define IS_BLOCK_END(value) (value.valueForSet == 0 || value.valueForSet == BASE_NULL_MAX.valueForSet)
+#define IS_VALUE_MOVED(value) (value.isNull && value.valueForSet != BASE_NULL.valueForSet && value.valueForSet != BASE_NULL_MAX.valueForSet)
+
+#define IS_BLOCK_END(value) (value.valueForSet == 0 || value.valueForSet == BASE_NULL_MAX.valueForSet || value.valueForSet == BASE_NULL2.valueForSet)
 
 
 // Doesn't do any moves, just makes undoing reserve updates easier, because undoing
@@ -131,8 +136,30 @@ int atomicHashTable2_updateReserved(
     uint64_t curSlotCount = curAlloc ? curAlloc->slotsCount : 0;
     uint64_t slotsReservedNulls = curAlloc ? curAlloc->slotsReservedWithNulls : 1;
     uint64_t slotsReservedNoNulls = curAlloc ? curAlloc->slotsReserved : 1;
+    // If we really don't have that many nulls, then don't use the count with nulls. This makes sure
+    //  we only do same size resizes when we have enough nulls, instead of when we are near a threshold and
+    //  have only a few nulls (as resizing to the same size prematurely can make all operations O(N)).
+    // (We require at least 20% nulls to do a resize of the same size, because if we use slotsReservedNulls then
+    //      any resize will increase or decrease our size)
+    if(slotsReservedNoNulls * 12 / 10 > slotsReservedNulls) {
+        slotsReservedNulls = slotsReservedNoNulls;
+    }
+
+	#ifdef DEBUG
+    if(curAlloc && curAlloc->slotsCount == 32 && slotsReservedNulls > 28) {
+        breakpoint();
+    }
+
+    if(curAlloc) {
+        if(slotsReservedNoNulls * 100 < curAlloc->slotsCount && curAlloc->slotsCount > 1024 && curAlloc->finishedMovingInto) {
+			// Why haven't we shrunk before this?
+            breakpoint();
+        }
+    }
+	#endif
+
     newSlotCount = newShrinkSize(this, curSlotCount, slotsReservedNoNulls);
-    newSlotCount = newSlotCount ? newSlotCount : newGrowSize(this, curSlotCount, slotsReservedNulls);
+    newSlotCount = newSlotCount != 0 && newSlotCount != curSlotCount ? newSlotCount : newGrowSize(this, curSlotCount, slotsReservedNulls);
     if(!newSlotCount || newSlotCount == curSlotCount) {
         return 0;
     }
@@ -150,6 +177,7 @@ int atomicHashTable2_updateReserved(
             //  our count will increase as we continue moving...
             return 0;
         }
+
         // We shouldn't be trying to grow though when moving... We should be able to move the whole table in well
         //  under the number of operations it takes to doulbe our size again. This likely means our fixed
         //  move count is too low, or our grow/shrink ranges overlap, or are too close, or something.
@@ -173,13 +201,14 @@ int atomicHashTable2_updateReserved(
     newTable->logSlotsCount = logSlotsCount;
     newTable->slots = (void*)((byte*)newTable + sizeof(AtomicHashTableBase));
     newTable->valuePool = (void*)((byte*)newTable->slots + sizeof(AtomicSlot) * newSlotCount);
-    newTable->moveState.nextSourceSlot = UINT32_MAX;
-    newTable->moveState.sourceBlockStart = UINT32_MAX;
-    newTable->moveState.sourceValue.valueForSet = 0;
+    newTable->moveState.destIndex = UINT32_MAX;
+    newTable->moveState.sourceIndex = 0;
     newTable->newAllocation.valueForSet = 0;
     newTable->slotsReserved = 0;
     newTable->slotsReservedWithNulls = 0;
     newTable->finishedMovingInto = false;
+
+    
 
     if(pNewAlloc != &this->currentAllocation) {
         memset(newTable->slots, 0xFF, newSlotCount * sizeof(uint64_t));
@@ -189,22 +218,30 @@ int atomicHashTable2_updateReserved(
     }
 
     InsideReference* newTableRef = Reference_Acquire(&newAllocation);
-    OutsideReference memPoolTableRef = { 0 };
-    Reference_SetOutside(&memPoolTableRef, newTableRef);
+    OutsideReference memPoolTableRef = Reference_CreateOutsideReference(newTableRef);
     Reference_Release(&newAllocation, newTableRef);
 
     MemPoolHashed pool = MemPoolHashedDefault(SIZE_PER_VALUE_ALLOC(this), newSlotCount, logSlotsCount, memPoolTableRef, this, atomicHashTable2_memPoolFreeCallback);
     *newTable->valuePool = pool;
     MemPoolHashed_Initialize(newTable->valuePool);
 
+	/*
+    if(logSlotsCount > 10) {
+        breakpoint();
+        MemPoolHashed_Allocate(newTable->valuePool, newTable->valuePool->VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD, (newSlotCount - 1) << (64 - logSlotsCount));
+    }
+	*/
+
     if(InterlockedCompareExchange64(
         (LONG64*)pNewAlloc,
         newAllocation.valueForSet,
         0
     ) != 0) {
+        DestroyUniqueOutsideRef(&memPoolTableRef);
+        DestroyUniqueOutsideRef(&newAllocation);
         return 1;
     }
-    printf("starting new move size %llu to %llu\n", curAlloc ? curAlloc->slotsCount : 0, newTable->slotsCount);
+    //printf("starting new move size %llu to %llu\n", curAlloc ? curAlloc->slotsCount : 0, newTable->slotsCount);
     return 0;
 }
 
@@ -253,14 +290,21 @@ void atomicHashTable2_replaceNullsInBlock(
 }
 
 
-
+// MUST be called before newAlloc is accessed.
 // Returns 0 if moves were applied,
 // Returns > 1 on error
+//  (never returns 1)
 int atomicHashTable2_applyMoveTableOperationInner(
     AtomicHashTable2* this,
     AtomicHashTableBase* curAlloc,
     AtomicHashTableBase* newAlloc
 ) {
+    uint64_t HASH_VALUE_SIZE = this->HASH_VALUE_SIZE;
+    uint64_t VALUE_SIZE = this->VALUE_SIZE;
+
+
+    // Okay, inserts...
+
     //todonext
     // Alright... how could moving, skip over a value that definitely exists? Because that is what happening, a value not deleted,
     //  doesn't get moved, it just completely gets skipped over. Maybe... print all cases we skip over, and why?
@@ -272,14 +316,22 @@ int atomicHashTable2_applyMoveTableOperationInner(
 	// This has to be a certain size above our grow/shrink thresholds or else we will try to grow before we finish moving!
     uint64_t minApplyCount = 64;
 
-    uint64_t HASH_VALUE_SIZE = this->HASH_VALUE_SIZE;
-    uint64_t VALUE_SIZE = this->VALUE_SIZE;
+    
 
     uint64_t countApplied = 0;
 
     MoveStateInner* pMoveState = &curAlloc->moveState;
 
     uint64_t loops = 0;
+    uint64_t retries = 0;
+    uint64_t savedRetries = 0;
+    uint64_t lastRetryId = 0;
+    uint64_t lastLastRetryId = 0;
+    bool setDest = false;
+
+    MoveStateInner firstObservedState = *pMoveState;
+
+    MoveStateInner moveState = { 0 };
     while(true) {
         loops++;
         if(loops > curAlloc->slotsCount * 10) {
@@ -287,498 +339,332 @@ int atomicHashTable2_applyMoveTableOperationInner(
             return 9;
         }
 
-        // Make sure we start off at the start of a block (so a 0).
-        if(pMoveState->nextSourceSlot == UINT32_MAX) {
-            bool shrinking = curAlloc->slotsCount < newAlloc->slotsCount;
-            for(uint32_t index = 0; index < curAlloc->slotsCount; index++) {
-                if(shrinking && index % 2 == 1) {
-                    // If we start moving on an odd entry, it means the dest index will be in a transition state (all of the source values
-                    //  that could fill it haven't been moved to it, but some might have), which will make our access algorithms
-                    //  way too complicated, as right now they rely on a location either being moved into (so it isn't in the source),
-                    //  or not moved into (so it is in the source).
-                    // So, we just skip odd entries when shrinking.
-                    continue;
-                }
-                if(curAlloc->slots[index].value.valueForSet == 0) {
-                    if(InterlockedCompareExchange64(
-                        (LONG64*)&curAlloc->slots[index].value,
-                        BASE_NULL2.valueForSet,
-                        0
-                    ) != 0) {
-                        break;
-                    }
-                    // If this fails, leaving BASE_NULL2s around is fine... we have to handle them anyway, and so leaving them around
-                    //  just lets us test that code more often.
-                    InterlockedCompareExchange(
-                        (LONG32*)&pMoveState->nextSourceSlot,
-                        index,
-                        UINT32_MAX
-                    );
-                    break;
-                }
+        // #define IS_VALUE_MOVED(value) (value.isNull && value.valueForSet != BASE_NULL.valueForSet)
+
+        // Move state is small enough that access are implicitly atomic (as it is 64 bits, and 64 bit aligned)
+        MoveStateInner prevMoveState = moveState;
+        moveState = *pMoveState;
+        if(moveState.sourceIndex != prevMoveState.sourceIndex) {
+            if(lastRetryId) {
+                lastLastRetryId = lastRetryId;
             }
-            if(pMoveState->nextSourceSlot == UINT32_MAX) {
-                continue;
-            }
+            savedRetries += retries;
+            retries = 0;
+            lastRetryId = 0;
+            setDest = false;
         }
 
-        // Make sure pMoveState->sourceValue is populated
-        {
-            // Move the value from the source into the move state, atomically, making it look like null in the source,
-            //  and not like null in the destination.
+        if(moveState.sourceIndex >= curAlloc->slotsCount) {
+            InsideReference* newAllocRef = (void*)((byte*)newAlloc - InsideReferenceSize);
+            newAlloc->finishedMovingInto = true;
 
-            // We map to BASE_NULL1, and not 0, that way 0 can stay as a sentinel
-            if(pMoveState->sourceValue.valueForSet == 0) {
-                uint32_t nextSourceSlot = pMoveState->nextSourceSlot;
-                OutsideReference* pSource = &curAlloc->slots[nextSourceSlot % curAlloc->slotsCount].value;
-                OutsideReference sourceValue = *pSource;
-                if (sourceValue.valueForSet == 0) {
-                    if (InterlockedCompareExchange64(
-                        (LONG64*)pSource,
-                        (LONG64)BASE_NULL2.valueForSet,
-                        0
-                    ) != 0) {
-                        continue;
-                    }
-                    sourceValue = BASE_NULL2;
-                }
-                else if(sourceValue.valueForSet == BASE_NULL.valueForSet) {
+            // Turn off IsSingleThreadedTest, to disable some leak detection login in references that is not needed for newAllocation
+            #ifdef DEBUG
+            bool prevIsSingleThreadedTest = IsSingleThreadedTest;
+            IsSingleThreadedTest = false;
+            #endif
+            Reference_RedirectReference((void*)((byte*)curAlloc - InsideReferenceSize), newAllocRef);
+            #ifdef DEBUG
+            IsSingleThreadedTest = prevIsSingleThreadedTest;
+            #endif
+
+            Reference_DestroyOutsideMakeNull(&curAlloc->newAllocation, newAllocRef);
+
+            // Hmm... does order matter with destroying the mem pool and redirecting the allocation?
+            //  It seems better to destroy the mem pool after we redirect and allocation...
+            MemPoolHashed_Destruct(curAlloc->valuePool);
+            return 0;
+        }
+
+        bool endOfBlock = false;
+
+        OutsideReference* pSource = &curAlloc->slots[moveState.sourceIndex].value;
+        // Make sure curAlloc->slots[sourceIndex] is frozen, and marked as moved
+        OutsideReference source = *pSource;
+
+        {
+            // We HAVE to make sure all source values become moved, or else inserts might insert into old allocations,
+            //  and then wonder where their inserts are (as in, the old allocation could have lots of BASE_NULL_MAXs, so
+            //  seem fine, so it wouldn't be able to know it inserted in the wrong allocation, without comparing against
+            //  currentAllocation again... but that is... extra work?)
+            if(!IS_VALUE_MOVED(source)) {
+                if(source.valueForSet == 0 || source.valueForSet == BASE_NULL_MAX.valueForSet) {
                     if(InterlockedCompareExchange64(
                         (LONG64*)pSource,
-                        (LONG64)BASE_NULL1.valueForSet,
-                        (LONG64)BASE_NULL.valueForSet
-                    ) != (LONG64)BASE_NULL.valueForSet) {
+                        BASE_NULL2.valueForSet,
+                        source.valueForSet
+                    ) != source.valueForSet) {
+                        retries++;
+                        lastRetryId = 1;
                         continue;
                     }
-                    sourceValue = BASE_NULL1;
-                } else if(sourceValue.valueForSet == BASE_NULL1.valueForSet || sourceValue.valueForSet == BASE_NULL2.valueForSet) {
-                    // Already set, nothing to do
+                    endOfBlock = true;
+                } else if(source.valueForSet == BASE_NULL2.valueForSet) {
+                    endOfBlock = true;
+                }
+                else if(source.valueForSet == BASE_NULL.valueForSet) {
+                    if(InterlockedCompareExchange64(
+                        (LONG64*)pSource,
+                        BASE_NULL1.valueForSet,
+                        source.valueForSet
+                    ) != source.valueForSet) {
+                        retries++;
+                        lastRetryId = 2;
+                        continue;
+                    }
                 }
                 else {
-                    if(!sourceValue.isNull) {
-                        InsideReference* sourceRef = Reference_Acquire(pSource);
-                        // If it does acquire a value, it must been the source isn't null, so we can use whatever value, even if it doesn't
-                        //  equal sourceValue, because we wipe out sourceValue anyway...
-                        if(!sourceRef) {
-                            continue;
-                        }
+                    
 
-                        OutsideReference setSourceValue = { 0 };
-                        setSourceValue.isNull = 1;
-                        setSourceValue.pointerClipped = (uint64_t)sourceRef;
-
-                        // This... freezes pSource, no one will ever change it after this. AND, it reduces the outside ref count to 0
-                        //  first, so we don't break any outstanding references. HOWEVER! It doesn't break the pointer, and it doesn't
-                        //  technically destroy the outside reference (as in, the outside reference's reference to the inner reference
-                        //  is kept alive). So... it means even if this thread fails, the next thread can pick up after it, trivially.
-                        
-                        if(!Reference_ReplaceOutsideStealOutside(
-                            pSource,
-                            sourceRef,
-                            setSourceValue
-                        )) {
-                            Reference_Release(pSource, sourceRef);
-                            continue;
-                        }
-                        // Replace will move outside references to the inside, so we free from the empty reference.
-                        Reference_Release(&emptyReference, sourceRef);
-
-                        sourceValue = setSourceValue;
-                    } // else, it is a null we set it to, so we can just pick up where we left off
-                    sourceValue.isNull = 0;
-                }
-
-                // So at this point the source value is immutable. No user will replace an isNull value
-                //  (except for BASE_NULL1, but setting isNull on a valid value will never create that, as that value
-                //  would have to have a pointer value of 1, which I am assuming can't happen...)
-                // So... that is very very nice
-
-                MoveStateInner prevMoveState;
-                prevMoveState.nextSourceSlot = nextSourceSlot;
-                prevMoveState.sourceValue.valueForSet = 0;
-                prevMoveState.sourceBlockStart = pMoveState->sourceBlockStart;
-
-                MoveStateInner newMoveState;
-                newMoveState.nextSourceSlot = nextSourceSlot;
-                newMoveState.sourceValue = sourceValue;
-                newMoveState.sourceBlockStart = prevMoveState.sourceBlockStart;
-                
-                if(!InterlockedCompareExchangeStruct128(pMoveState, &prevMoveState, &newMoveState)) {
-                    continue;
-                }
-                
-                if(sourceValue.pointerClipped > 10) {
-                    printf("Populated value from source index %llu\n", nextSourceSlot % curAlloc->slotsCount);
-                } else {
-                    printf("Populated empty value from source index %llu\n", nextSourceSlot % curAlloc->slotsCount);
+                    // Freeze it, BEFORE we redirect it.
+                    InsideReference* sourceRef = Reference_Acquire(pSource);
+                    if(!sourceRef) {
+                        retries++;
+                        lastRetryId = 3;
+                        continue;
+                    }
+                    if(!Reference_ReduceToZeroRefsAndSetIsNull(
+                        pSource,
+                        sourceRef
+                    )) {
+						byte testCopy[InsideReferenceSize] = { 0 };
+						memcpy(testCopy, sourceRef, InsideReferenceSize);
+                        InsideReference* pTestCopy = (void*)testCopy;
+                        IsInsideRefCorrupt(sourceRef);
+                        Reference_Release(pSource, sourceRef);
+                        retries++;
+                        lastRetryId = 4;
+                        continue;
+                    }
+                    IsInsideRefCorrupt(sourceRef);
+                    Reference_Release(&emptyReference, sourceRef);
                 }
             }
         }
 
-        #ifdef DEBUG
-        if(IsSingleThreadedTest) {
-            if(pMoveState->sourceValue.valueForSet == 0) {
-                // Can never be 0, otherwise we can't tell if we read a null from source, or didn't read anything yet.
-                OnError(3);
-            }
-        }
-        #endif
+        bool alreadyInserted = false;
 
-        // Get a value, and source index (atomically) so when we are done we can advance the source index
-        InsideReference* valueRef;
-        uint32_t sourceIndex;
-        uint32_t sourceBlockStart;
-        bool isBlockEnd = false;
+        // Redirect it
+        InsideReference* redirectedValue = nullptr;
         {
-            MoveStateInner moveState = *pMoveState;
-            if(!EqualsStruct128(&moveState, pMoveState)) {
-                continue;
-            }
-            if(moveState.sourceValue.valueForSet == 0) {
-                continue;
-            }
-            valueRef = Reference_Acquire(&pMoveState->sourceValue);
-            if(!FAST_CHECK_POINTER(moveState.sourceValue, valueRef)) {
-                Reference_Release(&pMoveState->sourceValue, valueRef);
-                continue;
-            }
-            if(moveState.sourceValue.valueForSet == 0) {
-                continue;
-            }
-            sourceIndex = moveState.nextSourceSlot;
-            sourceBlockStart = moveState.sourceBlockStart;
-            if(moveState.sourceValue.valueForSet == BASE_NULL2.valueForSet) {
-                isBlockEnd = true;
-            }
-        }
-
-        // Now make sure valueRef is in the newAlloc pool (so redirected)
-        if(valueRef && !MemPoolHashed_IsInPool(newAlloc->valuePool, valueRef)) {
-            HashValue* value = Reference_GetValue(valueRef);
-            OutsideReference newValueRef = { 0 };
-            HashValue* newValue = nullptr;
-            Reference_Allocate((MemPool*)newAlloc->valuePool, &newValueRef, &newValue, this->HASH_VALUE_SIZE, value->hash);
-            if(!newValue) {
-                Reference_Release(&pMoveState->sourceValue, valueRef);
-                return 3;
-            }
-
-            newValue->hash = value->hash;
-            memcpy(
-                (byte*)newValue + sizeof(HashValue),
-                (byte*)value + sizeof(HashValue),
-                VALUE_SIZE
-            );
-
-            InsideReference* newValueRefInside = Reference_Acquire(&newValueRef);
-            Reference_RedirectReference(
-                valueRef,
-                newValueRefInside
-            );
-
-            Reference_DestroyOutside(&newValueRef, newValueRefInside);
-            Reference_Release(&emptyReference, newValueRefInside);
-
-
-            // Release and reacquire it to make sure we get the most up to date value
-            Reference_Release(&pMoveState->sourceValue, valueRef);
-            valueRef = Reference_Acquire(&pMoveState->sourceValue);
-            if(!MemPoolHashed_IsInPool(newAlloc->valuePool, valueRef)) {
-                Reference_Release(&pMoveState->sourceValue, valueRef);
-                continue;
-            }
-        }
-
-        #ifdef DEBUG
-        if(IsSingleThreadedTest) {
-            if(pMoveState->sourceValue.valueForSet == 0) {
-                // Can never be 0, otherwise we can't tell if we read a null from source, or didn't read anything yet.
-                OnError(3);
-            }
-        }
-        #endif
-
-        // Now make sure valueRef has been put in the destination
-        //  (this is slightly dangerous, but because of our delete calls us an because it sees one entry after the value it deletes,
-        //  this should only put a value in the destination multiple times in the case of a delete, and then only once per delete thread,
-        //  and only before the delete call exits).
-        if(valueRef) {
-            HashValue* value = Reference_GetValue(valueRef);
-            uint64_t sourceBaseIndex = getSlotBaseIndex(curAlloc, value->hash);
-
-            // TODO: We really can't reuse BASE_NULL spots when moving, as this would create a hanging insert, but not in the original
-            //  insert function, which allow values to spontaneously reappear. This means that if deletes happen when moving we
-            //  could keep half moving, having the value deleted, and then inserting to another place, until we use up the whole
-            //  table. However... this should be unlikely, as each delete should see a move is happening, and then start helping,
-            //  which means this should only be possible if there are a lot of threads (equal to the number of free slots?).
-            
-            bool alreadyInserted = false;
-			uint64_t baseDestIndex = getSlotBaseIndex(newAlloc, value->hash);
-            uint64_t curDestIndex = baseDestIndex;
-            uint64_t loops = 0;
-            while(true) {
-                OutsideReference value = newAlloc->slots[curDestIndex].value;
-                if(FAST_CHECK_POINTER(value, valueRef)) {
-                    printf("double insert proof, value is already at %llu\n", curDestIndex);
-                    alreadyInserted = true;
-                    break;
-                }
-                if(value.valueForSet == 0) {
-                    //todonext;
-                    // Yeah... how would this work? If we fill every dest slot except 1, and then find that the corresponding source slot
-                    //  to that has 2 values... Well, that clearly wouldn't work...
-                    // But, the whole thing we are doing is to only insert into BASE_NULL_MAX slots, AND, we are also trying to clean up BASE_NULL_MAX
-                    //  slots while moving, for two reasons
-                    //  1) To prevent iterating over all the values when we finish
-                    //  2) To allow adding 0s before we finish moving everything
-                    //      - But maybe... maybe just letting BASE_NULL_MAX not count as moved, and let access algorithms treat it as 0... maybe that would work?
-                    //  Hmm... is there any way to recover shrinking to not force a full iteration to replace all BASE_NULL_MAX values when we finish? But also
-                    //      to not run out of spaces?
-
-                    // So... when we insert, we don't know if a block before us will start to spill into us...
-                    //  Hmm... it would take... a lot of searching to make sure.
-
-                    // BUT, we do need to do something so when searching we can know the dest block is ended...
-
-                    //  Hmm... maybe, when we would end the block, we see if we can set a special null at the end of the dest block. We might not
-                    //      be able to, if we shrunk and increased in relative size, but we should be able to usually (and if we can't we can
-                    //      just apply more moves, and it will be fine), which access functions can use to 
-
-                    // Oh... 
-
-                    printf("double insert proof, dest %llu is 0, base %llu\n", curDestIndex, baseDestIndex);
-                    // This means that a thread finished the move, and is currently going through the block changing BASE_NULL_MAX to 0.
-                    alreadyInserted = true;
-                    break;
-                }
-                
-                if(value.valueForSet == BASE_NULL_MAX.valueForSet) {
-                    break;
-                }
-                // value.valueForSet == 0 means we moved to here previous, but that value got deleted, we can't reuse the slot...
-                curDestIndex = (curDestIndex + 1) % newAlloc->slotsCount;
-                if(curDestIndex == baseDestIndex) {
-                    printf("double insert proof, looped around\n");
-                    // The entire move must have finished already, which is why we can't find any free place to put it.
-                    alreadyInserted = true;
-                    break;
-                }
-            }
-            if(alreadyInserted) {
-                // But... just because it has been inserted, doesn't mean the insert finished, so still try to finish
-                //  the insert by changing moveState.
-                printf("Ignoring double insert %llu to %llu for %llu\n", sourceIndex % curAlloc->slotsCount, curDestIndex, value->hash);
+            InsideReference* sourceRef = Reference_AcquireIfNull(pSource);
+            if(!sourceRef) {
+                alreadyInserted = true;
             } else {
-                OutsideReference destOutsideRef = { 0 };
-                Reference_SetOutside(&destOutsideRef, valueRef);
-                
-
                 //todonext
-                // Hmm... there is racing to move different values to the same slot. This should be impossible, we test pMoveState before we decide
-                //  upon the curDestIndex...
+                // Maybe... instead of this weird stuff, just call a function to explicitly follow redirections. Which we will call before
+                //  and after we redirect.
 
-                printf("Thinking of moving %llu to %llu for %llu\n", sourceIndex % curAlloc->slotsCount, curDestIndex, value->hash);
-
-                InterlockedIncrement64((LONG64*)&newAlloc->slotsReserved);
-                InterlockedIncrement64((LONG64*)&newAlloc->slotsReservedWithNulls);
-                if(InterlockedCompareExchange64(
-                    (LONG64*)&newAlloc->slots[curDestIndex].value,
-                    destOutsideRef.valueForSet,
-                    BASE_NULL_MAX.valueForSet
-                ) != BASE_NULL_MAX.valueForSet) {
-                    InterlockedDecrement64((LONG64*)&newAlloc->slotsReserved);
-                    InterlockedDecrement64((LONG64*)&newAlloc->slotsReservedWithNulls);
-                    DestroyUniqueOutsideRef(&destOutsideRef);
-                    continue;
-                }
-                printf("Moved %llu to %llu for %llu\n", sourceIndex % curAlloc->slotsCount, curDestIndex, value->hash);
-            }
-		} else {
-            printf("Nothing to move from %llu\n", sourceIndex % curAlloc->slotsCount);
-        }
-
-        // The destination has definitely been populated here
-
-        // Wipe out any BASE_NULL_MAXs with 0 in our block, and set nextSourceBlockStart
-        uint32_t nextSourceBlockStart = sourceBlockStart;
-        if(isBlockEnd) {
-            // If shrinking it is impossible to identify dest slots as being accounted for, as shrinking could cause massive cascading overlap.
-            //  Therefore, when shrinking, we have to leave nulls around as space to handle cascading overlap.
-            //  However when growing or staying the same size we don't need to, so we replace nulls early, that way we don't
-            //      need a final iteration to get rid of the remaining nulls...
-            /*
-            if(!(curAlloc->slotsCount < newAlloc->slotsCount)) {
-                atomicHashTable2_replaceNullsInBlock(sourceBlockStart, sourceIndex, curAlloc, newAlloc);
-            }
-            */
-
-            nextSourceBlockStart = UINT32_MAX;
-        } else {
-            if(nextSourceBlockStart == UINT32_MAX) {
-                nextSourceBlockStart = sourceIndex % curAlloc->slotsCount;
-            }
-        }
-
-        // Check if this is the last move
-        {
-            OutsideReference nextSourceValue = curAlloc->slots[(sourceIndex + 1) % curAlloc->slotsCount].value;
-            if(IS_VALUE_MOVED(nextSourceValue)) {
-                Reference_Release(&pMoveState->sourceValue, valueRef);
-
-                MoveStateInner prevMoveState = *pMoveState;
-                if(!EqualsStruct128(pMoveState, &prevMoveState)) {
-                    continue;
-                }
-                // If we aren't the current move this just means we are behind (but if we are the current move, this means we wrapped around)
-				if(pMoveState->nextSourceSlot != sourceIndex) {
-                    continue;
-                }
-                if(prevMoveState.sourceValue.valueForSet == 0) {
-                    // Impossible, sourceValue MUST be left non-0 when we finish moving
-                    OnError(9);
-                }
-
-
-                printf("finished move\n");
-                if(!prevMoveState.sourceValue.isNull) {
-                    MoveStateInner newMoveState = prevMoveState;
-                    newMoveState.sourceValue = BASE_NULL;
-                    if(InterlockedCompareExchangeStruct128(pMoveState, &prevMoveState, &newMoveState)) {
-                        DestroyUniqueOutsideRef(&prevMoveState.sourceValue);
+                if(MemPoolHashed_IsInPool(curAlloc->valuePool, sourceRef)) {
+                    HashValue* value = Reference_GetValue(sourceRef);
+                    OutsideReference newValueRef = { 0 };
+                    HashValue* newValue = nullptr;
+                    Reference_Allocate((MemPool*)newAlloc->valuePool, &newValueRef, &newValue, this->HASH_VALUE_SIZE, value->hash);
+                    if(!newValue) {
+                        IsInsideRefCorrupt(sourceRef);
+                        Reference_Release(&emptyReference, sourceRef);
+                        // We might just have completely finished the move, and have had the newAlloc already been destructed!
+                        if(newAlloc->valuePool->countForSet.destructed) {
+                            return 1;
+                        }
+                        return 3;
                     }
-                }
 
+                    newValue->hash = value->hash;
+                    memcpy(
+                        (byte*)newValue + sizeof(HashValue),
+                        (byte*)value + sizeof(HashValue),
+                        VALUE_SIZE
+                    );
 
-                /*
-                if(!(curAlloc->slotsCount < newAlloc->slotsCount)) {
-                    // End the current block, because no one else will...
-                    atomicHashTable2_replaceNullsInBlock(sourceBlockStart, sourceIndex, curAlloc, newAlloc);
+                    InsideReference* newValueRefInside = Reference_Acquire(&newValueRef);
+                    IsInsideRefCorrupt(newValueRefInside);
+                    IsInsideRefCorrupt(sourceRef);
+                    Reference_RedirectReference(
+                        sourceRef,
+                        newValueRefInside);
+                    Reference_DestroyOutside(&newValueRef, newValueRefInside);
+                    Reference_Release(&emptyReference, newValueRefInside);
                 } else {
-                    atomicHashTable2_replaceNullsInBlock(0, curAlloc->slotsCount - 1, curAlloc, newAlloc);
+                    printf("not in pool\n");
                 }
-                */
 
-                //todonext
-                // Wait... if we don't replace nulls while iterating, won't that leave us open to hanging inserts? Ugh... maybe we need to
-                //  just map nulls to new values, so if we wrap around we can still reuse them. Ugh... Okay, so... we could use nulls to store a value,
-                //  and then... when inserting only insert if that value is < the current value?
-                //  - Okay, so... values could be related to the sourceBlockStart?
-                // BUT WAIT! We can't have there isNulls overlap with real pointers, or else a hanging cleanup can break the final move.
-                todonext
-                // Okay well... a hanging insert has to start with a search...
-                // Uh... the place that does the insert, will have to...
-                // So, a hanging insert will have to iterate over values...
+                redirectedValue = Reference_FollowRedirects(sourceRef);
+                IsInsideRefCorrupt(redirectedValue);
+            }
+        }
 
-                // Oh, maybe when inserting we need to set another bit (in addition to isNull), to say the values are still moving? Fuck...
-                //  we might need more state, and then proper transactions here...
+        // Rule for finding where to put it:
+        // Either it is in newAlloc, sourceIndex has been updated, or it hasn't been inserted every yet?
+        //  - Because once we insert it, to remove it applyMove has to be run, which updates sourceIndex
+        // This means, that once we find a destIndex, if we try to insert it and find the dest slot is already being used,
+        //  and not by our value, if we find sourceIndex is the same, we can atomically rollback destIndex.
 
-                todonext
-                // Okay... we can reserve a small amount of nulls to be used... fuck, idk, to prepare items? And then hanging threads
-                //  leak those, but only so many threads can hang at once, so it is fine...
+        // Find a destination for the source, reserving it (now that the source is frozen, the hash won't change)
+        if(!alreadyInserted && moveState.destIndex == UINT32_MAX) {
+            HashValue* value = Reference_GetValue(redirectedValue);
 
-                fuck
-                // Okay, well... maybe we don't do moving by parts, maybe we just move everything, every time, except for finds,
-                //  which never do moving.
+            uint64_t baseIndex = getSlotBaseIndex(newAlloc, value->hash);
+            uint64_t index = baseIndex;
+            bool forceRetry = false;
+            while(true) {
+                OutsideReference* pDest = &newAlloc->slots[index].value;
+                OutsideReference dest = *pDest;
+                if(FAST_CHECK_POINTER(dest, redirectedValue)) {
+                    Reference_Release(&emptyReference, redirectedValue);
+                    moveState.destIndex = (uint32_t)index;
+                    alreadyInserted = true;
+                    break;
+                }
+                if(dest.valueForSet == BASE_NULL_MAX.valueForSet) {
+                    MoveStateInner newMoveState = moveState;
+                    newMoveState.destIndex = (uint32_t)index;
+                    if(InterlockedCompareExchange64(
+                        (LONG64*)pMoveState,
+                        newMoveState.valueForSet,
+                        moveState.valueForSet
+                    ) != moveState.valueForSet) {
+						forceRetry = true;
+                        lastRetryId = 11;
+						break;
+                    }
+                    moveState = newMoveState;
+                    break;
+                }
+                index = (index + 1) % newAlloc->slotsCount;
+                if(index == baseIndex) {
+                    forceRetry = true;
+                    lastRetryId = 5;
+                    // We ran out of space while moving. This must be because everything has already finished moving, right?
+                    
+                    MoveStateInner moveState = *pMoveState;
+                    if(moveState.sourceIndex < curAlloc->slotsCount) {
+                        Reference_Release(&emptyReference, redirectedValue);
+                        // Ran out of space... the BASE_NULL_MAXes do get used up by new inserts, but those should help us
+                        //  most, and so we shouldn't be running our of BASE_NULL_MAXes to insert into...
 
+                        OnError(9);
+                        return 9;
+                    }
+                    break;
+                }
+            }
+            if(forceRetry) {
+                Reference_Release(&emptyReference, redirectedValue);
+                retries++;
+                continue;
+            }
+        }
 
-                //todonext
-                // Wait... we can totally break this iteration up into groups. So... we should do that...
-                atomicHashTable2_replaceNullsInBlock(0, curAlloc->slotsCount - 1, curAlloc, newAlloc);
+        // alreadyInserted is set for non-pointer values, so if a hanging piece of code runs, then it will either try to get a destIndex,
+        //  and fail because sourceIndex has been updated, OR try to use the destIndex, but skip this because it saw the final null, and then
+        //  try to update the sourceIndex (and fail).
+        //  - (Or, of course, see the inserted value into dest, and use that)
+        if(!alreadyInserted) {
+            // Now moveState.destIndex will have a value
+            OutsideReference* pDest = &newAlloc->slots[moveState.destIndex].value;
 
+            OutsideReference newDest = Reference_CreateOutsideReference(redirectedValue);
 
-                /*
-                #ifdef DEBUG
-				for (uint64_t i = 0; i < curAlloc->slotsCount; i++) {
-					OutsideReference value = curAlloc->slots[i].value;
-					if (!IS_VALUE_MOVED(value)) {
-						// We shouldn't finish the move until everything has been moved...
-						breakpoint();
-					}
-				}
-                // We shouldn't have any BASE_NULL_MAXs, as they should be removed during moves (and if they aren't, it will mean that
-                //	calls us might cause an operation to have to keep looping until all moves are done, which shouldn't be required,
-                //	as that means the best worse cast scenario for operations is O(N))
-                for(uint64_t i = 0; i < newAlloc->slotsCount; i++) {
-                    OutsideReference value = newAlloc->slots[i].value;
-                    if(value.valueForSet == BASE_NULL_MAX.valueForSet) {
+            InterlockedIncrement64(&newAlloc->slotsReserved);
+            InterlockedIncrement64(&newAlloc->slotsReservedWithNulls);
+            if(InterlockedCompareExchange64(
+                (LONG64*)pDest,
+                newDest.valueForSet,
+                BASE_NULL_MAX.valueForSet
+            ) != BASE_NULL_MAX.valueForSet) {
+                InterlockedDecrement64(&newAlloc->slotsReserved);
+                InterlockedDecrement64(&newAlloc->slotsReservedWithNulls);
+
+                Reference_DestroyOutside(&newDest, redirectedValue);
+                IsInsideRefCorrupt(redirectedValue);
+
+                // Rollback destIndex, and try again to find a new one (if this hangs, it is fine. Worst case we rollback
+                //  when destIndex has already been set and inserted... which is fine, because the next loop will see that
+                //  it has been inserted (and it can't get deleted, as before deletions happen in newAlloc atomicHashTable2_applyMoveTableOperationInner
+                //  has to be called, which will run this code again, making the move finalize first).
+                // AND operations only access newAlloc WHEN they see a move is inside (or after) the block they want to in curAlloc, which
+                //  means either they access curAlloc completely, or they make sure the entire block they want to access in curAlloc (that
+                //  we might be moving), is moved... which means, anything we might be moving will be fully moved before a delete deletes it...
+
+                OutsideReference newDest = *pDest;
+                if(!FAST_CHECK_POINTER(newDest, redirectedValue)) {
+                    MoveStateInner curMoveState = *pMoveState;
+                    if(curMoveState.sourceIndex == moveState.sourceIndex) {
+                        // So actually... doesn't that mean in this case destIndex can't be deleted out, and actually it must have been inserted?
+                        //  So this should be impossible...
+                        // Also, shouldn't it be impossible to insert here without running move too? Cause that is the other case this could happen, if
+                        //  an insert happens to that slot before we can do our insert...
                         breakpoint();
+                        MoveStateInner newMoveState = moveState;
+                        newMoveState.destIndex = UINT32_MAX;
+                        InterlockedCompareExchange64(
+                            (LONG64*)pMoveState,
+                            newMoveState.valueForSet,
+                            moveState.valueForSet
+                        );
                     }
                 }
-                #endif
-                */
 
-                // Hmm... this really puts a lot on Reference_RedirectReference, but... it should be fine... as long as the caller
-                //  makes sure newAlloc is inside of curAlloc, then curAlloc can only redirect once,
-                //  AND this actually makes it so this->currentAllocation gets automatically updated when Reference_Acquire is called.
-                
-                InsideReference* newAllocRef = (void*)((byte*)newAlloc - InsideReferenceSize);
+                Reference_Release(&emptyReference, redirectedValue);
 
-                newAlloc->finishedMovingInto = true;
+                retries++;
+                lastRetryId = 6;
+                continue;
+            } else {
+                setDest = true;
+            }
+            IsInsideRefCorrupt(redirectedValue);
+            Reference_Release(pDest, redirectedValue);
+        }
 
-                MemPoolHashed_Destruct(curAlloc->valuePool);
+        MoveStateInner newMoveState = moveState;
+        newMoveState.sourceIndex++;
+        newMoveState.destIndex = UINT32_MAX;
+        if(InterlockedCompareExchange64(
+            (LONG64*)pMoveState,
+            newMoveState.valueForSet,
+            moveState.valueForSet
+        ) == moveState.valueForSet) {
+            if(moveState.destIndex != UINT32_MAX) {
+                OutsideReference* pDest = &newAlloc->slots[moveState.destIndex].value;
+                InsideReference* destRef = Reference_Acquire(pDest);
+                if(destRef) {
+                    IsInsideRefCorrupt(destRef);
+                    Reference_Release(pDest, destRef);
+                }
+            }
+            //todonext
+            // So... a thread hung at or in Reference_DestroyThroughNull, the other thread continued, and then when the original thread
+            //  got around to finishing this, it destroyed the source value, but then when freeing the nextRedirectValue it found
+            //  the redirected (the value at moveState.destIndex), was now corrupt, with a leaked outside reference... So...
+            //  it looks like one of the retries is leaving us in a bad state...
+            Reference_DestroyThroughNull(pSource, BASE_NULL1);
+            countApplied++;
+            //todonext
+            // Okay, with two threads, both moving, I had one thread with a lower sourceIndex find a bad value,
+            //  and the higher thread is at a higher index, doing fine. So... I think the higher thread broke that value,
+            //  in the move (although...). So... check pDest again here?
+            if(moveState.destIndex != UINT32_MAX) {
+                OutsideReference* pDest = &newAlloc->slots[moveState.destIndex].value;
+                InsideReference* destRef = Reference_Acquire(pDest);
+                if(destRef) {
+                    IsInsideRefCorrupt(destRef);
+                    Reference_Release(pDest, destRef);
+                }
+            }
 
-                Reference_RedirectReference((void*)((byte*)curAlloc - InsideReferenceSize), newAllocRef);
-                Reference_DestroyOutsideMakeNull(&curAlloc->newAllocation, newAllocRef);
-
+            if(endOfBlock && countApplied > minApplyCount) {
+                // Not only is it the endOfBlock, but... because we replace it with BASE_NULL1, the original block in curAlloc will never
+                //  grow, so we will never move anything from this block to newAlloc again.
                 return 0;
             }
         }
-
-        // Update nextSourceSlot and destOffset
-        {
-            while(true) {
-                if(valueRef) {
-                    // Must make the outside ref have 0 references, or else we will leave outside references in limbo when we swap,
-                    //  possibly resulting in a premature free.
-                    if (!Reference_ReduceToZeroOutsideRefs(&pMoveState->sourceValue)) {
-                        break;
-                    }
-                }
-                MoveStateInner prevMoveState = *pMoveState;
-                if(!EqualsStruct128(pMoveState, &prevMoveState)) {
-                    continue;
-                }
-                if(prevMoveState.sourceValue.count != 0) {
-                    break;
-                }
-                if(prevMoveState.nextSourceSlot != sourceIndex) {
-                    break;
-                }
-                if(prevMoveState.sourceBlockStart != sourceBlockStart) {
-                    break;
-                }
-                if(!FAST_CHECK_POINTER(prevMoveState.sourceValue, valueRef)) {
-                    break;
-                }
-
-                MoveStateInner newMoveState;
-                newMoveState.nextSourceSlot = sourceIndex + 1;
-                newMoveState.sourceBlockStart = nextSourceBlockStart;
-                newMoveState.sourceValue.valueForSet = 0;
-
-                if(InterlockedCompareExchangeStruct128(
-                    pMoveState,
-                    &prevMoveState,
-                    &newMoveState
-                )) {
-                    countApplied++;
-                    if(valueRef) {
-                        DestroyUniqueOutsideRef(&prevMoveState.sourceValue);
-                    }
-                }
-                break;
-            }
-            if(valueRef) {
-                Reference_Release(&pMoveState->sourceValue, valueRef);
-            }
-        }
-
-        // !valueRef means we finished a block, which is important
-        if(countApplied >= minApplyCount && !valueRef) {
-            // Done...
-            return 0;
-        }
     }
+
+	// Unreachable
+	OnError(9);
+	return 9;
 }
 
 
@@ -788,10 +674,8 @@ int atomicHashTable2_removeInner2(
     uint64_t hash,
 	void* callbackContext,
 	bool(*callback)(void* callbackContext, void* value),
-    AtomicHashTableBase* table,
-    uint64_t* pIndex
+    AtomicHashTableBase* table
 ) {
-    //uint64_t index = *pIndex;
     uint64_t index = getSlotBaseIndex(table, hash);
     uint64_t loopCount = 0;
     while(true) {
@@ -802,7 +686,6 @@ int atomicHashTable2_removeInner2(
         OutsideReference valueRef = *pValue;
 
         if(IS_VALUE_MOVED(valueRef)) {
-            *pIndex = index;
             return 1;
         }
 		if (IS_BLOCK_END(valueRef)) {
@@ -825,11 +708,11 @@ int atomicHashTable2_removeInner2(
                     }
                     else {
                         atomicHashTable2_updateReserved(this, table, &table->newAllocation, -1, 0);
-                        printf("Removed %llu for %llu\n", index, hash);
+                        //printf("Removed %llu for %llu\n", index, hash);
                     }
                 }
-                Reference_Release(pValue, ref);
             }
+            Reference_Release(pValue, ref);
         }
 
         index = (index + 1) % table->slotsCount;
@@ -856,8 +739,7 @@ int atomicHashTable2_removeInner(
     AtomicHashTableBase* table,
     AtomicHashTableBase* newTable
 ) {
-    uint64_t index = getSlotBaseIndex(table, hash);
-    int result = atomicHashTable2_removeInner2(this, hash, callbackContext, callback, table, &index);
+    int result = atomicHashTable2_removeInner2(this, hash, callbackContext, callback, table);
     if(result > 1) {
         return result;
     }
@@ -870,20 +752,10 @@ int atomicHashTable2_removeInner(
     if(newTable) {
         int moveResult = atomicHashTable2_applyMoveTableOperationInner(this, table, newTable);
         if(moveResult > 1) {
-            if(result == 0) {
-                // Unfortunately, we have to swallow the error here, as the operation succeeded, so we are forced to return 0
-                return 0;
-            }
             return moveResult;
         }
         if(result == 1) {
-            if(newTable->slotsCount > table->slotsCount) {
-                index = index * 2;
-            } else if(newTable->slotsCount < table->slotsCount) {
-                // Hmm... I am assuming rounding will be fine here...
-                index = index / 2;
-            }
-            return atomicHashTable2_removeInner2(this, hash, callbackContext, callback, newTable, &index);
+            return atomicHashTable2_removeInner2(this, hash, callbackContext, callback, newTable);
         }
     }
     return result;
@@ -945,13 +817,11 @@ int atomicHashTable2_findInner4(
     FindResult* valuesFound,
     uint64_t* pValuesFoundCur,
     uint64_t* pValuesFoundLimit,
-    uint64_t* pIndex,
-    uint64_t baseIndex,
-    uint64_t hash
+    uint64_t hash,
+    bool breakOnMove
 ) {
-    //uint64_t index = *pIndex;
     uint64_t index = getSlotBaseIndex(table, hash);
-    uint64_t startIndex = index;
+    uint64_t baseIndex = index;
     uint64_t loopCount = 0;
     while(true) {
         #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
@@ -959,50 +829,58 @@ int atomicHashTable2_findInner4(
         #endif
         OutsideReference* pValue = &table->slots[index].value;
         OutsideReference value = *pValue;
-        if(IS_VALUE_MOVED(value)) {
-            printf("moved retry\n");
-            *pIndex = index;
-            return 1;
-        }
 
         if(IS_BLOCK_END(value)) {
-            printf("Finished found %llu proof from %llu to %llu of %llu\n", *pValuesFoundCur, startIndex, index, hash);
-            *pIndex = index;
+            //printf("Finished found %llu proof from %llu to %llu of %llu\n", *pValuesFoundCur, baseIndex, index, hash);
             return 0;
         }
         if(value.valueForSet != BASE_NULL.valueForSet) {
-            InsideReference* valueRef = Reference_Acquire(pValue);
-            if (!valueRef) {
-                // Might be because of move, but is more likely just because the value was set to the tombstone value
-                //  (BASE_NULL), so we just just try rereading it
-                continue;
-            }
-            HashValue* value = Reference_GetValue(valueRef);
-            if (value->hash != hash) {
-                Reference_Release(pValue, valueRef);
-            }
-            else {
-                FindResult result;
-                result.refSource = pValue;
-                result.ref = valueRef;
-                result.value = value;
+			if (IS_VALUE_MOVED(value)) {
+				if (breakOnMove) {
+					return 1;
+				}
+			}
+			else {
+				InsideReference* valueRef = Reference_Acquire(pValue);
+				#ifdef DEBUG
+				if (IsSingleThreadedTest) {
+					if (Reference_HasBeenRedirected(valueRef)) {
+						breakpoint();
+					}
+				}
+				#endif
+				if (!valueRef) {
+					// Might be because of move, but is more likely just because the value was set to the tombstone value
+					//  (BASE_NULL), so we just just try rereading it
+					continue;
+				}
+				HashValue* hashValue = Reference_GetValue(valueRef);
+				if (hashValue->hash != hash) {
+					Reference_Release(pValue, valueRef);
+				}
+				else {
+					FindResult result;
+					result.refSource = pValue;
+					result.ref = valueRef;
+					result.value = hashValue;
 
-                uint64_t valuesFoundCur = *pValuesFoundCur;
-                uint64_t valuesFoundLimit = *pValuesFoundLimit;
-                valuesFoundCur++;
-                if (valuesFoundCur > valuesFoundLimit) {
-                    Reference_Release(pValue, valueRef);
-                    // Eh... *10, because we don't know how many entries there might be. We could loop and count how many values
-                    //  there might be, and allocate less... but I don't think we need to optimize the case of many results right now...
-                    *pValuesFoundLimit = valuesFoundLimit * 10 + 1;
-                    printf("found count retry\n");
-                    return -1;
-                }
+					uint64_t valuesFoundCur = *pValuesFoundCur;
+					uint64_t valuesFoundLimit = *pValuesFoundLimit;
+					valuesFoundCur++;
+					if (valuesFoundCur > valuesFoundLimit) {
+						Reference_Release(pValue, valueRef);
+						// Eh... *10, because we don't know how many entries there might be. We could loop and count how many values
+						//  there might be, and allocate less... but I don't think we need to optimize the case of many results right now...
+						*pValuesFoundLimit = valuesFoundLimit * 10 + 1;
+						//printf("found count retry\n");
+						return -1;
+					}
 
-                printf("found at %llu for %llu\n", index, hash);
-                *pValuesFoundCur = valuesFoundCur;
-                valuesFound[valuesFoundCur - 1] = result;
-            }
+					//printf("found at %llu for %llu\n", index, hash);
+					*pValuesFoundCur = valuesFoundCur;
+					valuesFound[valuesFoundCur - 1] = result;
+				}
+			}
         }
         
         index = (index + 1) % table->slotsCount;
@@ -1013,11 +891,12 @@ int atomicHashTable2_findInner4(
                 breakpoint();
             }
             #endif
-            printf("full loop retry\n");
+            //printf("full loop retry\n");
             return -1;
         }
     }
 }
+bool stop = false;
 int atomicHashTable2_findInner3(
     AtomicHashTable2* this,
     uint64_t hash,
@@ -1029,42 +908,67 @@ int atomicHashTable2_findInner3(
     AtomicHashTableBase* table,
     AtomicHashTableBase* newTable
 ) {
-    // See atomicHashTable2_removeInner, although this is also modified, as finds need to save results across both
-    //  the table and newTable searches
+    //todonext
+    // If we make all accessors like this, then we can change atomicHashTable2_applyMoveTableOperationInner to not need to complete blocks!
+    if(newTable) {
+        //todonext
+        // No it isn't fine.
+        // Move first... because encountering moved values is fine for find (because it doesn't need to worry about making a block fully moved
+        //  before we delete or insert values).
 
-    uint64_t baseIndex = getSlotBaseIndex(table, hash);
-    uint64_t index = baseIndex;
-    int result = atomicHashTable2_findInner4(this, table, valuesFound, pValuesFoundCur, pValuesFoundLimit, &index, baseIndex, hash);
+        //todonext
+        // What if we see a move, but it just moved 1 entry. The find loop will break, and the find loop in the newTable will only
+        //  look at one entry...
+        // However, we could... change the find loop to not break upon seeing a move?
+        int moveResult = atomicHashTable2_applyMoveTableOperationInner(this, table, newTable);
+        if(moveResult > 0) {
+            return moveResult;
+        }
+    }
+	#ifdef DEBUG
+	if (IsSingleThreadedTest) {
+		if (!stop) {
+			if (table->slotsReservedWithNulls * 12 / 10 > table->slotsCount) {
+				breakpoint();
+			}
+		}
+	}
+	#endif
+
+
+    //todonext
+    // Change !newTable to false, and make sure tests fail. Because they have to, because it can't be false
+    
+
+    //todonext
+    // false should be !newTable. But... shouldn't our tests fail because of this?
+    int result = atomicHashTable2_findInner4(this, table, valuesFound, pValuesFoundCur, pValuesFoundLimit, hash, !newTable);
     if(result > 1) {
         return result;
     }
-    todonext
-    // Okay, so... if we search table, then search newTable, and then find the values we found in table
-    //  are still there, then the find is good. Otherwise, we don't know if the values we found in table
-    //  have been moved to newTable, causing us to read the same value twice.
-    todonext
-    // Or... maybe using redirects... we can just see that the values have been redirected?
-    //  Although... redirect happens before we move, so just because something has been redirected doesn't mean
-    //  it is in the dest... so maybe redirects won't be useful after all..
+
     if(newTable) {
-        int moveResult = atomicHashTable2_applyMoveTableOperationInner(this, table, newTable);
-        if(moveResult > 1) {
-            if(result == 0) return 0;
-            return moveResult;
-        }
-        if(result == 1) {
-            if(newTable->slotsCount > table->slotsCount) {
-                index = index * 2;
-            } else if(newTable->slotsCount < table->slotsCount) {
-                // Hmm... I am assuming rounding will be fine here...
-                index = index / 2;
+        result = atomicHashTable2_findInner4(this, newTable, valuesFound, pValuesFoundCur, pValuesFoundLimit, hash, true);
+        if(result == 0) {
+            // So... values might be cross tables, which means we may have seen the same value twice. In which case, the first value will always
+            //  have been redirected (as it is redirected before it gets moved), so if anything is redirected... we probably read duplicates...
+            //	(only checked if we used newTable. Otherwise even if the values we returned are redirected, they were not moved when we read them,
+            //		so our read was consistent, even if their location is different now).
+            for (uint64_t i = 0; i < *pValuesFoundCur; i++) {
+                if (Reference_HasBeenRedirected(valuesFound[i].ref)) {
+                    #ifdef DEBUG
+                    if (IsSingleThreadedTest) {
+                        breakpoint();
+                    }
+                    #endif
+                    result = 1;
+                    break;
+                }
             }
-            for(uint64_t i = 0; i < *pValuesFoundCur; i++) {
-                Reference_Release(valuesFound[i].refSource, valuesFound[i].ref);
-            }
-            *pValuesFoundCur = 0;
-            return atomicHashTable2_findInner4(this, newTable, valuesFound, pValuesFoundCur, pValuesFoundLimit, &index, baseIndex, hash);
         }
+    } else {
+		// This should be hit at sometime...
+		//breakpoint();
     }
     return result;
 }
@@ -1113,6 +1017,12 @@ int atomicHashTable2_findInner(
         AtomicHashTableBase* newTable = Reference_GetValue(newTableRef);
 
         int result = atomicHashTable2_findInner2(this, hash, valuesFound, pValuesFoundLimit, callbackContext, callback, table, newTable);
+        //todonext
+        // Okay... why do we not need to check if the tables we searched are still the active tables? Because... I am seeing
+        //  a problem where a value doesn't appear until we search for it twice, which makes me think it is because
+        //  we were searching while moving, and that somehow made us not find a value... But that shouldn't be possible, right?
+        //todonext
+        // Okay, so now, we found it, but testGetSome didn't. So... definitely, moves are making it look like our values are temporarily gone.
 
         uint64_t size = table->slotsCount;
 
@@ -1130,6 +1040,9 @@ int atomicHashTable2_findInner(
         #endif
 
         loops++;
+		if (loops > size * 9) {
+			breakpoint();
+		}
         if(loops > size * 10) {
             // Too many loops, likely an internal error, or way too much contention.
             OnError(9);
@@ -1184,15 +1097,13 @@ int AtomicHashTable2_insertInner2(
     AtomicHashTable2* this,
     uint64_t hash,
     void* value,
-    AtomicHashTableBase* table,
-    uint64_t* pIndex
+    AtomicHashTableBase* table
 ) {
     int reserveResult = atomicHashTable2_updateReserved(this, table, &table->newAllocation, 1, 1);
     if(reserveResult > 0) {
         return reserveResult;
     }
     
-    //uint64_t index = *pIndex;
     uint64_t index = getSlotBaseIndex(table, hash);
     uint64_t startIndex = index;
     uint64_t loopCount = 0;
@@ -1204,9 +1115,8 @@ int AtomicHashTable2_insertInner2(
         OutsideReference valueRef = *pValue;
 
         if(IS_VALUE_MOVED(valueRef)) {
-            printf("Found move while inserting for %llu\n", hash);
+            //printf("Found move while inserting for %llu\n", hash);
             atomicHashTable2_updateReservedUndo(this, table, -1, -1);
-            *pIndex = index;
             return 1;
         }
 
@@ -1218,9 +1128,8 @@ int AtomicHashTable2_insertInner2(
             Reference_Allocate((MemPool*)table->valuePool, &valueOutsideRef, &hashValue, this->HASH_VALUE_SIZE, index << (64 - table->logSlotsCount));
             if(!hashValue) {
                 // We might not be out of memory, we might just have tried to allocate right after we finished a move.
-                if(table->valuePool->destructed) {
-                    // If the table is destructed it means all the values will be marked as moved, so the next loop will trigger the IS_VALUE_MOVED code.
-                    continue;
+                if(table->valuePool->countForSet.destructed) {
+					return 1;
                 }
                 atomicHashTable2_updateReservedUndo(this, table, -1, -1);
                 return 3;
@@ -1242,9 +1151,10 @@ int AtomicHashTable2_insertInner2(
                 DestroyUniqueOutsideRef(&valueOutsideRef);
                 continue;
             }
-			printf("Inserted %llu (base %llu) for %llu\n", index, startIndex, hash);
+			//printf("Inserted %llu (base %llu) for %llu\n", index, startIndex, hash);
 
-            if(valueRef.valueForSet != 0) {
+
+            if(!IS_BLOCK_END(valueRef)) {
                 // We reused a null entry, so we can release the reserved amount, as we didn't use up any more null entries
                 //  (but we still used up a real reserved count)
                 atomicHashTable2_updateReservedUndo(this, table, 0, -1);
@@ -1274,32 +1184,23 @@ int AtomicHashTable2_insertInner(
     AtomicHashTableBase* newTable
 ) {
     // See atomicHashTable2_removeInner
-    uint64_t index = getSlotBaseIndex(table, hash);
-    printf("First try insert for %llu\n", hash);
-    int result = AtomicHashTable2_insertInner2(this, hash, value, table, &index);
+    //printf("First try insert for %llu\n", hash);
+    int result = AtomicHashTable2_insertInner2(this, hash, value, table);
     if(result > 1) {
         return result;
     }
     if(newTable) {
         int moveResult = atomicHashTable2_applyMoveTableOperationInner(this, table, newTable);
         if(moveResult > 1) {
-            if(result == 0) return 0;
+            if(result == 0) {
+                // Unfortunately, we have to swallow the error here, as the operation succeeded, it was inserted,
+                //  so we need to return 0 to inform the caller it was inserted...
+                return 0;
+            }
             return moveResult;
         }
         if(result == 1) {
-            if(newTable->slotsCount > table->slotsCount) {
-                index = index * 2;
-            } else if(newTable->slotsCount < table->slotsCount) {
-                // Hmm... I am assuming rounding will be fine here...
-                index = index / 2;
-            }
-            //todonext
-            // Oh wait... insert... can't use the same index we left off at... some of the nulls we saw might have become
-            //  0s... And for finds... values can be moved backwards, same for deletions. Hmm... why did I think this would work?
-            // Okay, so... this is required, IF we cross the move start boundary?
-            //  Oh... so after we call move... yeah, it moves enough entries, so find will be fine... I think. And deletes too?
-            //printf("Second try insert for %llu\n", hash);
-            return AtomicHashTable2_insertInner2(this, hash, value, newTable, &index);
+            return AtomicHashTable2_insertInner2(this, hash, value, newTable);
         }
     }
     return result;

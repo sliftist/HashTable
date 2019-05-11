@@ -27,9 +27,10 @@
 
 
 void randomBytes(unsigned char* key, int size, unsigned long long seed) {
-	mersenne_seed((unsigned long)seed);
+	MTState state = { 0 };
+	mersenne_seed(&state, (unsigned long)seed);
 	for (int i = 0; i < size; i++) {
-		unsigned int v = mersenne_rand_u32();
+		unsigned int v = mersenne_rand_u32(&state);
 		// Eh... this might be a bit biased. But I don't think it impacts the security of this. Also... this probably won't be called anyway.
 		key[i] = (char)v;
 	}
@@ -581,6 +582,8 @@ void testSizingVar(int variation) {
 		item.a = i;
 		item.b = i;
 		item.c = i;
+		// I think this comment isn't true anymore, and I think we only remove it the exact amount of times it exists
+		//	per function? Maybe?
 		// TODO: Oh, the remove count can easily be higher, as it is possible the function will be called many times
 		//	for the same value (because of contention).
 		tickStart();
@@ -622,7 +625,7 @@ void testSizing() {
 	testSizingVar(3);
 
 	// Test to make sure we can scale large
-	//testSizingVar(2);
+	testSizingVar(2);
 }
 
 void* getValueHash(OutsideReference& ref) { return ((ref).valueForSet == 0 || (ref).isNull) ? 0 : (void*)(*(uint64_t*)((ref).pointerClipped + 32)); }
@@ -631,8 +634,8 @@ void* getValueHash(OutsideReference& ref) { return ((ref).valueForSet == 0 || (r
 #include <vector>
 void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIndex = 0) {
 
-	uint64_t itemCount = 10;
-	uint64_t iterationCount = itemCount * 10;
+	uint64_t itemCount = 1000;
+	uint64_t iterationCount = variation == 2 ? itemCount * 100 : itemCount * 10;
 
 
 	int16_t* randomChoices = (int16_t*)malloc(iterationCount * sizeof(int16_t));
@@ -640,7 +643,7 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 	Item* items = (Item*)malloc(itemCount * sizeof(Item));
 
 
-	if (variation == 0) {
+	if (variation == 0 || variation == 2) {
 		randomBytes((unsigned char*)randomChoices, (int)(iterationCount * sizeof(int16_t)), 0x7cdd44b);
 		randomBytes((unsigned char*)randomIndexes, (int)(iterationCount * sizeof(int64_t)), 0x7cdd44b);
 
@@ -672,20 +675,42 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 			index = index % itemsNotAdded.size();
 			Item item = itemsNotAdded.at(index);
 			uint64_t hash = getHash(item.a, item.b);
+			//_CrtCheckMemory();
 			testAdd2(table, item.a, item.b, item.c);
+			//_CrtCheckMemory();
 			uint64_t count = testGetCount2(table, item.a, item.b);
 			if (count != 1) {
+				uint64_t count2 = testGetCount2(table, item.a, item.b);
 				breakpoint();
-				AssertEqual(testGetCount2(table, item.a, item.b), 1);
+				if (count2 != 1) {
+					breakpoint();
+					AssertEqual(testGetCount2(table, item.a, item.b), 1);
+				}
 			}
 			
-			AssertEqual(testGetSome2(table, item).c, item.c);
+			Item testGetItem = testGetSome2(table, item);
+			if (variation == 2) {
+				if (testGetItem.a != testGetItem.b || testGetItem.b != testGetItem.c) {
+					// Corrupted item
+					OnError(3);
+				}
+			}
+			if (testGetItem.c != item.c) {
+				Item testGetItem2 = testGetSome2(table, item);
+				breakpoint();
+				Item testGetItem3 = testGetSome2(table, item);
+				AssertEqual(testGetItem.c, item.c);
+			}
+			//_CrtCheckMemory();
 			itemsNotAdded.erase(itemsNotAdded.begin() + index);
 			itemsAdded.push_back(item);
+			//_CrtCheckMemory();
 		} else {
 			index = index % itemsAdded.size();
 			Item item = itemsAdded.at(index);
+			//_CrtCheckMemory();
 			uint64_t count = testRemove2(table, item);
+			//_CrtCheckMemory();
 
 			// Count could be higher than 1, it just means we had to try a few times to remove it
 			if (count < 1) {
@@ -693,10 +718,13 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 				AssertEqual(true, false);
 			}
 
+			//_CrtCheckMemory();
 			itemsAdded.erase(itemsAdded.begin() + index);
 			itemsNotAdded.push_back(item);
+			//_CrtCheckMemory();
 		}
 
+		if(variation != 2)
 		{
 			for (uint64_t j = 0; j < itemsAdded.size(); j++) {
 				Item item = itemsAdded.at(j);
@@ -720,6 +748,7 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 			}
 		}
 		decision += randomChoices[i] / 256;
+		//_CrtCheckMemory();
 	}
 
 	for(uint64_t i = 0; i < itemsAdded.size(); i++) {
@@ -765,6 +794,7 @@ DWORD threadedChurn(TableMultiThreadsContext* context) {
 void testHashChurn2() {
 	testHashChurn2Var(0);
 	testHashChurn2Var(1);
+	testHashChurn2Var(2);
 }
 
 
@@ -979,6 +1009,7 @@ typedef struct {
 #include "MemPoolImpls.h"
 
 void runRefCountTests() {	
+	/*
 	Test test = { 0 };
 
 
@@ -1071,6 +1102,7 @@ void runRefCountTests() {
 	WaitForAllThreads();
 
 	Timing_EndRootPrint(&rootTimer, totalCount * threadCount);
+	*/
 }
 
 
@@ -1090,8 +1122,11 @@ void runAtomicHashTableTest() {
 	#endif
 	//*/
 	printf("ran single threaded tests\n");
-	testTableMultiThreads(4, 0, 1, threadedChurn);
+	//testTableMultiThreads(4, 0, 1, threadedChurn);
 	//testTableMultiThreads(4, 1, 1, threadedChurn);
+	//testTableMultiThreads(2, 2, 1, threadedChurn);
+	testTableMultiThreads(10, 2, 1, threadedChurn);
+	//testHashChurn2Var(2);
 
 	//todonext
 	// Oh, test with multiple threads... obviously...

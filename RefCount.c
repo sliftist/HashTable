@@ -2,9 +2,8 @@
 #include "AtomicHelpers.h"
 #include "MemPool.h"
 
+#define IS_NULL_POINTER IS_FROZEN_POINTER
 
-#define GET_POINTER_CLIPPED(val) (val & ((1ull << BITS_IN_ADDRESS_SPACE) - 1))
-#define GET_NULL(val) (val & (1ull << 63))
 
 // ATTTENTION! We can't call PACKED_POINTER_GET_POINTER on any threaded values, because there is a race between access of p.
 //  (which is one of the reasons we don't wrap p with parentheses)
@@ -21,7 +20,6 @@
 
 #define PACKED_POINTER_GET_POINTER(p) (PACKED_POINTER_GET_POINTER_VAL(p.valueForSet))
 
-#define IS_NULL_POINTER(ref) (ref.isNull && (GET_POINTER_CLIPPED(ref.valueForSet) >= MIN_POINTER_VALUE && ref.valueForSet != BASE_NULL_MAX.valueForSet))
 #define UNSET_NULL(ref) ((ref).valueForSet & ~(1ull << 63))
 
 #define GET_NULL_POINTER_VALUE(ref) (!IS_NULL_POINTER(ref) ? 0 : PACKED_POINTER_GET_POINTER_VAL( (UNSET_NULL(ref)) ) )
@@ -151,7 +149,7 @@ bool IsInsideRefCorruptInner(InsideReference* pRef, bool allowFreed) {
         OnError(3);
         return true;
     }
-    if(ref.outsideCount > ref.count) {
+    if(ref.outsideCount > ref.count && ref.outsideCount < 1024) {
         // This means there are outstanding outside references with references that have been orphaned. This is bad...
         OnError(3);
         return true;
@@ -172,7 +170,7 @@ bool IsInsideRefCorruptInner(InsideReference* pRef, bool allowFreed) {
 		OnError(3);
 		return true;
 	}
-	if (ref.count > 20) {
+	if (ref.count > 100) {
 		//todonext
 		// We have a leak somewhere, only with multiple threads, so it is likely in a contention retry case.
 		//	Probably in how we follow redirects?
@@ -242,6 +240,16 @@ bool XchgOutsideReference(
 
 InsideReference* Reference_AcquireInsideNoRedirect(OutsideReference* pRef, const char* file, uint64_t line) {
 	InsideReference* ref = Reference_AcquireInternal(pRef, false, file, line);
+	if (!ref) return nullptr;
+    //printf("acquiring inside reference for %p have %llu\n", ref, ref->count);
+	InterlockedIncrement64((LONG64*)&ref->countFullValue);
+	Reference_Release(pRef, ref);
+    //printf("acquired inside reference for %p have %llu\n", ref, ref->count);
+	return ref;
+}
+
+InsideReference* Reference_AcquireInside(OutsideReference* pRef) {
+    InsideReference* ref = Reference_AcquireInternal(pRef, true, __FILE__, __LINE__);
 	if (!ref) return nullptr;
     //printf("acquiring inside reference for %p have %llu\n", ref, ref->count);
 	InterlockedIncrement64((LONG64*)&ref->countFullValue);
@@ -399,7 +407,7 @@ bool setDestructValue(InsideReference* ref) {
 bool unsetDestructValue(InsideReference* ref) {
     while(true) {
         uint64_t count = ref->countFullValue;
-        if(~(count & (1ull << 63))) {
+        if(!(count & (1ull << 63))) {
             return false;
         }
         if(InterlockedCompareExchange64(
@@ -554,7 +562,7 @@ bool releaseInsideReferenceX(InsideReference* insideRef, const char* file, uint6
     // decrementResult
     InsideReferenceCountDebug countDebug;
     countDebug.countFullValue = decrementResult;
-    if(countDebug.outsideCount > countDebug.count) {
+    if(countDebug.outsideCount > countDebug.count && countDebug.outsideCount < 1024) {
         // A big problem, you released a reference you obtained for an outside reference without that outside reference,
         //  which leaks a reference and will cause leaks or double frees.
         OnError(3);
@@ -620,6 +628,14 @@ InsideReference* Reference_AcquireInternal(OutsideReference* pRef, bool redirect
     }
 
     DebugLog(file, line, "Reference_Acquire (ACQUIRED)", ref);
+
+    //todonext
+    // Actually... because Reference_ReduceToZeroRefsAndSetIsNull, we don't need to follow redirects.
+    //  So redirects are really just links to prevent moved references from being released, AND extra work
+    //  to make sure just because an old reference doesn't get freed, doesn't mean every reference in that
+    //  chain leaks, so we can free all references except the original leaked one.
+    // And, change Reference_HasBeenRedirected to just check for links instead, as any reference
+    //  that has a link is either moved from the original location, or in the process of moving.
 
     if(redirect && ref->nextRedirectValue.valueForSet) {
         InsideReference* newRef = referenceAcquire(&ref->nextRedirectValue, file, line);

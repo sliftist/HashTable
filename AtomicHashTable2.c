@@ -31,7 +31,13 @@ uint64_t log2RoundDown(uint64_t v) {
 uint64_t minSlotCount(AtomicHashTable2* this) {
     uint64_t sizePerCount = SIZE_PER_COUNT(this);
     
-    uint64_t minCount = (PAGE_SIZE * 100 - sizeof(AtomicHashTableBase) - InsideReferenceSize - sizeof(MemPoolHashed)) / sizePerCount;
+    #define TARGET_PAGES 1
+    #ifdef EVENT_ID_COUNT
+    #undef TARGET_PAGES
+    #define TARGET_PAGES EVENT_ID_COUNT
+    #endif
+
+    uint64_t minCount = (PAGE_SIZE * TARGET_PAGES - sizeof(AtomicHashTableBase) - InsideReferenceSize - sizeof(MemPoolHashed)) / sizePerCount;
 
     // Must be a power of 2, for getSlotBaseIndex
     minCount = 1ll << log2RoundDown(minCount);
@@ -178,10 +184,14 @@ int atomicHashTable2_updateReserved(
             return 0;
         }
 
-        // We shouldn't be trying to grow though when moving... We should be able to move the whole table in well
-        //  under the number of operations it takes to doulbe our size again. This likely means our fixed
-        //  move count is too low, or our grow/shrink ranges overlap, or are too close, or something.
-        OnError(9);
+        // Of course, while moving to deal with null entries we might grow, and then want to grow again while moving. This is fine,
+        //  we will finish the previous move before we get dangerously empty
+
+        if(slotsReservedNoNulls > curSlotCount / 10 * 8) {
+            // We are within 80% of being filled. This is dangerously close, this shouldn't happen, we should move enough entries
+            //  on each insert to prevent this from happening...
+            OnError(9);
+        }
         return 0;
     }
 
@@ -217,11 +227,9 @@ int atomicHashTable2_updateReserved(
         newTable->finishedMovingInto = true;
     }
 
-    InsideReference* newTableRef = Reference_Acquire(&newAllocation);
-    OutsideReference memPoolTableRef = Reference_CreateOutsideReference(newTableRef);
-    Reference_Release(&newAllocation, newTableRef);
+    InsideReference* newTableRef = Reference_AcquireInside(&newAllocation);
 
-    MemPoolHashed pool = MemPoolHashedDefault(SIZE_PER_VALUE_ALLOC(this), newSlotCount, logSlotsCount, memPoolTableRef, this, atomicHashTable2_memPoolFreeCallback);
+    MemPoolHashed pool = MemPoolHashedDefault(SIZE_PER_VALUE_ALLOC(this), newSlotCount, logSlotsCount, newTableRef, this, atomicHashTable2_memPoolFreeCallback);
     *newTable->valuePool = pool;
     MemPoolHashed_Initialize(newTable->valuePool);
 
@@ -237,7 +245,7 @@ int atomicHashTable2_updateReserved(
         newAllocation.valueForSet,
         0
     ) != 0) {
-        DestroyUniqueOutsideRef(&memPoolTableRef);
+        Reference_Release(&newAllocation, newTableRef);
         DestroyUniqueOutsideRef(&newAllocation);
         return 1;
     }
@@ -358,15 +366,12 @@ int atomicHashTable2_applyMoveTableOperationInner(
             InsideReference* newAllocRef = (void*)((byte*)newAlloc - InsideReferenceSize);
             newAlloc->finishedMovingInto = true;
 
-            // Turn off IsSingleThreadedTest, to disable some leak detection login in references that is not needed for newAllocation
-            #ifdef DEBUG
-            bool prevIsSingleThreadedTest = IsSingleThreadedTest;
-            IsSingleThreadedTest = false;
-            #endif
-            Reference_RedirectReference((void*)((byte*)curAlloc - InsideReferenceSize), newAllocRef);
-            #ifdef DEBUG
-            IsSingleThreadedTest = prevIsSingleThreadedTest;
-            #endif
+            InsideReference* curAllocRef = (void*)((byte*)curAlloc - InsideReferenceSize);
+
+            OutsideReference newAllocOutside = Reference_CreateOutsideReference(newAllocRef);
+            if(!Reference_ReplaceOutside(&this->currentAllocation, curAllocRef, newAllocOutside)) {
+                DestroyUniqueOutsideRef(&newAllocOutside);
+            }
 
             Reference_DestroyOutsideMakeNull(&curAlloc->newAllocation, newAllocRef);
 
@@ -818,7 +823,7 @@ int atomicHashTable2_findInner4(
     uint64_t* pValuesFoundCur,
     uint64_t* pValuesFoundLimit,
     uint64_t hash,
-    bool breakOnMove
+    AtomicHashTableBase* newTable
 ) {
     uint64_t index = getSlotBaseIndex(table, hash);
     uint64_t baseIndex = index;
@@ -836,9 +841,16 @@ int atomicHashTable2_findInner4(
         }
         if(value.valueForSet != BASE_NULL.valueForSet) {
 			if (IS_VALUE_MOVED(value)) {
-				if (breakOnMove) {
-					return 1;
-				}
+                if(newTable) {
+                    // If we have a newTable, then we aren't the new table, so seeing moved values is okay
+                    if(IS_FROZEN_POINTER(value)) {
+                        // But if it is presently being moved, we have to finish the move, so we can read it when we search in the newTable
+                        //  (but we don't need to research the current entry, the move will just set it to some BASE_NULL value.
+                        RETURN_ON_ERROR(atomicHashTable2_applyMoveTableOperationInner(this, table, newTable));
+                    }
+                } else {
+                    return 1;
+                }
 			}
 			else {
 				InsideReference* valueRef = Reference_Acquire(pValue);
@@ -910,45 +922,24 @@ int atomicHashTable2_findInner3(
 ) {
     //todonext
     // If we make all accessors like this, then we can change atomicHashTable2_applyMoveTableOperationInner to not need to complete blocks!
-    if(newTable) {
-        //todonext
-        // No it isn't fine.
-        // Move first... because encountering moved values is fine for find (because it doesn't need to worry about making a block fully moved
-        //  before we delete or insert values).
+    //  So this means, move first, and then check for IS_FROZEN_POINTER, moving if that is true.
+    //      - This means... that we only do moves equals to the number of times we read an entry while someone else is moving it.
+    //          Which I haven't been able to make a test case that triggers this often, so it will probably almost never happen?
 
-        //todonext
-        // What if we see a move, but it just moved 1 entry. The find loop will break, and the find loop in the newTable will only
-        //  look at one entry...
-        // However, we could... change the find loop to not break upon seeing a move?
+    if(newTable) {
         int moveResult = atomicHashTable2_applyMoveTableOperationInner(this, table, newTable);
         if(moveResult > 0) {
             return moveResult;
         }
     }
-	#ifdef DEBUG
-	if (IsSingleThreadedTest) {
-		if (!stop) {
-			if (table->slotsReservedWithNulls * 12 / 10 > table->slotsCount) {
-				breakpoint();
-			}
-		}
-	}
-	#endif
 
-
-    //todonext
-    // Change !newTable to false, and make sure tests fail. Because they have to, because it can't be false
-    
-
-    //todonext
-    // false should be !newTable. But... shouldn't our tests fail because of this?
-    int result = atomicHashTable2_findInner4(this, table, valuesFound, pValuesFoundCur, pValuesFoundLimit, hash, !newTable);
+    int result = atomicHashTable2_findInner4(this, table, valuesFound, pValuesFoundCur, pValuesFoundLimit, hash, newTable);
     if(result > 1) {
         return result;
     }
 
     if(newTable) {
-        result = atomicHashTable2_findInner4(this, newTable, valuesFound, pValuesFoundCur, pValuesFoundLimit, hash, true);
+        result = atomicHashTable2_findInner4(this, newTable, valuesFound, pValuesFoundCur, pValuesFoundLimit, hash, nullptr);
         if(result == 0) {
             // So... values might be cross tables, which means we may have seen the same value twice. In which case, the first value will always
             //  have been redirected (as it is redirected before it gets moved), so if anything is redirected... we probably read duplicates...

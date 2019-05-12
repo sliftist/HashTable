@@ -427,12 +427,22 @@ void printPercentTick(const char* tickName, AtomicHashTable2& table, double frac
 }
 
 
-void testSizingVar(int variation) {
+void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex) {
+	
 	//todonext
 	// Do all single threaded tests, and then do multithreaded tests, in debug and release...
 
+	uint64_t repeatCount = 1;
+	if(variation == 4) {
+		#ifdef DEBUG
+		repeatCount = 100;
+		#else 
+		repeatCount = 10000;
+		#endif
+	}
+
 	uint64_t factor = 1;
-	uint64_t itemCount;
+	uint64_t itemCount = 0;
 	
 	if (variation == 0) {
 		itemCount = 1000;
@@ -451,174 +461,192 @@ void testSizingVar(int variation) {
 		//itemCount = (1ll << 23);
 		// Requires 64GB of memory to work, but after struggling at lot at 64GB, it will free ~20GB, then the remaining ~60GB when it finishes
 		#ifdef DEBUG
-		itemCount = (1ll << 20);
+		itemCount = (1ll << 18);
 		#else
 		itemCount = (1ll << 26);
 		#endif
 	}
-	else {
+	else if(variation == 3) {
 		itemCount = (1ll << 14);
+	} else if(variation == 4) {
+		itemCount = (1ll << 10);
+	} else {
+		// Unhandled variation
+		OnError(2);
 	}
 
+	TimeTrackerRoot rootTimer = { 0 };
 
-	AtomicHashTable2 table = AtomicHashTableDefault(sizeof(Item), deleteItem);
-
-
-	if (variation == 2 || variation == 3) {
+	if (variation != 0 && variation != 1) {
 		printf("insert + 2 gets + remove + dtor timing\n");
 		Timing_StartRoot(&rootTimer);
 	}
 
-	tickGroupStart();
-	for (uint64_t i = 0; i < itemCount; i++) {
-		if (i == 209714) {
-			//breakpoint();
-		}
-		tickStart();
-		testAdd2(table, i, i, i);
-		testAdd2(table, i, i, i);
-		tickEnd();
 
-		if (variation == 2) {
-			if (i % (itemCount / 100) == 0) {
-				printPercentTick("Add", table, (double)(i + 1) / itemCount);
+	for(uint64_t q = 0; q < repeatCount; q++) {
+
+		tickGroupStart();
+		for (uint64_t i = itemCount * threadIndex; i < itemCount * (threadIndex + 1); i++) {
+			if (i == 209714) {
+				//breakpoint();
 			}
-		}
-
-		if (variation == 0) {
-			for (uint64_t j = 0; j <= i; j++) {
-				uint64_t count = testGetCount2(table, j, j);
-				AssertEqual(count, 2);
-			}
-		}
-	}
-
-	tickGroupStart();
-	if (variation == 0 || variation == 2 || variation == 3) {
-		for (uint64_t j = 0; j < itemCount; j++) {
 			tickStart();
-			{
-				uint64_t count = testGetCount2(table, j + itemCount, j + itemCount);
-				AssertEqual(count, 0);
-			}
-			{
-				uint64_t count = testGetCount2(table, j, j);
-				AssertEqual(count, 2);
-			}
+			testAdd2(table, i, i, i);
+			testAdd2(table, i, i, i);
 			tickEnd();
 
 			if (variation == 2) {
-				if (j % (itemCount / 100) == 0) {
-					printPercentTick("Check", table, (double)(j + 1) / itemCount);
+				if (i % (itemCount / 100) == 0) {
+					printPercentTick("Add", table, (double)(i % itemCount + 1) / itemCount);
+				}
+			}
+
+			if (variation == 0) {
+				for (uint64_t j = 0; j <= i; j++) {
+					uint64_t count = testGetCount2(table, j, j);
+					AssertEqual(count, 2);
+				}
+			}
+		}
+
+		tickGroupStart();
+		if (variation != 1) {
+			for (uint64_t j = itemCount * threadIndex; j < itemCount * (threadIndex + 1); j++) {
+				tickStart();
+				/*
+				{
+					uint64_t count = testGetCount2(table, j + itemCount, j + itemCount);
+					AssertEqual(count, 0);
+				}
+				*/
+				{
+					uint64_t count = testGetCount2(table, j, j);
+					AssertEqual(count, 2);
+				}
+				tickEnd();
+
+				if (variation == 2) {
+					if (j % (itemCount / 100) == 0) {
+						printPercentTick("Check", table, (double)(j % itemCount + 1) / itemCount);
+					}
+				}
+			}
+		}
+		else {
+			printf("get no matches (fast hashing):\n");
+
+			uint64_t* hashes = new uint64_t[itemCount];
+			for (uint64_t j = itemCount * threadIndex; j < itemCount * (threadIndex + 1); j++) {
+				hashes[j] = getHash(j + itemCount, j + itemCount);
+			}
+
+			Timing_StartRoot(&rootTimer);
+
+			
+
+			for (uint64_t k = 0; k < factor; k++) {
+				for (uint64_t j = 0; j < itemCount; j++) {
+					typedef struct {
+						Item item;
+						uint64_t count;
+					} Context;
+					Context context = { 0 };
+					context.item.a = j + itemCount;
+					context.item.b = j + itemCount;
+
+					uint64_t hash = hashes[j];
+					// This call takes around 28 instructions, with the loop taking around 15 instructions
+					int result = AtomicHashTable2_find(&table, hash, &context, [](void* contextAny, void* value) {
+						Context* context = (Context*)contextAny;
+						Item* item = (Item*)value;
+						if (context->item.a == item->a && context->item.b == item->b) {
+							context->count++;
+						}
+					});
+
+					ErrorTop(result);
+
+					AssertEqual(context.count, 0);
+				}
+			}
+			Timing_EndRootPrint(&rootTimer, itemCount * factor);
+
+			delete[] hashes;
+			printf("get no matches:\n");
+			Timing_StartRoot(&rootTimer);
+			for (uint64_t k = 0; k < factor; k++) {
+				for (uint64_t j = itemCount * threadIndex; j < itemCount * (threadIndex + 1); j++) {
+					uint64_t count = testGetCount2(table, j + itemCount, j + itemCount);
+					AssertEqual(count, 0);
+				}
+			}
+			Timing_EndRootPrint(&rootTimer, itemCount * factor);
+
+			printf("get all matches:\n");
+			Timing_StartRoot(&rootTimer);
+			for (uint64_t k = 0; k < factor; k++) {
+				for (uint64_t j = itemCount * threadIndex; j < itemCount * (threadIndex + 1); j++) {
+					uint64_t count = testGetCount2(table, j, j);
+					AssertEqual(count, 2);
+				}
+			}
+			Timing_EndRootPrint(&rootTimer, itemCount * factor);
+		}
+
+
+		tickGroupStart();
+		for (uint64_t i = itemCount * threadIndex; i < itemCount * (threadIndex + 1); i++) {
+			Item item = { 0 };
+			item.a = i;
+			item.b = i;
+			item.c = i;
+
+			tickStart();
+			uint64_t removeCount = testRemove2(table, item);
+			tickEnd();
+			// It can be more than 2, due as we might have gotten it, decided to delete it, and then found it was moved, which will
+			//	mean we will have to find it in the new allocation and check if we want to delete it again, resulting in many calls
+			//	to the remove test function. We need at least 2 calls though, or else it clearly isn't deleting 2 entries.
+			if (removeCount < 2) {
+				OnError(3);
+			}
+
+			if (variation == 0) {
+				for (uint64_t j = itemCount * threadIndex; j <= i; j++) {
+					AssertEqual(testGetCount2(table, j, j), 0);
+				}
+				for (uint64_t j = i + 1; j < itemCount * (threadIndex + 1); j++) {
+					AssertEqual(testGetCount2(table, j, j), 2);
+				}
+			}
+
+			if (variation == 2) {
+				if (i % (itemCount / 100) == 0) {
+					printPercentTick("Remove", table, (double)(i % itemCount + 1) / itemCount);
 				}
 			}
 		}
 	}
-	else {
-		printf("get no matches (fast hashing):\n");
-
-		uint64_t* hashes = new uint64_t[itemCount];
-		for (uint64_t j = 0; j < itemCount; j++) {
-			hashes[j] = getHash(j + itemCount, j + itemCount);
-		}
-
-		Timing_StartRoot(&rootTimer);
-
-		
-
-		for (uint64_t k = 0; k < factor; k++) {
-			for (uint64_t j = 0; j < itemCount; j++) {
-				typedef struct {
-					Item item;
-					uint64_t count;
-				} Context;
-				Context context = { 0 };
-				context.item.a = j + itemCount;
-				context.item.b = j + itemCount;
-
-				uint64_t hash = hashes[j];
-				// This call takes around 28 instructions, with the loop taking around 15 instructions
-				int result = AtomicHashTable2_find(&table, hash, &context, [](void* contextAny, void* value) {
-					Context* context = (Context*)contextAny;
-					Item* item = (Item*)value;
-					if (context->item.a == item->a && context->item.b == item->b) {
-						context->count++;
-					}
-				});
-
-				ErrorTop(result);
-
-				AssertEqual(context.count, 0);
-			}
-		}
-		Timing_EndRootPrint(&rootTimer, itemCount * factor);
-
-		delete[] hashes;
-		printf("get no matches:\n");
-		Timing_StartRoot(&rootTimer);
-		for (uint64_t k = 0; k < factor; k++) {
-			for (uint64_t j = 0; j < itemCount; j++) {
-				uint64_t count = testGetCount2(table, j + itemCount, j + itemCount);
-				AssertEqual(count, 0);
-			}
-		}
-		Timing_EndRootPrint(&rootTimer, itemCount * factor);
-
-		printf("get all matches:\n");
-		Timing_StartRoot(&rootTimer);
-		for (uint64_t k = 0; k < factor; k++) {
-			for (uint64_t j = 0; j < itemCount; j++) {
-				uint64_t count = testGetCount2(table, j, j);
-				AssertEqual(count, 2);
-			}
-		}
-		Timing_EndRootPrint(&rootTimer, itemCount * factor);
-	}
-
-
-	tickGroupStart();
-	for (uint64_t i = 0; i < itemCount; i++) {
-		Item item = { 0 };
-		item.a = i;
-		item.b = i;
-		item.c = i;
-		// I think this comment isn't true anymore, and I think we only remove it the exact amount of times it exists
-		//	per function? Maybe?
-		// TODO: Oh, the remove count can easily be higher, as it is possible the function will be called many times
-		//	for the same value (because of contention).
-		tickStart();
-		uint64_t removeCount = testRemove2(table, item);
-		tickEnd();
-		AssertEqual(removeCount, 2);
-
-		if (variation == 0) {
-			for (uint64_t j = 0; j <= i; j++) {
-				AssertEqual(testGetCount2(table, j, j), 0);
-			}
-			for (uint64_t j = i + 1; j < itemCount; j++) {
-				AssertEqual(testGetCount2(table, j, j), 2);
-			}
-		}
-
-		if (variation == 2) {
-			if (i % (itemCount / 100) == 0) {
-				printPercentTick("Remove", table, (double)(i + 1) / itemCount);
-			}
-		}
-	}
-
 	// Hmm... we should probably add "iterate all" function, because I am sure it would be useful to display
 	//	the contents in a UI. Although... iterate all is problematic... Hmm... And maybe a clear all function?
+	/*
 	uint64_t allocSize = DebugAtomicHashTable2_allocationSize(&table);
 	for(uint64_t i = 0; i < allocSize; i++) {
 		AtomicHashTable2_remove(&table, i, nullptr, [](void* x, void* value){ x; value; return true; } );
 	}
-
-	if (variation == 2 || variation == 3) {
-		Timing_EndRootPrint(&rootTimer, itemCount * factor);
+	*/
+	if (variation != 0 && variation != 1) {
+		Timing_EndRootPrint(&rootTimer, itemCount * factor * repeatCount);
 	}
+	
 	printf("\t%f search pressure (1 means there were no hash collisions)\n", (double)table.searchLoops / (double)table.searchStarts);
 }
+
+void testSizingVar(int variation) {
+	AtomicHashTable2 table = AtomicHashTableDefault(sizeof(Item), deleteItem);
+	testSizingVarInner(table, variation, 0);
+}
+
 void testSizing() {
 	testSizingVar(0);
 	testSizingVar(1);
@@ -626,6 +654,15 @@ void testSizing() {
 
 	// Test to make sure we can scale large
 	testSizingVar(2);
+}
+
+DWORD threadedSizing(TableMultiThreadsContext* context) {
+	auto table = context->table;
+	auto variation = context->variation;
+
+	testSizingVarInner(*table, variation, context->threadIndex);
+
+	return 0;
 }
 
 void* getValueHash(OutsideReference& ref) { return ((ref).valueForSet == 0 || (ref).isNull) ? 0 : (void*)(*(uint64_t*)((ref).pointerClipped + 32)); }
@@ -1108,7 +1145,7 @@ void runRefCountTests() {
 
 
 void runAtomicHashTableTest() {
-	/*
+	//*
 	// TODO: Add a debug wrapper for malloc and free, so we can track the number of allocations, and run tests to make sure we don't leak allocations.
 	#ifdef DEBUG
 	IsSingleThreadedTest = true;
@@ -1124,9 +1161,12 @@ void runAtomicHashTableTest() {
 	printf("ran single threaded tests\n");
 	//testTableMultiThreads(4, 0, 1, threadedChurn);
 	//testTableMultiThreads(4, 1, 1, threadedChurn);
-	//testTableMultiThreads(2, 2, 1, threadedChurn);
-	testTableMultiThreads(10, 2, 1, threadedChurn);
 	//testHashChurn2Var(2);
+	//testSizingVar(4);
+	testTableMultiThreads(16, 4, 1, threadedSizing);
+	testTableMultiThreads(2, 4, 1, threadedSizing);
+	testTableMultiThreads(2, 2, 1, threadedChurn);
+	testTableMultiThreads(16, 2, 1, threadedChurn);
 
 	//todonext
 	// Oh, test with multiple threads... obviously...

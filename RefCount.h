@@ -41,7 +41,7 @@ extern "C" {
 struct InsideReference;
 typedef struct InsideReference InsideReference;
 //#define InsideReferenceSize 32
-#define EVENT_ID_COUNT 140
+#define EVENT_ID_COUNT 1
 #define InsideReferenceSize (32 + EVENT_ID_COUNT * 4 * 8 + 8)
 
 #ifdef DEBUG
@@ -62,6 +62,10 @@ extern bool IsSingleThreadedTest;
 #else
 #define FAST_CHECK_POINTER(outsideRef, insideRef) (!(outsideRef).isNull ? (outsideRef).pointerClipped == ((uint64_t)(insideRef)) : (uint64_t)(insideRef) == nullptr)
 #endif
+
+#define GET_POINTER_CLIPPED(val) (val & ((1ull << BITS_IN_ADDRESS_SPACE) - 1))
+#define GET_NULL(val) (val & (1ull << 63))
+#define IS_FROZEN_POINTER(ref) (ref.isNull && (GET_POINTER_CLIPPED(ref.valueForSet) >= MIN_POINTER_VALUE && ref.valueForSet != BASE_NULL_MAX.valueForSet))
 
 
 // OutsideReferences can have a count of 0, the count simply refers to the number of references not yet moved
@@ -168,6 +172,8 @@ void Reference_RedirectReferenceX(
 
 InsideReference* Reference_AcquireX(OutsideReference* pRef, const char* file, uint64_t line);
 #define Reference_Acquire(pRef) Reference_AcquireX(pRef, __FILE__, __LINE__)
+
+InsideReference* Reference_AcquireInside(OutsideReference* pRef);
 
 // Acquires the reference, even if it is null, as long as the pointer value is > BASE_NULL_LAST, and not BASE_NULL_MAX.
 // Does not follow redirections

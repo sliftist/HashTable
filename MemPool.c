@@ -125,14 +125,16 @@ void MemPoolHashed_Initialize(MemPoolHashed* pool) {
 }
 
 void memPoolHashed_DestroyOutsideRef(MemPoolHashed* pool) {
-    InsideReference* ref = Reference_Acquire(&pool->holderOutsideReference);
-    if(!ref) {
-        // We should uniquely hold this...
+    InsideReference* holderRef = pool->holderRef;
+    if(!holderRef || InterlockedCompareExchange64((LONG64*)&pool->holderRef, 0, (LONG64)holderRef) != (LONG64)holderRef) {
+        // We should uniquely hold this... And if we don't it is dangerous, as this reference keeps US alive,
+		//	so at this point, our own pool memory is potentially freed (as we could only exist in a redirect chain,
+		//	and then just been released, so the allocation that holds us might not be anywhere on the stack).
+        // So... pool->holderRef could access invalid memory at this point...
         OnError(2);
         return;
     }
-    Reference_DestroyOutside(&pool->holderOutsideReference, ref);
-    Reference_Release(&emptyReference, ref);
+    Reference_Release(&emptyReference, holderRef);
 }
 
 void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) {
@@ -141,11 +143,12 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
         OnError(2);
         return nullptr;
     }
-	// Tried to allocate after destruct was called...
+	
 	if (pool->countForSet.destructed) {
 		// This is a valid necessary race condition, so we just have to return nullptr.
 		return nullptr;
 	}
+
     uint64_t index = hash >> (64 - pool->VALUE_COUNT_LOG);
     uint64_t loopCount = 0;
     byte* allocatedBits = (byte*)pool + sizeof(MemPoolHashed);
@@ -159,7 +162,23 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
                 allocatedByte | (1 << (index % 8)),
                 allocatedByte
             ) == allocatedByte) {
-                InterlockedIncrement64((LONG64*)&pool->countForSet.valueForSet);
+                while(true) {
+                    AllocCount count = pool->countForSet;
+                    AllocCount countNew = count;
+                    if(countNew.destructed) {
+                        // This is a valid necessary race condition, so we just have to return nullptr.
+                        return nullptr;
+                    }
+                    countNew.totalAllocationsOutstanding++;
+                    if(InterlockedCompareExchange64(
+                        (LONG64*)&pool->countForSet.valueForSet,
+                        countNew.valueForSet,
+                        count.valueForSet
+                    ) != count.valueForSet) {
+                        continue;
+                    }
+                    break;
+                }
                 byte* allocation = allocatedBits + (pool->VALUE_COUNT + 7) / 8 + index * (pool->VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD);
                 return allocation;
             }

@@ -174,6 +174,25 @@ void Reference_RedirectReference(
 
 InsideReference* Reference_Acquire(OutsideReference* pRef);
 
+// pRef must be guaranteed to have a value, as we might mess up null values, or create bad pointers
+__forceinline InsideReference* Reference_AcquireFast(OutsideReference* pRef) {
+    // Assume there were no refs before
+    OutsideReference prevRef = *pRef;
+    prevRef.fastCount = 0;
+    OutsideReference newRef = prevRef;
+    newRef.fastCount = 1;
+    
+    if(InterlockedCompareExchange64(
+        (LONG64*)pRef,
+        newRef.valueForSet,
+        prevRef.valueForSet
+    ) == prevRef.valueForSet) {
+        return (InsideReference*)newRef.pointerClipped;
+    }
+
+    return Reference_Acquire(pRef);
+}
+
 InsideReference* Reference_AcquireInside(OutsideReference* pRef);
 
 // Acquires the reference, even if it is null, as long as the pointer value is > BASE_NULL_LAST, and not BASE_NULL_MAX.
@@ -193,6 +212,28 @@ extern const OutsideReference emptyReference;
 // Outside reference may be knowingly wiped out, we will just ignore it and then release the inside reference.
 //  Always pass an outsideRef, even if you know it has been wiped out.
 void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef);
+
+// InsideRef must not be null
+__forceinline void Reference_ReleaseFast(OutsideReference* outsideRef, InsideReference* insideRef) {
+    // Assume we had 1 outside ref. If not, just bail to Reference_Release (but most of the time
+    //  we have 1 outside ref, so this is good)
+    OutsideReference prevRef;
+    prevRef.pointerClipped = (uint64_t)insideRef;
+    prevRef.fastCount = 1;
+    OutsideReference newRef;
+	newRef.valueForSet = 0;
+	newRef.pointerClipped = (uint64_t)insideRef;
+    
+    if(InterlockedCompareExchange64(
+        (LONG64*)outsideRef,
+        newRef.valueForSet,
+        prevRef.valueForSet
+    ) == prevRef.valueForSet) {
+        return;
+    }
+
+    Reference_Release(outsideRef, insideRef);
+}
 
 
 // Destroys this outside ref to the inside ref (which if it is the last outside ref, and there are no more inside references, will result

@@ -767,7 +767,6 @@ void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef)
 }
 
 bool Reference_ReplaceOutsideInner(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef, bool notSetIsNullAndReduceToZeroRefs, bool onNulls) {
-	InsideReference testCopy = *pInsideRef;
     OutsideReference testRef = *pOutsideRef;
     if(onNulls) {
         if(!testRef.isNull) {

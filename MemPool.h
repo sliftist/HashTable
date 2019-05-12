@@ -6,6 +6,8 @@
 extern "C" {
 #endif
 
+
+
 struct MemPool;
 typedef struct MemPool MemPool;
 #pragma pack(push, 1)
@@ -16,6 +18,8 @@ struct MemPool {
 };
 #pragma pack(pop)
 
+
+extern uint64_t SystemAllocationCount;
 
 #define MemPoolSystemDefault() { (Allocate)MemPoolSystem_Allocate, (Free)MemPoolSystem_Free }
 #pragma pack(push, 1)

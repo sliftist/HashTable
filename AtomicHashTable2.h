@@ -117,6 +117,7 @@ typedef struct {
     #endif
 
 
+
 } AtomicHashTable2;
 #pragma pack(pop)
 
@@ -157,14 +158,16 @@ int atomicHashTable2_findFull(
 
 #define atomicHashTable_getSlotBaseIndex(alloc, hash) ((hash) >> (64 - (alloc)->logSlotsCount))
 
-/*
+
 // internal
 __forceinline bool atomicHashTable2_fastNotContains(
     AtomicHashTable2* self,
 	uint64_t hash
 ) {
+    const OutsideReference BASE_NULL_CPLUSPLUS = { 0, 0, 1 };
+    const OutsideReference BASE_NULL_MAX_CPLUSPLUS = { UINT64_MAX, UINT64_MAX, UINT64_MAX };
     if(self->currentAllocation.valueForSet) {
-        InsideReference* tableRef = Reference_Acquire(&self->currentAllocation);
+        InsideReference* tableRef = Reference_AcquireFast(&self->currentAllocation);
         AtomicHashTableBase* table = (AtomicHashTableBase*)Reference_GetValueFast(tableRef);
         if(!table->newAllocation.valueForSet) {
             uint64_t index = atomicHashTable_getSlotBaseIndex(table, hash);
@@ -176,8 +179,7 @@ __forceinline bool atomicHashTable2_fastNotContains(
                 InterlockedIncrement64((LONG64*)&self->searchLoops);
                 #endif
                 OutsideReference value = table->slots[index].value;
-                if(value.valueForSet == 0) {
-                    printf("Fast not contains from %llu of %llu of %llu\n", startIndex, index, hash);
+                if(value.valueForSet == 0 || value.valueForSet == BASE_NULL_MAX_CPLUSPLUS.valueForSet) {
 					Reference_ReleaseFast(&self->currentAllocation, tableRef);
                     return 1;
                 }
@@ -192,8 +194,8 @@ __forceinline bool atomicHashTable2_fastNotContains(
                         return 0;
                     }
                 } else {
-                    const OutsideReference x = { 0, 0, 1 };
-                    if(value.valueForSet != x.valueForSet) {
+                    // BASE_NULL, but different because C++ doesn't like our macro
+                    if(value.valueForSet != BASE_NULL_CPLUSPLUS.valueForSet) {
                         // A move occured since we started, so we cannot continue.
 						Reference_ReleaseFast(&self->currentAllocation, tableRef);
                         return 0;
@@ -211,11 +213,11 @@ __forceinline bool atomicHashTable2_fastNotContains(
                 }
             }
         }
-        Reference_Release(&self->currentAllocation, tableRef);
+        Reference_ReleaseFast(&self->currentAllocation, tableRef);
     }
     return 0;
 }
-*/
+
 
 // This is optimized for the case when we don't find any matches, as this really needs to be fastest when used
 //  as a filter, and other cases will presumably spend more time in processing a match than it takes to find a match.
@@ -235,7 +237,7 @@ __forceinline int AtomicHashTable2_find(
     #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
     InterlockedIncrement64((LONG64*)&self->searchStarts);
     #endif
-    //if(atomicHashTable2_fastNotContains(self, hash)) {return 0;}
+    if(atomicHashTable2_fastNotContains(self, hash)) {return 0;}
     return atomicHashTable2_findFull(self, hash, callbackContext, callback);
 }
 inline int AtomicHashTable2_findWithMatches(

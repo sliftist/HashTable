@@ -71,3 +71,5 @@ void OnErrorInner(int code, const char* name, unsigned long long line);
 #ifdef __cplusplus
 }
 #endif
+
+#define ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING

@@ -5,10 +5,15 @@
 
 MemPoolSystem memPoolSystem = MemPoolSystemDefault();
 
+uint64_t SystemAllocationCount = 0;
+
 void* MemPoolSystem_Allocate(MemPoolSystem* pool, uint64_t size, uint64_t hash) {
 	//uint64_t time = GetTime();
 	//_CrtCheckMemory();
     void* allocation = malloc(size);
+    if(allocation) {
+        InterlockedIncrement64((LONG64*)&SystemAllocationCount);
+    }
 	//_CrtCheckMemory();
 	//time = GetTime() - time;
 	//printf("Allocation size %llu, %p\n", size, allocation);
@@ -19,6 +24,7 @@ void MemPoolSystem_Free(MemPoolSystem* pool, void* value) {
 	//printf("Freeing %p\n", value);
 	//_CrtCheckMemory();
     free(value);
+    InterlockedDecrement64((LONG64*)&SystemAllocationCount);
 	//_CrtCheckMemory();
 }
 

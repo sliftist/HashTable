@@ -25,7 +25,6 @@
 #include <immintrin.h>
 
 
-
 void randomBytes(unsigned char* key, int size, unsigned long long seed) {
 	MTState state = { 0 };
 	mersenne_seed(&state, (unsigned long)seed);
@@ -346,34 +345,31 @@ typedef struct {
 void testTableMultiThreads(
 	int count,
 	int variationStart,
-	int variationCount,
 	DWORD(*runThread)(TableMultiThreadsContext*)
 ) {
-	for(int v = variationStart; v < variationStart + variationCount; v++) {
-		AtomicHashTable2 table = AtomicHashTableDefault(sizeof(Item), deleteItem);
+	AtomicHashTable2 table = AtomicHashTableDefault(sizeof(Item), deleteItem);
 
-		TableMultiThreadsContext* threads = new TableMultiThreadsContext[count];
+	TableMultiThreadsContext* threads = new TableMultiThreadsContext[count];
 
-		printf("Starting %d threads\n", count);
+	printf("Starting %d threads, variation %d\n", count, variationStart);
 
-		memset(threads, 0, sizeof(HANDLE) * count);
-		for (int i = 0; i < count; i++) {
-			TableMultiThreadsContext* context = &threads[i];
-			context->table = &table;
-			context->variation = v;
-			context->threadIndex = i;
-			SpawnThread(
-				&context->thread,
-				context,
-				(DWORD(*)(void*))runThread
-			);
-		}
+	memset(threads, 0, sizeof(HANDLE) * count);
+	for (int i = 0; i < count; i++) {
+		TableMultiThreadsContext* context = &threads[i];
+		context->table = &table;
+		context->variation = variationStart;
+		context->threadIndex = i;
+		SpawnThread(
+			&context->thread,
+			context,
+			(DWORD(*)(void*))runThread
+		);
+	}
 
-		// WaitForMultipleObjects is garbage as it has a max of 64, so... don't use it.
-		for (int i = 0; i < count; i++) {
-			WaitForSingleObject(threads[i].thread, INFINITE);
-			printf("Finished thread %d\n", i);
-		}
+	// WaitForMultipleObjects is garbage as it has a max of 64, so... don't use it.
+	for (int i = 0; i < count; i++) {
+		WaitForSingleObject(threads[i].thread, INFINITE);
+		printf("Finished thread %d\n", i);
 	}
 }
 
@@ -453,7 +449,13 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 		#ifdef DEBUG
 		repeatCount = 100;
 		#else 
-		repeatCount = 1000;
+		repeatCount = 1000 * 100;
+		#endif
+	} else if(variation == 2) {
+		#ifdef DEBUG
+		repeatCount = 1;
+		#else 
+		repeatCount = 100;
 		#endif
 	}
 
@@ -476,7 +478,7 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 	else if(variation == 2) {
 		//itemCount = (1ll << 23);
 		// Requires 64GB of memory to work, but after struggling at lot at 64GB, it will free ~20GB, then the remaining ~60GB when it finishes
-		//	EDIT: Changed to only use 32GB
+		//	EDIT: Changed to use less memory?
 		#ifdef DEBUG
 		itemCount = (1ll << 18);
 		#else
@@ -572,7 +574,7 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 					context.item.b = j + itemCount;
 
 					uint64_t hash = hashes[j];
-					// This call takes around 28 instructions, with the loop taking around 15 instructions
+					// This call takes around 31 instructions, With setting up context, the asserts and for loop around this taking around 15 instructions
 					int result = AtomicHashTable2_find(&table, hash, &context, [](void* contextAny, void* value) {
 						Context* context = (Context*)contextAny;
 						Item* item = (Item*)value;
@@ -656,11 +658,14 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 		Timing_EndRootPrint(&rootTimer, itemCount * factor * repeatCount);
 	}
 	
+#ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
 	printf("\t%f search pressure (1 means there were no hash collisions)\n", (double)table.searchLoops / (double)table.searchStarts);
+#endif
 }
 
 void testSizingVar(int variation) {
 	AtomicHashTable2 table = AtomicHashTableDefault(sizeof(Item), deleteItem);
+	uint64_t x = 0;
 	testSizingVarInner(table, variation, 0);
 }
 
@@ -691,6 +696,9 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 
 	uint64_t itemCount = 1000;
 	uint64_t iterationCount = variation == 2 ? itemCount * 100 : itemCount * 10;
+	#ifndef DEBUG
+	iterationCount = iterationCount * 100;
+	#endif 
 
 
 	int16_t* randomChoices = (int16_t*)malloc(iterationCount * sizeof(int16_t));
@@ -1182,17 +1190,25 @@ void runAtomicHashTableTest() {
 	//testHashChurn2Var(2);
 	//testSizingVar(4);
 
+	printf("0 to N, many times\n");
+	testTableMultiThreads(1, 4, threadedSizing);
+	testTableMultiThreads(2, 4, threadedSizing);
+	testTableMultiThreads(16, 4, threadedSizing);
 
-	testTableMultiThreads(2, 4, 1, threadedSizing);
-	
-	/*
-	testTableMultiThreads(1, 4, 1, threadedSizing);
-	testTableMultiThreads(2, 4, 1, threadedSizing);
-	testTableMultiThreads(1, 2, 1, threadedChurn);
-	testTableMultiThreads(2, 2, 1, threadedChurn);
-	testTableMultiThreads(16, 4, 1, threadedSizing);
-	testTableMultiThreads(16, 2, 1, threadedChurn);
-	//*/
+	printf("0 to large N, many times\n");
+	testTableMultiThreads(1, 4, threadedSizing);
+	testTableMultiThreads(2, 4, threadedSizing);
+	testTableMultiThreads(16, 4, threadedSizing);
+
+	printf("churn medium amount of random items, many times\n");
+	testTableMultiThreads(1, 2, threadedChurn);
+	testTableMultiThreads(2, 2, threadedChurn);
+	testTableMultiThreads(16, 2, threadedChurn);
+
+	printf("churn medium amount of random items, more random, many times\n");
+	testTableMultiThreads(1, 1, threadedChurn);
+	testTableMultiThreads(2, 1, threadedChurn);
+	testTableMultiThreads(16, 1, threadedChurn);
 
 	// many operations speed
 	//testSizingVar(2);
@@ -1201,6 +1217,8 @@ void runAtomicHashTableTest() {
 
 	//todonext
 	// Oh, test with multiple threads... obviously...
+
+	printf("Final allocation count %llu\n", SystemAllocationCount);
 }
 
 int main() {

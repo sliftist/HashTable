@@ -331,13 +331,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
     MoveStateInner* pMoveState = &curAlloc->moveState;
 
     uint64_t loops = 0;
-    uint64_t retries = 0;
-    uint64_t savedRetries = 0;
-    uint64_t lastRetryId = 0;
-    uint64_t lastLastRetryId = 0;
-    bool setDest = false;
-
-    MoveStateInner firstObservedState = *pMoveState;
 
     MoveStateInner moveState = { 0 };
     while(true) {
@@ -350,17 +343,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
         // #define IS_VALUE_MOVED(value) (value.isNull && value.valueForSet != BASE_NULL.valueForSet)
 
         // Move state is small enough that access are implicitly atomic (as it is 64 bits, and 64 bit aligned)
-        MoveStateInner prevMoveState = moveState;
         moveState = *pMoveState;
-        if(moveState.sourceIndex != prevMoveState.sourceIndex) {
-            if(lastRetryId) {
-                lastLastRetryId = lastRetryId;
-            }
-            savedRetries += retries;
-            retries = 0;
-            lastRetryId = 0;
-            setDest = false;
-        }
 
         if(moveState.sourceIndex >= curAlloc->slotsCount) {
             InsideReference* newAllocRef = (void*)((byte*)newAlloc - InsideReferenceSize);
@@ -397,8 +380,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
                         BASE_NULL2.valueForSet,
                         source.valueForSet
                     ) != source.valueForSet) {
-                        retries++;
-                        lastRetryId = 1;
                         continue;
                     }
                 } else if(source.valueForSet == BASE_NULL2.valueForSet) {
@@ -410,8 +391,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
                         BASE_NULL1.valueForSet,
                         source.valueForSet
                     ) != source.valueForSet) {
-                        retries++;
-                        lastRetryId = 2;
                         continue;
                     }
                 }
@@ -421,8 +400,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
                     // Freeze it, BEFORE we redirect it.
                     InsideReference* sourceRef = Reference_Acquire(pSource);
                     if(!sourceRef) {
-                        retries++;
-                        lastRetryId = 3;
                         continue;
                     }
                     if(!Reference_ReduceToZeroRefsAndSetIsNull(
@@ -434,8 +411,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
                         InsideReference* pTestCopy = (void*)testCopy;
                         IsInsideRefCorrupt(sourceRef);
                         Reference_Release(pSource, sourceRef);
-                        retries++;
-                        lastRetryId = 4;
                         continue;
                     }
                     IsInsideRefCorrupt(sourceRef);
@@ -526,7 +501,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
                         moveState.valueForSet
                     ) != moveState.valueForSet) {
 						forceRetry = true;
-                        lastRetryId = 11;
 						break;
                     }
                     moveState = newMoveState;
@@ -535,7 +509,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 index = (index + 1) % newAlloc->slotsCount;
                 if(index == baseIndex) {
                     forceRetry = true;
-                    lastRetryId = 5;
                     // We ran out of space while moving. This must be because everything has already finished moving, right?
                     
                     MoveStateInner moveState = *pMoveState;
@@ -552,7 +525,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
             }
             if(forceRetry) {
                 Reference_Release(&emptyReference, redirectedValue);
-                retries++;
                 continue;
             }
         }
@@ -602,11 +574,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
 
                 Reference_Release(&emptyReference, redirectedValue);
 
-                retries++;
-                lastRetryId = 6;
                 continue;
-            } else {
-                setDest = true;
             }
             IsInsideRefCorrupt(redirectedValue);
             Reference_Release(pDest, redirectedValue);
@@ -1066,7 +1034,6 @@ int atomicHashTable2_findFull(
 			MemPoolFixed_Free(&this->findValuePool, valuesFound);
 		}
         if(result == -1) {
-			// TODO: If we don't memset the allocation we can save a lot of time. Also, using a stack allocated buffer will probably be a lot faster.
             valuesFound = MemPoolFixed_Allocate(&this->findValuePool, sizeof(FindResult) * valuesFoundLimit, hash);
             continue;
         }

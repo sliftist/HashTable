@@ -1163,7 +1163,7 @@ void runRefCountTests() {
 
 
 void runAtomicHashTableTest() {
-	//*
+	/*
 	// TODO: Add a debug wrapper for malloc and free, so we can track the number of allocations, and run tests to make sure we don't leak allocations.
 	#ifdef DEBUG
 	IsSingleThreadedTest = true;
@@ -1183,7 +1183,9 @@ void runAtomicHashTableTest() {
 	//testSizingVar(4);
 
 
-	//*
+	testTableMultiThreads(2, 4, 1, threadedSizing);
+	
+	/*
 	testTableMultiThreads(1, 4, 1, threadedSizing);
 	testTableMultiThreads(2, 4, 1, threadedSizing);
 	testTableMultiThreads(1, 2, 1, threadedChurn);

@@ -151,7 +151,7 @@ void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPoint
 // Makes it so future Reference_Acquire calls that would return oldRef now return newRef (for all OutsideReferences).
 // If this is called multiple times on the same oldRef, the same newRef must be given, or else things will break.
 // Returns false if it didn't redirect, and newRef should be destroyed.
-void Reference_RedirectReferenceX(
+void Reference_RedirectReference(
     // Must be acquired first
     // If already redirected, fails and returns false.
     InsideReference* oldRef,
@@ -159,11 +159,8 @@ void Reference_RedirectReferenceX(
     //  Shouldn't be used after this. Instead acquire an outside reference with the old ref, which will
     //  give you the most updated redirected reference (which very well might not be this, as this
     //  redirect could fail).
-    InsideReference* newRef,
-    const char* file,
-    uint64_t line
+    InsideReference* newRef
 );
-#define Reference_RedirectReference(oldRef, newRef) Reference_RedirectReferenceX(oldRef, newRef, __FILE__, __LINE__)
 
 
 // pointer should be directly used inside of InsideReference. The only reason a raw pointer isn't returned is
@@ -175,8 +172,7 @@ void Reference_RedirectReferenceX(
 //  its pointer is always valid, so does not need to be null checked).
 //__forceinline InsideReference* Reference_Acquire(OutsideReference* ref);
 
-InsideReference* Reference_AcquireX(OutsideReference* pRef, const char* file, uint64_t line);
-#define Reference_Acquire(pRef) Reference_AcquireX(pRef, __FILE__, __LINE__)
+InsideReference* Reference_Acquire(OutsideReference* pRef);
 
 InsideReference* Reference_AcquireInside(OutsideReference* pRef);
 
@@ -184,8 +180,7 @@ InsideReference* Reference_AcquireInside(OutsideReference* pRef);
 // Does not follow redirections
 // Always makes its reference an inside reference
 //  - So it should be freed via Reference_Release(&emptyReference, insideRef);
-InsideReference* Reference_AcquireIfNullX(OutsideReference* ref, const char* file, uint64_t line);
-#define Reference_AcquireIfNull(ref) Reference_AcquireIfNullX(ref, __FILE__, __LINE__)
+InsideReference* Reference_AcquireIfNull(OutsideReference* ref);
 
 // Sometimes through null, sometimes if. Should only be called if you set outsideRef to null, and aren't expecting it
 //  to not come back from null, as we don't fully check for isNull inside here.
@@ -197,11 +192,7 @@ extern const OutsideReference emptyReference;
 
 // Outside reference may be knowingly wiped out, we will just ignore it and then release the inside reference.
 //  Always pass an outsideRef, even if you know it has been wiped out.
-void Reference_ReleaseX(OutsideReference* outsideRef, InsideReference* insideRef, const char* file, uint64_t line);
-#define Reference_Release(outsideRef, insideRef) Reference_ReleaseX(outsideRef, insideRef, __FILE__, __LINE__)
-
-// insideRef must be non-nullptr
-void Reference_ReleaseFast(OutsideReference* outsideRef, InsideReference* insideRef);
+void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef);
 
 
 // Destroys this outside ref to the inside ref (which if it is the last outside ref, and there are no more inside references, will result
@@ -223,15 +214,13 @@ bool Reference_ReplaceOutsideStealOutside(OutsideReference* pOutsideRef, InsideR
 //  and then access it by calling special functions which allow us to treat isNull values like regular references.
 bool Reference_ReduceToZeroRefsAndSetIsNull(OutsideReference* pOutsideRef, InsideReference* pInsideRef);
 
-#define Reference_CreateOutsideReference(insideRef) Reference_CreateOutsideReferenceX(insideRef, __FILE__, __LINE__)
-OutsideReference Reference_CreateOutsideReferenceX(InsideReference* insideRef, const char* file, uint64_t line);
+OutsideReference Reference_CreateOutsideReference(InsideReference* insideRef);
 
 void DestroyUniqueOutsideRef(OutsideReference* ref);
 
 // Must be passed a reference obtained as an inside reference
 // Frees the argument reference, and always returns a reference (so you only need to free the result).
-InsideReference* Reference_FollowRedirectsX(InsideReference* ref, const char* file, uint64_t line);
-#define Reference_FollowRedirects(ref) Reference_FollowRedirectsX(ref, __FILE__, __LINE__)
+InsideReference* Reference_FollowRedirects(InsideReference* ref);
 
 #ifdef DEBUG
 #define IsInsideRefCorrupt(pRef) IsInsideRefCorruptInner(pRef, false)

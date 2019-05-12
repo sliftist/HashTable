@@ -116,6 +116,7 @@ typedef struct {
     uint64_t searchLoops;
     #endif
 
+
 } AtomicHashTable2;
 #pragma pack(pop)
 

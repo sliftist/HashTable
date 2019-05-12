@@ -65,8 +65,6 @@ typedef struct {
 } DebugLineInfo;
 
 
-
-
 // When InsideReference reaches a count of 0, it should be freed (as this means nothing knows about it,
 //  and so if we don't free it now it will leak).
 #pragma pack(push, 1)
@@ -91,11 +89,14 @@ struct InsideReference {
     //  if a previous node has a nextRedirectValue pointing to them.
     OutsideReference prevRedirectValue;
 
+    #ifdef EVENT_ID_COUNT
     uint64_t nextEventIdIndex;
     DebugLineInfo eventIds[EVENT_ID_COUNT];
+    #endif
 };
 #pragma pack(pop)
 
+#ifdef EVENT_ID_COUNT
 void DebugLog(const char* file, uint64_t line, const char* operation, InsideReference* ref) {
     DebugLineInfo info = { 0 };
     info.file = file;
@@ -105,6 +106,9 @@ void DebugLog(const char* file, uint64_t line, const char* operation, InsideRefe
     uint64_t eventIndex = InterlockedIncrement64((LONG64*)&ref->nextEventIdIndex) - 1;
     ref->eventIds[eventIndex % EVENT_ID_COUNT] = info;
 }
+#else
+#define DebugLog(file, line, operation, ref) false
+#endif
 
 // I guess it can be more than 4 64 bit ints, but... the larger it is, the worse memory performance we get for hash tables
 //  with small items...

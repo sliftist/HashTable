@@ -381,8 +381,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
             return 0;
         }
 
-        bool endOfBlock = false;
-
         OutsideReference* pSource = &curAlloc->slots[moveState.sourceIndex].value;
         // Make sure curAlloc->slots[sourceIndex] is frozen, and marked as moved
         OutsideReference source = *pSource;
@@ -403,9 +401,8 @@ int atomicHashTable2_applyMoveTableOperationInner(
                         lastRetryId = 1;
                         continue;
                     }
-                    endOfBlock = true;
                 } else if(source.valueForSet == BASE_NULL2.valueForSet) {
-                    endOfBlock = true;
+
                 }
                 else if(source.valueForSet == BASE_NULL.valueForSet) {
                     if(InterlockedCompareExchange64(
@@ -472,6 +469,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
                         if(newAlloc->valuePool->countForSet.destructed) {
                             return 1;
                         }
+                        breakpoint();
                         return 3;
                     }
 
@@ -657,7 +655,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 }
             }
 
-            if(endOfBlock && countApplied > minApplyCount) {
+            if(countApplied > minApplyCount) {
                 // Not only is it the endOfBlock, but... because we replace it with BASE_NULL1, the original block in curAlloc will never
                 //  grow, so we will never move anything from this block to newAlloc again.
                 return 0;
@@ -677,7 +675,8 @@ int atomicHashTable2_removeInner2(
     uint64_t hash,
 	void* callbackContext,
 	bool(*callback)(void* callbackContext, void* value),
-    AtomicHashTableBase* table
+    AtomicHashTableBase* table,
+    AtomicHashTableBase* newTable
 ) {
     uint64_t index = getSlotBaseIndex(table, hash);
     uint64_t loopCount = 0;
@@ -688,34 +687,42 @@ int atomicHashTable2_removeInner2(
         OutsideReference* pValue = &table->slots[index].value;
         OutsideReference valueRef = *pValue;
 
-        if(IS_VALUE_MOVED(valueRef)) {
-            return 1;
-        }
-		if (IS_BLOCK_END(valueRef)) {
+        if (IS_BLOCK_END(valueRef)) {
 			return 0;
 		}
+		
         if(valueRef.valueForSet != BASE_NULL.valueForSet) {
-            InsideReference* ref = Reference_Acquire(pValue);
-            if(!ref) {
-                continue;
-            }
-            HashValue* value = Reference_GetValue(ref);
-            if(value->hash == hash) {
-                void* valueVoid = (byte*)value + sizeof(HashValue);
-                bool shouldRemove = callback(callbackContext, valueVoid);
-                if(shouldRemove) {
-                    bool destroyedRef = Reference_DestroyOutsideMakeNull(pValue, ref);
-                    if(!destroyedRef) {
-                        Reference_Release(pValue, ref);
-                        continue;
+            if(IS_VALUE_MOVED(valueRef)) {
+                if(newTable) {
+                    if(IS_FROZEN_POINTER(valueRef)) {
+                        RETURN_ON_ERROR(atomicHashTable2_applyMoveTableOperationInner(this, table, newTable));
                     }
-                    else {
-                        atomicHashTable2_updateReserved(this, table, &table->newAllocation, -1, 0);
-                        //printf("Removed %llu for %llu\n", index, hash);
+                } else {
+                    return 1;
+                }
+            } else {
+                InsideReference* ref = Reference_Acquire(pValue);
+                if(!ref) {
+                    continue;
+                }
+                HashValue* value = Reference_GetValue(ref);
+                if(value->hash == hash) {
+                    void* valueVoid = (byte*)value + sizeof(HashValue);
+                    bool shouldRemove = callback(callbackContext, valueVoid);
+                    if(shouldRemove) {
+                        bool destroyedRef = Reference_DestroyOutsideMakeNull(pValue, ref);
+                        if(!destroyedRef) {
+                            Reference_Release(pValue, ref);
+                            continue;
+                        }
+                        else {
+                            atomicHashTable2_updateReserved(this, table, &table->newAllocation, -1, 0);
+                            //printf("Removed %llu for %llu\n", index, hash);
+                        }
                     }
                 }
+                Reference_Release(pValue, ref);
             }
-            Reference_Release(pValue, ref);
         }
 
         index = (index + 1) % table->slotsCount;
@@ -742,7 +749,10 @@ int atomicHashTable2_removeInner(
     AtomicHashTableBase* table,
     AtomicHashTableBase* newTable
 ) {
-    int result = atomicHashTable2_removeInner2(this, hash, callbackContext, callback, table);
+    if(newTable) {
+        RETURN_ON_ERROR(atomicHashTable2_applyMoveTableOperationInner(this, table, newTable));
+    }
+    int result = atomicHashTable2_removeInner2(this, hash, callbackContext, callback, table, newTable);
     if(result > 1) {
         return result;
     }
@@ -753,13 +763,8 @@ int atomicHashTable2_removeInner(
     // (and of course, we always apply a move, even if the operation succeeded, because we want to finish up the move,
     //      as just the presense of newTable slows down every operation).
     if(newTable) {
-        int moveResult = atomicHashTable2_applyMoveTableOperationInner(this, table, newTable);
-        if(moveResult > 1) {
-            return moveResult;
-        }
-        if(result == 1) {
-            return atomicHashTable2_removeInner2(this, hash, callbackContext, callback, newTable);
-        }
+        // The previous removeInner only returns 1 if !newTable... so... we will never be clobbering result == 1 here.
+        result = atomicHashTable2_removeInner2(this, hash, callbackContext, callback, newTable, nullptr);
     }
     return result;
 }
@@ -923,12 +928,12 @@ int atomicHashTable2_findInner3(
     //  So this means, move first, and then check for IS_FROZEN_POINTER, moving if that is true.
     //      - This means... that we only do moves equals to the number of times we read an entry while someone else is moving it.
     //          Which I haven't been able to make a test case that triggers this often, so it will probably almost never happen?
+    // And also, change atomicHashTable2_applyMoveTableOperationInner to happen after we run for find/remove, and swallow
+    //  the error from it... giving us a chance to keep working when we run out of memory (also... maybe set an out of memory
+    //  flag which causes us to not call apply in find?)
 
     if(newTable) {
-        int moveResult = atomicHashTable2_applyMoveTableOperationInner(this, table, newTable);
-        if(moveResult > 0) {
-            return moveResult;
-        }
+        RETURN_ON_ERROR(atomicHashTable2_applyMoveTableOperationInner(this, table, newTable));
     }
 
     int result = atomicHashTable2_findInner4(this, table, valuesFound, pValuesFoundCur, pValuesFoundLimit, hash, newTable);
@@ -1121,6 +1126,7 @@ int AtomicHashTable2_insertInner2(
 					return 1;
                 }
                 atomicHashTable2_updateReservedUndo(this, table, -1, -1);
+                breakpoint();
                 return 3;
             }
             hashValue->hash = hash;
@@ -1172,27 +1178,17 @@ int AtomicHashTable2_insertInner(
     AtomicHashTableBase* table,
     AtomicHashTableBase* newTable
 ) {
-    // See atomicHashTable2_removeInner
-    //printf("First try insert for %llu\n", hash);
-    int result = AtomicHashTable2_insertInner2(this, hash, value, table);
-    if(result > 1) {
-        return result;
-    }
     if(newTable) {
-        int moveResult = atomicHashTable2_applyMoveTableOperationInner(this, table, newTable);
-        if(moveResult > 1) {
-            if(result == 0) {
-                // Unfortunately, we have to swallow the error here, as the operation succeeded, it was inserted,
-                //  so we need to return 0 to inform the caller it was inserted...
-                return 0;
-            }
-            return moveResult;
-        }
-        if(result == 1) {
-            return AtomicHashTable2_insertInner2(this, hash, value, newTable);
-        }
+        RETURN_ON_ERROR(atomicHashTable2_applyMoveTableOperationInner(this, table, newTable));
     }
-    return result;
+
+    // The simplest, obviously always try to insert in newTable. Why would we try to insert in an old table?
+
+    if(newTable) {
+        return AtomicHashTable2_insertInner2(this, hash, value, newTable);
+    } else {
+        return AtomicHashTable2_insertInner2(this, hash, value, table);
+    }
 }
 
 int AtomicHashTable2_insert(AtomicHashTable2* this, uint64_t hash, void* value) {

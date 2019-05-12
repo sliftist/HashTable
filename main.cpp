@@ -380,13 +380,16 @@ void testTableMultiThreads(
 uint64_t groupSum;
 uint64_t groupCount;
 uint64_t groupMax;
+uint64_t groupMax2;
 uint64_t tickSum;
 uint64_t tickCount;
 uint64_t tickMax;
+uint64_t tickMax2;
 void tickGroupStart() {
 	groupSum = 0;
 	groupCount = 0;
 	groupMax = 0;
+	groupMax2 = 0;
 }
 
 uint64_t tickStartTime = 0;
@@ -398,7 +401,12 @@ void tickEnd() {
 	uint64_t curTime = tickEndTime - tickStartTime;
 	groupSum += curTime;
 	groupCount++;
+	uint64_t prevGroupMax = groupMax;
 	groupMax = max(groupMax, curTime);
+	if(curTime != groupMax) {
+		groupMax2 = max(groupMax2, curTime);
+		groupMax2 = max(groupMax2, prevGroupMax);
+	}
 
 	if (curTime > 108915300) {
 		//breakpoint();
@@ -406,24 +414,32 @@ void tickEnd() {
 
 	tickSum += curTime;
 	tickCount++;
+	uint64_t prevTickMax = tickMax;
 	tickMax = max(tickMax, curTime);
+	if(curTime != tickMax) {
+		tickMax2 = max(tickMax2, curTime);
+		tickMax2 = max(tickMax2, prevTickMax);
+	}
 }
 void printPercentTick(const char* tickName, AtomicHashTable2& table, double fraction) {
 	uint64_t count = DebugAtomicHashTable2_reservedSize(&table);
 	uint64_t maxCount = DebugAtomicHashTable2_allocationSize(&table);
-	printf("%s at %f%% %llu/%llu, %llu time %f%% of all, %llu average time, %f%% average of all, max %fX average, %f%% tick max of worst max, worst %f%%\n",
+	printf("%s at %f%% %llu/%llu, %llu time %f%% of all, %llu average time, %llu average time - max, %f%% average of all, max %fX average, %f%% tick max of worst 2nd max, %f%% tick 2nd max of worst 2nd max, worst %f%%\n",
 		tickName, fraction * 100, count, maxCount,
 		tickSum,
 		(double)tickSum / groupSum * 100,
 		tickSum / tickCount,
+		(tickSum - tickMax) / max(1, tickCount - 1),
 		(double)(tickSum / tickCount) / (groupSum / groupCount) * 100,
 		(double)tickMax / (tickSum / tickCount),
 		(double)tickMax / groupMax * 100,
+		(double)tickMax2 / groupMax2 * 100,
 		(double)tickMax / tickSum * 100
 	);
 	tickSum = 0;
 	tickCount = 0;
 	tickMax = 0;
+	tickMax2 = 0;
 }
 
 
@@ -437,7 +453,7 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 		#ifdef DEBUG
 		repeatCount = 100;
 		#else 
-		repeatCount = 10000;
+		repeatCount = 1000;
 		#endif
 	}
 
@@ -460,10 +476,11 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 	else if(variation == 2) {
 		//itemCount = (1ll << 23);
 		// Requires 64GB of memory to work, but after struggling at lot at 64GB, it will free ~20GB, then the remaining ~60GB when it finishes
+		//	EDIT: Changed to only use 32GB
 		#ifdef DEBUG
 		itemCount = (1ll << 18);
 		#else
-		itemCount = (1ll << 26);
+		itemCount = (1ll << 23);
 		#endif
 	}
 	else if(variation == 3) {
@@ -649,6 +666,7 @@ void testSizingVar(int variation) {
 
 void testSizing() {
 	testSizingVar(0);
+	// Get speed tests
 	testSizingVar(1);
 	testSizingVar(3);
 
@@ -1164,10 +1182,20 @@ void runAtomicHashTableTest() {
 	//testHashChurn2Var(2);
 	//testSizingVar(4);
 
+
+	//*
+	testTableMultiThreads(1, 4, 1, threadedSizing);
 	testTableMultiThreads(2, 4, 1, threadedSizing);
+	testTableMultiThreads(1, 2, 1, threadedChurn);
 	testTableMultiThreads(2, 2, 1, threadedChurn);
 	testTableMultiThreads(16, 4, 1, threadedSizing);
 	testTableMultiThreads(16, 2, 1, threadedChurn);
+	//*/
+
+	// many operations speed
+	//testSizingVar(2);
+	// get speed
+	//testSizingVar(1);
 
 	//todonext
 	// Oh, test with multiple threads... obviously...

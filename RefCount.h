@@ -41,8 +41,13 @@ extern "C" {
 struct InsideReference;
 typedef struct InsideReference InsideReference;
 //#define InsideReferenceSize 32
-#define EVENT_ID_COUNT 1
+//#define EVENT_ID_COUNT 1
+
+#ifdef EVENT_ID_COUNT
 #define InsideReferenceSize (32 + EVENT_ID_COUNT * 4 * 8 + 8)
+#else
+#define InsideReferenceSize 32
+#endif
 
 #ifdef DEBUG
 extern bool IsSingleThreadedTest;

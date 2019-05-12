@@ -636,8 +636,19 @@ InsideReference* Reference_AcquireInternal(OutsideReference* pRef, bool redirect
     //  chain leaks, so we can free all references except the original leaked one.
     // And, change Reference_HasBeenRedirected to just check for links instead, as any reference
     //  that has a link is either moved from the original location, or in the process of moving.
+    //todonext
+    // Oh, and really it is always just linking a new reference to not destruct until an old reference
+    //  destructs. So... it should be something like:
+    // Reference_WaitForOldToDestruct
+    // Reference_SharedWithOld
+    // Reference_DependsOnOld
+    // Reference_PointersMovedToNewRef
+    // Reference_ExternalLinkPointers
 
+    /*
     if(redirect && ref->nextRedirectValue.valueForSet) {
+        // This shouldn't be called anymore?
+        //OnError(3);
         InsideReference* newRef = referenceAcquire(&ref->nextRedirectValue, file, line);
         OutsideReference newOutsideRef = Reference_CreateOutsideReferenceX(newRef, file, line);
         // Replacing pRef is required, otherwise they can't acquire the reference and destroy the outside source,
@@ -657,6 +668,7 @@ InsideReference* Reference_AcquireInternal(OutsideReference* pRef, bool redirect
         // And now that we updated pRef, try again, with the new deeper value.
         return referenceAcquire(pRef, file, line);
     }
+    */
 
     //printf("acquired reference A %p, for %s:%llu, have %llu\n", ref, file, line, ref->count);
     return ref;

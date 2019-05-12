@@ -1163,9 +1163,10 @@ void runAtomicHashTableTest() {
 	//testTableMultiThreads(4, 1, 1, threadedChurn);
 	//testHashChurn2Var(2);
 	//testSizingVar(4);
-	testTableMultiThreads(16, 4, 1, threadedSizing);
+
 	testTableMultiThreads(2, 4, 1, threadedSizing);
 	testTableMultiThreads(2, 2, 1, threadedChurn);
+	testTableMultiThreads(16, 4, 1, threadedSizing);
 	testTableMultiThreads(16, 2, 1, threadedChurn);
 
 	//todonext

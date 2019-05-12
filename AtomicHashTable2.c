@@ -460,7 +460,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 // Maybe... instead of this weird stuff, just call a function to explicitly follow redirections. Which we will call before
                 //  and after we redirect.
 
-                if(MemPoolHashed_IsInPool(curAlloc->valuePool, sourceRef)) {
+                if(!Reference_HasBeenRedirected(sourceRef)) {
                     HashValue* value = Reference_GetValue(sourceRef);
                     OutsideReference newValueRef = { 0 };
                     HashValue* newValue = nullptr;
@@ -490,8 +490,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
                         newValueRefInside);
                     Reference_DestroyOutside(&newValueRef, newValueRefInside);
                     Reference_Release(&emptyReference, newValueRefInside);
-                } else {
-                    printf("not in pool\n");
                 }
 
                 redirectedValue = Reference_FollowRedirects(sourceRef);

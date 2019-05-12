@@ -584,19 +584,12 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 //  when destIndex has already been set and inserted... which is fine, because the next loop will see that
                 //  it has been inserted (and it can't get deleted, as before deletions happen in newAlloc atomicHashTable2_applyMoveTableOperationInner
                 //  has to be called, which will run this code again, making the move finalize first).
-                // AND operations only access newAlloc WHEN they see a move is inside (or after) the block they want to in curAlloc, which
-                //  means either they access curAlloc completely, or they make sure the entire block they want to access in curAlloc (that
-                //  we might be moving), is moved... which means, anything we might be moving will be fully moved before a delete deletes it...
+                // AND when operation see we are moving, they help with the move, so nothing will ever be hung up in a move.
 
                 OutsideReference newDest = *pDest;
                 if(!FAST_CHECK_POINTER(newDest, redirectedValue)) {
                     MoveStateInner curMoveState = *pMoveState;
                     if(curMoveState.sourceIndex == moveState.sourceIndex) {
-                        // So actually... doesn't that mean in this case destIndex can't be deleted out, and actually it must have been inserted?
-                        //  So this should be impossible...
-                        // Also, shouldn't it be impossible to insert here without running move too? Cause that is the other case this could happen, if
-                        //  an insert happens to that slot before we can do our insert...
-                        breakpoint();
                         MoveStateInner newMoveState = moveState;
                         newMoveState.destIndex = UINT32_MAX;
                         InterlockedCompareExchange64(

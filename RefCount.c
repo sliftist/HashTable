@@ -326,7 +326,7 @@ void Reference_RedirectReference(
     }
 
 	// Update all previous values to point to the new head
-    InsideReference* prevToRedirect = Reference_Acquire(&oldRef->prevRedirectValue);
+    InsideReference* prevToRedirect = Reference_AcquireInside(&oldRef->prevRedirectValue);
 	while (prevToRedirect) {
 		#ifdef DEBUG
 		if (IsSingleThreadedTest) {
@@ -352,7 +352,7 @@ void Reference_RedirectReference(
         //printf("update redirect of %p(%llu) to %p(%llu)\n", prevToRedirect, prevToRedirect->count, newRef, newRef->count);        
 
 		InsideReference* prevToRedirectPrev = prevToRedirect;
-		prevToRedirect = Reference_Acquire(&prevToRedirectPrev->prevRedirectValue);
+		prevToRedirect = Reference_AcquireInside(&prevToRedirectPrev->prevRedirectValue);
         // Eventually prevToRedirect will be nullptr, and this will release the final prevToRedirect
 		releaseInsideReference(prevToRedirectPrev);
 	}
@@ -457,7 +457,7 @@ bool releaseInsideReference(InsideReference* insideRef) {
 
         InsideReference* prevNode = nullptr;
         {
-            prevNode = Reference_Acquire(&insideRef->prevRedirectValue);
+            prevNode = Reference_AcquireInside(&insideRef->prevRedirectValue);
             if(prevNode) {
                 if(!setDestructValue(prevNode)) {
                     unsetDestructValue(prevNode);
@@ -468,6 +468,8 @@ bool releaseInsideReference(InsideReference* insideRef) {
 
         InsideReference* nextNode = nullptr;
         {
+            // Get the actual next most node, which may require following a few nodes, as we always want to point to the
+            //  next most node
             InsideReference* searchNode = Reference_FollowRedirects(Reference_AcquireInside(&insideRef->nextRedirectValue));
             while(searchNode) {
                 if(FAST_CHECK_POINTER(searchNode->prevRedirectValue, insideRef)) {

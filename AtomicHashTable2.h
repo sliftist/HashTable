@@ -20,13 +20,6 @@ extern "C" {
 //  much more likely for our retry loops to hit their limits. So... we should add some kind of minimum slot count?
 //  Or... something...
 
-#pragma pack(push, 1)
-typedef struct {
-    uint64_t hash;
-
-    // After the end is filled with the value
-} HashValue;
-#pragma pack(pop)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -53,7 +46,6 @@ typedef struct {
 } MoveStateInner;
 #pragma pack(pop)
 CASSERT(sizeof(MoveStateInner) == 8);
-
 
 
 
@@ -94,7 +86,6 @@ typedef __declspec(align(16)) struct {
 #define AtomicHashTableDefault(VALUE_SIZE, deleteValue) { \
     MemPoolFixedDefault(), \
     VALUE_SIZE,\
-    VALUE_SIZE + sizeof(HashValue), \
     deleteValue, \
 }
 #pragma pack(push, 1)
@@ -103,7 +94,6 @@ typedef struct {
 
     // (in bytes)
     uint64_t VALUE_SIZE;
-    uint64_t HASH_VALUE_SIZE;
 
     void (*deleteValue)(void* value);
 
@@ -187,7 +177,7 @@ __forceinline bool atomicHashTable2_fastNotContains(
                     //	allocation, so this is safe. We only really need to acquire the reference IF the user has pointers inside
                     //	the structure, and wants to dereference them (in which case we need to make sure deletes don't happen in other allocations
                     //	while are are accessing it here).
-                    uint64_t quickHash = ((HashValue*)((byte*)value.pointerClipped + InsideReferenceSize))->hash;
+                    uint64_t quickHash = Reference_GetHash((InsideReference*)value.pointerClipped);
                     if(quickHash == hash) {
 						Reference_ReleaseFast(&self->currentAllocation, tableRef);
                         return 0;

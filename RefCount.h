@@ -44,9 +44,9 @@ typedef struct InsideReference InsideReference;
 //#define EVENT_ID_COUNT 1
 
 #ifdef EVENT_ID_COUNT
-#define InsideReferenceSize (32 + EVENT_ID_COUNT * 4 * 8 + 8)
+#define InsideReferenceSize (24 + EVENT_ID_COUNT * 4 * 8 + 8)
 #else
-#define InsideReferenceSize (32 + 16)
+#define InsideReferenceSize (sizeof(InsideReference))
 #endif
 
 #ifdef DEBUG
@@ -125,31 +125,49 @@ void* Reference_GetValue(InsideReference* ref);
 // Assumes ref isn't NULL
 #define Reference_GetValueFast(ref) ((void*)((byte*)(ref) + InsideReferenceSize))
 
-bool Reference_HasBeenRedirected(InsideReference* ref);
+// Only really relevant in the free mempool callback. Returns true if the reference has been moved
+//  with Reference_AcquireStartMove, etc.
+// OH! And Find also wants this, so it can see if any values it stored may be moved, and so may be duplicates...
+//  - Delete doesn't need this though, as if it can remove a value before it becomes frozen, that value is gone
+//  - And insert doesn't, as if it can insert before a freeze, the value is there, and will be moved in necessary
+bool Reference_HasBeenMoved(InsideReference* ref);
 
 
 
-// Of course the memory OutsideReference is stored in must be guaranteed to exist, however reuse of the memory for other
-//  OutsideReferences is allowed (however you better not store arbitrary memory there).
+// Of course the memory OutsideReference is stored in must be guaranteed to exist, and the reuse of the memory for other
+//  OutsideReferences is allowed, but you better not store arbitrary other memory there.
 
 // (May set outPointer to nullptr if the allocation fails)
 //void Reference_Allocate(uint64_t size, OutsideReference* outRef, void** outPointer);
 void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPointer, uint64_t size, uint64_t hash);
 
-// Makes it so future Reference_Acquire calls that would return oldRef now return newRef (for all OutsideReferences).
-// If this is called multiple times on the same oldRef, the same newRef must be given, or else things will break.
-// Returns false if it didn't redirect, and newRef should be destroyed.
-bool Reference_RedirectReference(
-    // Must be acquired first
-    // If already redirected, fails and returns false.
-    InsideReference* oldRef,
-    // Allocated normally, and having the value, pool, etc, set as desired.
-    // Must be uniquely held by the caller
-    //  Shouldn't be used after this. Instead acquire an outside reference with the old ref, which will
-    //  give you the most updated redirected reference (which very well might not be this, as this
-    //  redirect could fail).
-    InsideReference* newRef
-);
+uint64_t Reference_GetHash(InsideReference* ref);
+
+
+InsideReference* Reference_AcquireCheckIsMoved(OutsideReference* ref, bool* outIsMoved, bool* outIsFrozen);
+
+// Freezes ref, so future Reference_AcquireCheckIsMoved calls will return nullptr, but true for outIsMoved
+//  (and so future Reference_Acquire calls will throw, as anything that is moved shouldn't be called with Reference_Acquire),
+//  and returns a value that is allocated in newPool, and suitable for Reference_CopyIntoZero.
+// (and of course, returns nullptr if ref didn't have a value to begin with, but still freezes it).
+// - Sets isCommittedToMove inside the newRef, as this is the only way a frozen outside
+//      reference can be destroyed (or should be), and so isCommittedToMove should matter before
+//      this, but after this it may be destructed, so knowing if it moved is important.
+int Reference_AcquireStartMove(OutsideReference* ref, MemPool* newPool, uint64_t size, InsideReference** outNewRef);
+
+
+// Copies newRef into the target (making a new outside reference), if the target is 0.
+//  Returns true if it copied OR if it found a value from the same Reference_AcquireStartMove
+//  in that spot, as in both cases it is effectively copied.
+// (returns false if the target wasn't 0, and so the caller needs to keep searching for a free target)
+bool Reference_CopyIntoZero(OutsideReference* target, InsideReference* newRef);
+
+// Called after Reference_AcquireStartMove and Reference_CopyIntoZero on the original ref,
+//  destroying it (returning the InsideReference* of the reference that was destroyed, or nullptr
+//  if there was no reference to destroy).
+// Returns true if it destroyed an outside reference.
+bool Reference_FinishMove(OutsideReference* outsideRef);
+
 
 
 // pointer should be directly used inside of InsideReference. The only reason a raw pointer isn't returned is
@@ -184,14 +202,7 @@ __forceinline InsideReference* Reference_AcquireFast(OutsideReference* pRef) {
 
 InsideReference* Reference_AcquireInside(OutsideReference* pRef);
 
-// Acquires the reference if isNull is set
-// Always makes its reference an inside reference
-//  - So it should be freed via Reference_Release(&emptyReference, insideRef);
-InsideReference* Reference_AcquireIfNull(OutsideReference* ref);
 
-// Sometimes through null, sometimes if. Should only be called if you set outsideRef to null, and aren't expecting it
-//  to not come back from null, as we don't fully check for isNull inside here.
-bool Reference_DestroyThroughNull(OutsideReference* outsideRef, OutsideReference newNullValue);
 
 
 // Must be passed if a Reference_Release call is freeing a reference count it knows has been moved to the inside reference.
@@ -199,7 +210,8 @@ extern const OutsideReference emptyReference;
 
 // Outside reference may be knowingly wiped out, we will just ignore it and then release the inside reference.
 //  Always pass an outsideRef, even if you know it has been wiped out.
-void Reference_Release(OutsideReference* outsideRef, InsideReference* insideRef);
+#define Reference_Release(outsideRef, insideRef) Reference_ReleaseX(outsideRef, insideRef, __FILE__, __LINE__)
+void Reference_ReleaseX(OutsideReference* outsideRef, InsideReference* insideRef, const char* file, uint64_t line);
 
 // InsideRef must not be null
 __forceinline void Reference_ReleaseFast(OutsideReference* outsideRef, InsideReference* insideRef) {
@@ -228,7 +240,9 @@ __forceinline void Reference_ReleaseFast(OutsideReference* outsideRef, InsideRef
 //  in the inside ref being freed).
 // Must have an inside reference to be called, but does not free inside reference
 //  returns true on success
-bool Reference_DestroyOutside(OutsideReference* outsideRef, InsideReference* insideRef);
+bool Reference_DestroyOutsideX(OutsideReference* outsideRef, InsideReference* insideRef, const char* file, uint64_t line);
+#define Reference_DestroyOutside(outsideRef, insideRef) Reference_DestroyOutsideX(outsideRef, insideRef, __FILE__, __LINE__)
+
 // Makes the outsideRef BASE_NULL after it destroys it, instead of 0
 //  returns true on success
 bool Reference_DestroyOutsideMakeNull(OutsideReference* outsideRef, InsideReference* insideRef);
@@ -236,7 +250,8 @@ bool Reference_DestroyOutsideMakeNull(OutsideReference* outsideRef, InsideRefere
 bool Reference_DestroyOutsideMakeNull1(OutsideReference* pOutsideRef, InsideReference* pInsideRef);
 
 //  returns true on success
-bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef);
+bool Reference_ReplaceOutsideX(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef, const char* file, uint64_t line);
+#define Reference_ReplaceOutside(pOutsideRef, pInsideRef, newOutsideRef) Reference_ReplaceOutsideX(pOutsideRef, pInsideRef, newOutsideRef, __FILE__, __LINE__)
 
 // We need this in one specific place... It is used when moving to basically freeze the reference,
 //  and then access it by calling special functions which allow us to treat isNull values like regular references.
@@ -263,6 +278,30 @@ bool IsInsideRefCorruptInner(InsideReference* pRef, bool allowFreed);
 bool IsOutsideRefCorruptInner(OutsideReference ref);
 
 
+
+void DebugLog2(const char* operation, InsideReference* ref, const char* file, uint64_t line);
+
+
+typedef struct { union {
+    struct {
+        uint64_t count: 43;
+        #define OUTSIDE_COUNT_BIT_INDEX (43)
+        #define OUTSIDE_COUNT_1 (1ull << OUTSIDE_COUNT_BIT_INDEX)
+        uint64_t outsideCount: 20;
+        uint64_t isCommittedToMove: 1;
+    };
+    uint64_t valueForSet;
+}; } InsideReferenceCount;
+
+
+typedef struct {
+    InsideReferenceCount state;
+    const char* operation;
+    uint64_t line;
+    const char* file;
+} DebugLineInfo;
+
+
 // When InsideReference reaches a count of 0, it should be freed (as this means nothing knows about it,
 //  and so if we don't free it now it will leak).
 #pragma pack(push, 1)
@@ -273,47 +312,26 @@ struct InsideReference {
             #define OUTSIDE_COUNT_BIT_INDEX (43)
             #define OUTSIDE_COUNT_1 (1ull << OUTSIDE_COUNT_BIT_INDEX)
             uint64_t outsideCount: 20;
-            uint64_t destructStarted: 1;
+            // Means the value has been moved, which is something the destructor
+            //  callbacks likely want to know...
+            uint64_t isCommittedToMove: 1;
         };
-        uint64_t countFullValue;
+        uint64_t valueForSet;
     };
 
     MemPool* pool;
 
-    // This is used with redirects.
-    //  Is updated in the whole list when more redirects happen.
-    OutsideReference nextRedirectValue;
-
-    todonext
-    // Actually... first of all, when freezing a value, we should set a value in the InsideReference
-    //  stating it is frozen, which is what will be checked for instead of redirects?
-    //  - Oh... and... because we set it on the source, if it doesn't get unset, it just forces find to finish
-    //      a move before reading that value, so it can get into new values that don't have it set. So it
-    //      can be unset uniquely.
-
-    // Then, we should add a uniqueId field in each inside reference, that uniquely identifies its value
-    // Then we want to make a new "AllocateAsCopy", which allocates, copies but keeps the unique id the same
-    // Then when iterating we want something to check if a spot is 0 OR if it has a value and the underlying value
-    //  has the same uniqueId as that thing we are trying to insert
-    //  - Oh... and can we also insert it right away?
-    //  - Yes, and this can also insert it, so it will either insert, continue, or know that the insertion already happened.
-    //      - It can work on inside references, making the outside reference itself, that way the caller can always
-    //          just free its inside reference, regardless of the outcome.
-    //  - And then... we don't need destIndex anymore...
-    //  - And also... we won't need nextRedirectValue or prevRedirectValue...
-
-
-    // This is used when destructing. This let's us remove ourself from the redirect chain,
-    //  but letting us iteration back to find which reference has reference (via a nextRedirectValue) to us (if any).
-    OutsideReference prevRedirectValue;
+    uint64_t hash;
 
     const char* file;
     uint64_t line;
 
-    #ifdef EVENT_ID_COUNT
-    uint64_t nextEventIdIndex;
-    DebugLineInfo eventIds[EVENT_ID_COUNT];
-    #endif
+    #define EVENT_ID_COUNT 100
+    uint64_t nextEventIndex;
+    DebugLineInfo events[EVENT_ID_COUNT];
+
+    InsideReference* unsafeSource;
+
 };
 #pragma pack(pop)
 

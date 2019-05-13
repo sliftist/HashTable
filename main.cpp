@@ -748,6 +748,7 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 			//_CrtCheckMemory();
 			testAdd2(table, item.a, item.b, item.c);
 			//_CrtCheckMemory();
+			
 			uint64_t count = testGetCount2(table, item.a, item.b);
 			if (count != 1) {
 				uint64_t count2 = testGetCount2(table, item.a, item.b);
@@ -1178,8 +1179,11 @@ void runRefCountTests() {
 
 
 void runAtomicHashTableTest() {
+	testTableMultiThreads(2, 4, threadedSizing);
+	//testHashChurn2Var(2);
+
 	//*
-	testSizingVar(1);
+	//testSizingVar(1);
 
 	// TODO: Add a debug wrapper for malloc and free, so we can track the number of allocations, and run tests to make sure we don't leak allocations.
 	#ifdef DEBUG

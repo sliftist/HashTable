@@ -43,10 +43,10 @@ typedef struct InsideReference InsideReference;
 //#define InsideReferenceSize 32
 //#define EVENT_ID_COUNT 1
 
-#ifdef EVENT_ID_COUNT
-#define InsideReferenceSize (24 + EVENT_ID_COUNT * 4 * 8 + 8)
-#else
+#ifdef DEBUG_INSIDE_REFERENCES
 #define InsideReferenceSize (sizeof(InsideReference))
+#else
+#define InsideReferenceSize (24)
 #endif
 
 #ifdef DEBUG
@@ -278,9 +278,11 @@ bool IsInsideRefCorruptInner(InsideReference* pRef, bool allowFreed);
 bool IsOutsideRefCorruptInner(OutsideReference ref);
 
 
-
+#ifdef DEBUG_INSIDE_REFERENCES
 void DebugLog2(const char* operation, InsideReference* ref, const char* file, uint64_t line);
-
+#else
+#define DebugLog2(operation, ref, file, line) false
+#endif
 
 typedef struct { union {
     struct {
@@ -301,6 +303,8 @@ typedef struct {
     const char* file;
 } DebugLineInfo;
 
+
+// struct InsideReference really be inside RefCount.c, so it is hidden, but for debugging it was a lot easier to bring it out...
 
 // When InsideReference reaches a count of 0, it should be freed (as this means nothing knows about it,
 //  and so if we don't free it now it will leak).
@@ -323,6 +327,8 @@ struct InsideReference {
 
     uint64_t hash;
 
+    #ifdef DEBUG_INSIDE_REFERENCES
+
     const char* file;
     uint64_t line;
 
@@ -331,6 +337,7 @@ struct InsideReference {
     DebugLineInfo events[EVENT_ID_COUNT];
 
     InsideReference* unsafeSource;
+    #endif
 
 };
 #pragma pack(pop)

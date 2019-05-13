@@ -31,10 +31,10 @@ uint64_t log2RoundDown(uint64_t v) {
 uint64_t minSlotCount(AtomicHashTable2* this) {
     uint64_t sizePerCount = SIZE_PER_COUNT(this);
     
-    #define TARGET_PAGES 1
-    #ifdef EVENT_ID_COUNT
-    #undef TARGET_PAGES
+    #ifdef DEBUG_INSIDE_REFERENCES
     #define TARGET_PAGES EVENT_ID_COUNT
+    #else
+    #define TARGET_PAGES 1
     #endif
 
     uint64_t minCount = (PAGE_SIZE * TARGET_PAGES - sizeof(AtomicHashTableBase) - InsideReferenceSize - sizeof(MemPoolHashed)) / sizePerCount;
@@ -248,12 +248,12 @@ int atomicHashTable2_updateReserved(
         newAllocation.valueForSet,
         0
     ) != 0) {
-        printf("failed to add %p\n", newTableRef);
+        //printf("failed to add %p\n", newTableRef);
         MemPoolHashed_Destruct(newTable->valuePool);
         DestroyUniqueOutsideRef(&newAllocation);
         return 1;
     }
-    printf("starting new move size %llu to %llu, using %llu, saw using %llu\n", curAlloc ? curAlloc->slotsCount : 0, newTable->slotsCount, curAlloc ? curAlloc->slotsReserved : 0, slotsReservedNoNulls);
+    //printf("starting new move size %llu to %llu, using %llu, saw using %llu\n", curAlloc ? curAlloc->slotsCount : 0, newTable->slotsCount, curAlloc ? curAlloc->slotsReserved : 0, slotsReservedNoNulls);
     return 0;
 }
 
@@ -320,13 +320,10 @@ int atomicHashTable2_applyMoveTableOperationInner(
         }
 
         OutsideReference* pSource = &curAlloc->slots[moveState.sourceIndex].value;
-        OutsideReference source = *pSource;
         // Make sure curAlloc->slots[sourceIndex] is frozen, and marked as moved
 
         InsideReference* newRef = nullptr;
         int result = Reference_AcquireStartMove(pSource, (MemPool*)newAlloc->valuePool, this->VALUE_SIZE, &newRef);
-        OutsideReference sourceAfter = *pSource;
-        InsideReference* newRef2 = newRef;
         
         if(result > 0) {
             if(result == 3) {
@@ -415,10 +412,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 continue;
             }
 
-            OutsideReference newDest;
-            DebugLog2("creating copy for dest", newRef, __FILE__, (uint64_t)&newDest);
-            newDest = Reference_CreateOutsideReference(newRef);
-            DebugLog2("created copy for dest", newRef, __FILE__, (uint64_t)&newDest);
+            OutsideReference newDest = Reference_CreateOutsideReference(newRef);
 
             InterlockedIncrement64(&newAlloc->slotsReserved);
             InterlockedIncrement64(&newAlloc->slotsReservedWithNulls);
@@ -428,57 +422,16 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 newDest.valueForSet,
                 0
             );
-            if(prevDest.valueForSet == 0) {
-                DebugLog2("copy for dest put in table", newRef, __FILE__, (uint64_t)&newDest);
-                // A allocates it in newAlloc before B sees it
-                // B sees ref is moved, and then picks that up
-                // B set it in dest
-                // A picks it back up, sees it is in dest, and then finishes the move
-                // But... for some reason, when A finishes the move, and removes it from the source, it still has
-                //  some outside reference trailing...
-
-                // But then... the issue is that the finishMove with it as a source doesn't happen?
-
-                DebugLog2("set in source", newRef, __FILE__, source.pointerClipped);
-                if(sourceAfter.pointerClipped) {
-                    DebugLog2("set in dest (sourceAfter)", (InsideReference*)sourceAfter.pointerClipped, __FILE__, (uint64_t)newRef);
-                }
-                if(source.pointerClipped) {
-                    DebugLog2("set in dest", (InsideReference*)source.pointerClipped, __FILE__, (uint64_t)newRef);
-                } else {
-                    // How isn't this gettting hit? And the one we are leaking, doesn't have a set in dest. But the loop...
-                    breakpoint();
-                }
-            }
             // If it isn't newRef, either someone took or spot, or we inserted, increased sourceIndex, and removed the original source
             //  (in which case the rollback code will just fail and we will continue).
             if(prevDest.valueForSet != 0) {
-                InsideReference* ref = source.pointerClipped;
-                InsideReference before = { 0 };
-                if(ref) {
-                    before = *ref;
-                }
-                // Dangerous, but I have to know what is leaking...
-                if(ref->outsideCount > 1) {
-                    //breakpoint();
-                }
-
                 if(!Reference_DestroyOutside(&newDest, newRef)) {
                     OnError(3);
                 }
-
-                DebugLog2("destroyed copy for dest", newRef, __FILE__, (uint64_t)&newDest);
-
-                
-
                 IsInsideRefCorrupt(newRef);
                 if(FAST_CHECK_POINTER(prevDest, newRef)) {
                     // Just retry, so we can catch it in the destIndex search loop
                     Reference_Release(&emptyReference, newRef);
-                    if(ref->outsideCount > 0) {
-                        // Unlikely, it was moved, but not yet freed from source?
-                        //breakpoint();
-                    }
                     continue;
                 }
                 else {
@@ -498,17 +451,11 @@ int atomicHashTable2_applyMoveTableOperationInner(
                     if(curMoveState.sourceIndex == moveState.sourceIndex) {
                         MoveStateInner newMoveState = moveState;
                         newMoveState.destIndex = UINT32_MAX;
-                        if(InterlockedCompareExchange64(
+                        InterlockedCompareExchange64(
                             (LONG64*)pMoveState,
                             newMoveState.valueForSet,
                             moveState.valueForSet
-                        ) == moveState.valueForSet) {
-                            printf("rolled back move from %d to %d\n", moveState.sourceIndex, moveState.destIndex);
-                        } else {
-                            printf("failed to roll back move from %d to %d\n", moveState.sourceIndex, moveState.destIndex);
-                        }
-                    } else {
-                        printf("to far behind for insert from %d to %d\n", moveState.sourceIndex, moveState.destIndex);
+                        );
                     }
 
                     Reference_Release(&emptyReference, newRef);
@@ -528,44 +475,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
             newMoveState.valueForSet,
             moveState.valueForSet
         ) == moveState.valueForSet) {
-            
-            //DebugLog2("finished move into", newRef, __FILE__, source.pointerClipped);
-            //DebugLog2("finished move into2", newRef2, __FILE__, source.pointerClipped);
-            //printf("finished move from %d to %d\n", moveState.sourceIndex, moveState.destIndex);
-            InsideReference* ref = source.pointerClipped;
-            InsideReference before = { 0 };
-            if(ref) {
-                before = *ref;
-            }
-            //todonext
-            // Wait, so... we reach a valid value for 
-
-            //todonext
-            // So... the thread that moves us into our dest, it doesn't know our source. So then...
-            //  I guess when we get copied and moved, the thread that needs to destroy the original...
-            //  probably doesn't know the source either.
-
-            if(newRef) {
-                DebugLog2("before deleted from source", newRef->unsafeSource, __FILE__, (uint64_t)newRef);
-            }
             if(Reference_FinishMove(pSource)) {   
-                if(newRef) {
-                    DebugLog2("deleted from source", newRef->unsafeSource, __FILE__, (uint64_t)newRef);
-                }
-                //todonext
-                // So... leaks seem to happen when someone else does the inserting, but we
-                //  increase sourceIndex.
-
-                // Dangerous, but I have to know what is leaking...
-                //if(ref != newRef && ref->outsideCount > 0) {
-                if(newRef && newRef->unsafeSource->outsideCount > 0) {
-                    // So, newRef was set to null because someone else moved it, but we finished the move.
-                    //breakpoint();
-                    //Reference_AcquireStartMove(&source, (MemPool*)newAlloc->valuePool, this->VALUE_SIZE, &newRef);
-                } else {
-                    int here = 0;
-                    here;
-                }
                 InterlockedDecrement64((LONG64*)&curAlloc->slotsReserved);
             }
             countApplied++;

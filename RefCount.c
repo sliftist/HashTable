@@ -30,17 +30,11 @@
 
 const OutsideReference emptyReference = { 0 };
 
-
-
 // Anyone with InsideReference*, should either have a count incremented in the reference count,
 //  or an OutsideReference that points to that InsideReference*.
 
 
-
-
-
-
-#ifdef EVENT_ID_COUNT
+#ifdef DEBUG_INSIDE_REFERENCES
 #define DebugLog(operation, ref) DebugLog2(operation, ref, __FILE__, __LINE__)
 void DebugLog2(const char* operation, InsideReference* ref, const char* file, uint64_t line) {
 	if (!ref) return;
@@ -53,7 +47,8 @@ void DebugLog2(const char* operation, InsideReference* ref, const char* file, ui
     ref->events[eventIndex % EVENT_ID_COUNT] = info;
 }
 #else
-#define DebugLog(file, line, operation, ref) false
+#define DebugLog(file, line) false
+#define DebugLog2(file, line, operation, ref) false
 #endif
 
 // I guess it can be more than 4 64 bit ints, but... the larger it is, the worse memory performance we get for hash tables
@@ -337,8 +332,10 @@ int Reference_AcquireStartMove(OutsideReference* pRef, MemPool* newPool, uint64_
 
 
     InsideReference* newRef = (void*)PACKED_POINTER_GET_POINTER(newOutRef);
-
+    
+    #ifdef DEBUG_INSIDE_REFERENCES
     newRef->unsafeSource = oldRef;
+    #endif
 
     // The ref is still uniquely held, so this is fine!
     // (get the ref for our outNewRef parameter)
@@ -687,8 +684,10 @@ OutsideReference Reference_CreateOutsideReferenceX(InsideReference* pInsideRef, 
     newOutsideRef.count = 0;
     newOutsideRef.pointerClipped = (uint64_t)pInsideRef;
 
+    #ifdef DEBUG_INSIDE_REFERENCES
     pInsideRef->file = file;
     pInsideRef->line = line;
+    #endif
 
     return newOutsideRef;
 }

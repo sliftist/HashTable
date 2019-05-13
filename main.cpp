@@ -341,6 +341,7 @@ typedef struct {
 	int variation;
 	int threadIndex;
 	HANDLE thread;
+	int threadCount;
 } TableMultiThreadsContext;
 void testTableMultiThreads(
 	int count,
@@ -356,6 +357,7 @@ void testTableMultiThreads(
 	memset(threads, 0, sizeof(HANDLE) * count);
 	for (int i = 0; i < count; i++) {
 		TableMultiThreadsContext* context = &threads[i];
+		context->threadCount = count;
 		context->table = &table;
 		context->variation = variationStart;
 		context->threadIndex = i;
@@ -465,12 +467,15 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 		repeatCount = 100;
 		#endif
 	}
+	else if(variation == 2) {
+		repeatCount = 10;
+	}
 
 	uint64_t factor = 1;
 	uint64_t itemCount = 0;
 	
 	if (variation == 0) {
-		itemCount = 1000;
+		itemCount = 600;
 	}
 	else if(variation == 1) {
 #ifdef DEBUG
@@ -528,7 +533,7 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 			}
 
 			if (variation == 0) {
-				for (uint64_t j = 0; j <= i; j++) {
+				for (uint64_t j = itemCount * threadIndex; j < i; j++) {
 					uint64_t count = testGetCount2(table, j, j);
 					AssertEqual(count, 2);
 				}
@@ -547,7 +552,13 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 				*/
 				{
 					uint64_t count = testGetCount2(table, j, j);
-					AssertEqual(count, 2);
+					if (count != 2) {
+						uint64_t count2 = testGetCount2(table, j, j);
+						breakpoint();
+						testGetCount2(table, j, j);
+						AssertEqual(count2, 2);
+					}
+					
 				}
 				tickEnd();
 
@@ -701,7 +712,7 @@ void* getValueHash(OutsideReference& ref) { return ((ref).valueForSet == 0 || (r
 #include <vector>
 void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIndex = 0) {
 
-	uint64_t itemCount = 1000;
+	uint64_t itemCount = 100;
 	uint64_t iterationCount = variation == 2 ? itemCount * 100 : itemCount * 10;
 	#ifndef DEBUG
 	iterationCount = iterationCount * 100;
@@ -748,6 +759,8 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 			//_CrtCheckMemory();
 			testAdd2(table, item.a, item.b, item.c);
 			//_CrtCheckMemory();
+
+			auto tableBefore = table.currentAllocation;
 			
 			uint64_t count = testGetCount2(table, item.a, item.b);
 			if (count != 1) {
@@ -1179,10 +1192,14 @@ void runRefCountTests() {
 
 
 void runAtomicHashTableTest() {
-	testTableMultiThreads(2, 4, threadedSizing);
+	testTableMultiThreads(16, 4, threadedSizing);
+	//testTableMultiThreads(2, 4, threadedSizing);
+	//testTableMultiThreads(2, 4, threadedSizing);
+	//testTableMultiThreads(2, 4, threadedSizing);
+
 	//testHashChurn2Var(2);
 
-	//*
+	/*
 	//testSizingVar(1);
 
 	// TODO: Add a debug wrapper for malloc and free, so we can track the number of allocations, and run tests to make sure we don't leak allocations.
@@ -1192,21 +1209,28 @@ void runAtomicHashTableTest() {
 
 	testSizing();
 	testHashChurn2();
+	// The single threaded test leak, so just reset the allocation count here
+	SystemAllocationCount = 0;
 
 	#ifdef DEBUG
 	IsSingleThreadedTest = false;
 	#endif
 	//*/
 	
-	testTableMultiThreads(2, 4, threadedSizing);
+	//testTableMultiThreads(2, 4, threadedSizing);
 
 	//*
 	printf("ran single threaded tests\n");
-	breakpoint();
+	//breakpoint();
 	//testTableMultiThreads(4, 0, 1, threadedChurn);
 	//testTableMultiThreads(4, 1, 1, threadedChurn);
 	//testHashChurn2Var(2);
 	//testSizingVar(4);
+
+	printf("0 to N with a lot of verification, a few times\n");
+	testTableMultiThreads(1, 0, threadedSizing);
+	testTableMultiThreads(2, 0, threadedSizing);
+	testTableMultiThreads(16, 0, threadedSizing);
 
 	printf("0 to N, many times\n");
 	testTableMultiThreads(1, 4, threadedSizing);

@@ -109,14 +109,14 @@ typedef struct {
 
     OutsideReference currentAllocation;
 
+    uint64_t destructed;
+
     // Disabling this instrumentation makes our fastest case about 30% faster. But it is already basically a NOOP, and
     //  checking if our hash algorithm is bad in realtime is very useful...
     #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
     uint64_t searchStarts;
     uint64_t searchLoops;
     #endif
-
-
 
 } AtomicHashTable2;
 #pragma pack(pop)
@@ -165,7 +165,6 @@ __forceinline bool atomicHashTable2_fastNotContains(
 	uint64_t hash
 ) {
     const OutsideReference BASE_NULL_CPLUSPLUS = { 0, 0, 1 };
-    const OutsideReference BASE_NULL_MAX_CPLUSPLUS = { UINT64_MAX, UINT64_MAX, UINT64_MAX };
     if(self->currentAllocation.valueForSet) {
         InsideReference* tableRef = Reference_AcquireFast(&self->currentAllocation);
         AtomicHashTableBase* table = (AtomicHashTableBase*)Reference_GetValueFast(tableRef);
@@ -179,7 +178,7 @@ __forceinline bool atomicHashTable2_fastNotContains(
                 InterlockedIncrement64((LONG64*)&self->searchLoops);
                 #endif
                 OutsideReference value = table->slots[index].value;
-                if(value.valueForSet == 0 || value.valueForSet == BASE_NULL_MAX_CPLUSPLUS.valueForSet) {
+                if(value.valueForSet == 0) {
 					Reference_ReleaseFast(&self->currentAllocation, tableRef);
                     return 1;
                 }
@@ -251,6 +250,13 @@ inline int AtomicHashTable2_findWithMatches(
     #endif
     return atomicHashTable2_findFull(self, hash, callbackContext, callback);
 }
+
+// Eventually causes future calls to other functions (with the exception of find, as a dtored table is basically just empty),
+//  and removes every entry in the table.
+void AtomicHashTable2_dtor(
+    AtomicHashTable2* self
+);
+
 
 uint64_t DebugAtomicHashTable2_reservedSize(AtomicHashTable2* self);
 uint64_t DebugAtomicHashTable2_allocationSize(AtomicHashTable2* self);

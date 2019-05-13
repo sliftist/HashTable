@@ -46,7 +46,7 @@ typedef struct InsideReference InsideReference;
 #ifdef EVENT_ID_COUNT
 #define InsideReferenceSize (32 + EVENT_ID_COUNT * 4 * 8 + 8)
 #else
-#define InsideReferenceSize 32
+#define InsideReferenceSize (32 + 16)
 #endif
 
 #ifdef DEBUG
@@ -70,8 +70,11 @@ extern bool IsSingleThreadedTest;
 
 #define GET_POINTER_CLIPPED(val) (val & ((1ull << BITS_IN_ADDRESS_SPACE) - 1))
 #define GET_NULL(val) (val & (1ull << 63))
-#define IS_FROZEN_POINTER(ref) (ref.isNull && (GET_POINTER_CLIPPED(ref.valueForSet) >= MIN_POINTER_VALUE && ref.valueForSet != BASE_NULL_MAX.valueForSet))
+#define IS_FROZEN_POINTER(ref) (ref.isNull && ref.pointerClipped)
 
+#define IS_VALUE_MOVED(value) (value.isNull && value.pointerAndCount)
+
+#define IS_BLOCK_END(value) (value.valueForSet == 0 || value.valueForSet == BASE_NULL2.valueForSet)
 
 // OutsideReferences can have a count of 0, the count simply refers to the number of references not yet moved
 //  to the InsideReference. We have to sort of shuffle references to the InsideReference, erroring on the side
@@ -96,6 +99,9 @@ typedef struct {
             //  worry about the highest bit setting isNull to 1).
             uint64_t fastCount : 64 - BITS_IN_ADDRESS_SPACE;
         };
+        struct {
+            uint64_t pointerAndCount: 63;
+        };
         uint64_t valueForSet;
     };
 } OutsideReference;
@@ -103,26 +109,17 @@ typedef struct {
 CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
 
 #define BASE_NULL ((OutsideReference){ 0, 0, 1 })
-#define BASE_NULL1 ((OutsideReference){ 1, 0, 1 })
-#define BASE_NULL2 ((OutsideReference){ 2, 0, 1 })
-#define BASE_NULL3 ((OutsideReference){ 3, 0, 1 })
-#define BASE_NULL4 ((OutsideReference){ 4, 0, 1 })
-#define BASE_NULL5 ((OutsideReference){ 5, 0, 1 })
-#define BASE_NULL6 ((OutsideReference){ 6, 0, 1 })
-#define BASE_NULL7 ((OutsideReference){ 7, 0, 1 })
-#define BASE_NULL8 ((OutsideReference){ 8, 0, 1 })
-#define BASE_NULL9 ((OutsideReference){ 9, 0, 1 })
-// We need this to be somewhat high, as we use it to identify pointers in null values even
-//  when the null values have the isNull set...
-//  - We could also take the approach of just immediately leaking any allocations that
-//      start before this, that way we can guarantee pointers don't get used with values less than this...
-#define MIN_POINTER_VALUE 1000
-#define BASE_NULL_LAST_CONST { MIN_POINTER_VALUE, 0, 1  }
-#define BASE_NULL_LAST ((OutsideReference) BASE_NULL_LAST_CONST )
+#define BASE_NULL1 ((OutsideReference){ 0, 1, 1 })
+#define BASE_NULL2 ((OutsideReference){ 0, 2, 1 })
+#define BASE_NULL3 ((OutsideReference){ 0, 3, 1 })
+#define BASE_NULL4 ((OutsideReference){ 0, 4, 1 })
+#define BASE_NULL5 ((OutsideReference){ 0, 5, 1 })
+#define BASE_NULL6 ((OutsideReference){ 0, 6, 1 })
+#define BASE_NULL7 ((OutsideReference){ 0, 7, 1 })
+#define BASE_NULL8 ((OutsideReference){ 0, 8, 1 })
+#define BASE_NULL9 ((OutsideReference){ 0, 9, 1 })
 
-#define BASE_NULL_MAX ((OutsideReference){ UINT64_MAX, UINT64_MAX, UINT64_MAX })
 
-OutsideReference GetNextNull();
 void* Reference_GetValue(InsideReference* ref);
 
 // Assumes ref isn't NULL
@@ -130,15 +127,6 @@ void* Reference_GetValue(InsideReference* ref);
 
 bool Reference_HasBeenRedirected(InsideReference* ref);
 
-//todonext
-// Remove unused functions, and see if any of the used functions can be simplified, or if any of the use cases
-//  of functions can be made more specific, instead of forcing our code to get things done in a roundabout way
-//  (which is slower, and more error prone).
-
-// We can tell the different between a valid pointer and null because null with have the highest bit set, the lower
-//  bits used for the count BUT THE COUNT WON'T BE LARGE ENOUGH TO REACH THE 2ND HIGHEST BIT! This should be true
-//  for outside references too, so this should really work for more uint64_t values
-bool Reference_IsNull(uint64_t);
 
 
 // Of course the memory OutsideReference is stored in must be guaranteed to exist, however reuse of the memory for other
@@ -151,11 +139,12 @@ void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPoint
 // Makes it so future Reference_Acquire calls that would return oldRef now return newRef (for all OutsideReferences).
 // If this is called multiple times on the same oldRef, the same newRef must be given, or else things will break.
 // Returns false if it didn't redirect, and newRef should be destroyed.
-void Reference_RedirectReference(
+bool Reference_RedirectReference(
     // Must be acquired first
     // If already redirected, fails and returns false.
     InsideReference* oldRef,
     // Allocated normally, and having the value, pool, etc, set as desired.
+    // Must be uniquely held by the caller
     //  Shouldn't be used after this. Instead acquire an outside reference with the old ref, which will
     //  give you the most updated redirected reference (which very well might not be this, as this
     //  redirect could fail).
@@ -195,15 +184,14 @@ __forceinline InsideReference* Reference_AcquireFast(OutsideReference* pRef) {
 
 InsideReference* Reference_AcquireInside(OutsideReference* pRef);
 
-// Acquires the reference, even if it is null, as long as the pointer value is > BASE_NULL_LAST, and not BASE_NULL_MAX.
-// Does not follow redirections
+// Acquires the reference if isNull is set
 // Always makes its reference an inside reference
 //  - So it should be freed via Reference_Release(&emptyReference, insideRef);
 InsideReference* Reference_AcquireIfNull(OutsideReference* ref);
 
 // Sometimes through null, sometimes if. Should only be called if you set outsideRef to null, and aren't expecting it
 //  to not come back from null, as we don't fully check for isNull inside here.
-void Reference_DestroyThroughNull(OutsideReference* outsideRef, OutsideReference newNullValue);
+bool Reference_DestroyThroughNull(OutsideReference* outsideRef, OutsideReference newNullValue);
 
 
 // Must be passed if a Reference_Release call is freeing a reference count it knows has been moved to the inside reference.
@@ -245,17 +233,17 @@ bool Reference_DestroyOutside(OutsideReference* outsideRef, InsideReference* ins
 //  returns true on success
 bool Reference_DestroyOutsideMakeNull(OutsideReference* outsideRef, InsideReference* insideRef);
 
+bool Reference_DestroyOutsideMakeNull1(OutsideReference* pOutsideRef, InsideReference* pInsideRef);
+
 //  returns true on success
 bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef);
-
-// We need this in one specific place...
-bool Reference_ReplaceOutsideStealOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef);
 
 // We need this in one specific place... It is used when moving to basically freeze the reference,
 //  and then access it by calling special functions which allow us to treat isNull values like regular references.
 bool Reference_ReduceToZeroRefsAndSetIsNull(OutsideReference* pOutsideRef, InsideReference* pInsideRef);
 
-OutsideReference Reference_CreateOutsideReference(InsideReference* insideRef);
+#define Reference_CreateOutsideReference(insideRef) Reference_CreateOutsideReferenceX(insideRef, __FILE__, __LINE__)
+OutsideReference Reference_CreateOutsideReferenceX(InsideReference* insideRef, const char* file, uint64_t line);
 
 void DestroyUniqueOutsideRef(OutsideReference* ref);
 
@@ -273,6 +261,62 @@ InsideReference* Reference_FollowRedirects(InsideReference* ref);
 
 bool IsInsideRefCorruptInner(InsideReference* pRef, bool allowFreed);
 bool IsOutsideRefCorruptInner(OutsideReference ref);
+
+
+// When InsideReference reaches a count of 0, it should be freed (as this means nothing knows about it,
+//  and so if we don't free it now it will leak).
+#pragma pack(push, 1)
+struct InsideReference {
+    union {
+        struct {
+            uint64_t count: 43;
+            #define OUTSIDE_COUNT_BIT_INDEX (43)
+            #define OUTSIDE_COUNT_1 (1ull << OUTSIDE_COUNT_BIT_INDEX)
+            uint64_t outsideCount: 20;
+            uint64_t destructStarted: 1;
+        };
+        uint64_t countFullValue;
+    };
+
+    MemPool* pool;
+
+    // This is used with redirects.
+    //  Is updated in the whole list when more redirects happen.
+    OutsideReference nextRedirectValue;
+
+    todonext
+    // Actually... first of all, when freezing a value, we should set a value in the InsideReference
+    //  stating it is frozen, which is what will be checked for instead of redirects?
+    //  - Oh... and... because we set it on the source, if it doesn't get unset, it just forces find to finish
+    //      a move before reading that value, so it can get into new values that don't have it set. So it
+    //      can be unset uniquely.
+
+    // Then, we should add a uniqueId field in each inside reference, that uniquely identifies its value
+    // Then we want to make a new "AllocateAsCopy", which allocates, copies but keeps the unique id the same
+    // Then when iterating we want something to check if a spot is 0 OR if it has a value and the underlying value
+    //  has the same uniqueId as that thing we are trying to insert
+    //  - Oh... and can we also insert it right away?
+    //  - Yes, and this can also insert it, so it will either insert, continue, or know that the insertion already happened.
+    //      - It can work on inside references, making the outside reference itself, that way the caller can always
+    //          just free its inside reference, regardless of the outcome.
+    //  - And then... we don't need destIndex anymore...
+    //  - And also... we won't need nextRedirectValue or prevRedirectValue...
+
+
+    // This is used when destructing. This let's us remove ourself from the redirect chain,
+    //  but letting us iteration back to find which reference has reference (via a nextRedirectValue) to us (if any).
+    OutsideReference prevRedirectValue;
+
+    const char* file;
+    uint64_t line;
+
+    #ifdef EVENT_ID_COUNT
+    uint64_t nextEventIdIndex;
+    DebugLineInfo eventIds[EVENT_ID_COUNT];
+    #endif
+};
+#pragma pack(pop)
+
 
 #ifdef __cplusplus
 }

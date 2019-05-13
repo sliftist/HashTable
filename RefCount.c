@@ -32,12 +32,6 @@ bool Reference_ReplaceOutsideInner(OutsideReference* pOutsideRef, InsideReferenc
 
 const OutsideReference emptyReference = { 0 };
 
-static OutsideReference PREV_NULL = BASE_NULL_LAST_CONST;
-OutsideReference GetNextNull() {
-    OutsideReference value;
-    value.valueForSet = InterlockedIncrement64((LONG64*)&PREV_NULL.valueForSet);
-    return value;
-}
 
 
 // Anyone with InsideReference*, should either have a count incremented in the reference count,
@@ -62,36 +56,7 @@ typedef struct {
 } DebugLineInfo;
 
 
-// When InsideReference reaches a count of 0, it should be freed (as this means nothing knows about it,
-//  and so if we don't free it now it will leak).
-#pragma pack(push, 1)
-struct InsideReference {
-    union {
-        struct {
-            uint64_t count: 43;
-            #define OUTSIDE_COUNT_BIT_INDEX (43)
-            #define OUTSIDE_COUNT_1 (1ull << OUTSIDE_COUNT_BIT_INDEX)
-            uint64_t outsideCount: 20;
-            uint64_t destructStarted: 1;
-        };
-        uint64_t countFullValue;
-    };
 
-    MemPool* pool;
-
-    // Means, the underlying value should be read from nextRedirectValue
-    OutsideReference nextRedirectValue;
-
-    // Used to update nextRedirectValue of all of our nodes, as we can't free any nodes
-    //  if a previous node has a nextRedirectValue pointing to them.
-    OutsideReference prevRedirectValue;
-
-    #ifdef EVENT_ID_COUNT
-    uint64_t nextEventIdIndex;
-    DebugLineInfo eventIds[EVENT_ID_COUNT];
-    #endif
-};
-#pragma pack(pop)
 
 #ifdef EVENT_ID_COUNT
 void DebugLog(const char* file, uint64_t line, const char* operation, InsideReference* ref) {
@@ -249,19 +214,17 @@ InsideReference* Reference_AcquireInside(OutsideReference* pRef) {
 	return ref;
 }
 
-#define ASSERT_DECREMENT_SAFE(expr) (expr) != UINT64_MAX ? 0 : breakpoint()
-
 bool releaseInsideReference(InsideReference* insideRef);
 
-void Reference_RedirectReference(
+bool Reference_RedirectReference(
     // Must be acquired first
     // If already redirects, fails and returns false.
     InsideReference* oldRef,
     // Must be allocated normally, and have the value set as desired
     InsideReference* newRef
 ) {
-    if(IsInsideRefCorrupt(oldRef)) return;
-    if(IsInsideRefCorrupt(newRef)) return;
+    if(IsInsideRefCorrupt(oldRef)) return false;
+    if(IsInsideRefCorrupt(newRef)) return false;
 
 
     DebugLog(file, line, "Redirect TO", newRef);
@@ -274,10 +237,12 @@ void Reference_RedirectReference(
 	if (newRef->prevRedirectValue.valueForSet != 0 && !FAST_CHECK_POINTER(newRef->prevRedirectValue, oldRef)) {
 		// Redirect was called with the same of newRef, but different oldRefs... This should never happen.
 		OnError(4);
-		return;
+		return false;
 	}
 	#endif
 
+    //todonext
+    // We're leaking this? But... HOW! And we're leaking it in the case the redirection fails!?
     OutsideReference refToOldRef = Reference_CreateOutsideReference(oldRef);
 
     OutsideReference newRefPrevRedirectValue;
@@ -295,7 +260,8 @@ void Reference_RedirectReference(
     #endif
 
     if(newRefPrevRedirectValue.valueForSet != 0) {
-        DestroyUniqueOutsideRef(&refToOldRef);
+        // NewRef should be uniquely held by the caller...
+        OnError(3);
     }
     
     
@@ -313,16 +279,20 @@ void Reference_RedirectReference(
     if(oldRefNextRedirectValue.valueForSet != 0) {
 		// The newRef->prevRedirectValue will be freed when our newRef is freed.
 		// But we do need to free the ref we added for the failed outside ref set
+        // newRef is unique to this thread, so this is safe
+        newRef->prevRedirectValue.valueForSet = 0;
+        DestroyUniqueOutsideRef(&refToOldRef);
+
         DestroyUniqueOutsideRef(&refToNewRef);
 
-		if (IsInsideRefCorrupt(oldRef)) return;
-		if (IsInsideRefCorrupt(newRef)) return;
+		if (IsInsideRefCorrupt(oldRef)) return false;
+		if (IsInsideRefCorrupt(newRef)) return false;
 
         DebugLog(file, line, "failed redirect FROM", oldRef);
 
         //printf("failed redirect of %p(%llu) to %p(%llu)\n", oldRef, oldRef->count, newRef, newRef->count);
 
-		return;
+		return false;
     }
 
 	// Update all previous values to point to the new head
@@ -352,12 +322,14 @@ void Reference_RedirectReference(
         //printf("update redirect of %p(%llu) to %p(%llu)\n", prevToRedirect, prevToRedirect->count, newRef, newRef->count);        
 
 		InsideReference* prevToRedirectPrev = prevToRedirect;
-		prevToRedirect = Reference_AcquireInside(&prevToRedirectPrev->prevRedirectValue);
+		prevToRedirect = Reference_AcquireInside(&prevToRedirect->prevRedirectValue);
         // Eventually prevToRedirect will be nullptr, and this will release the final prevToRedirect
 		releaseInsideReference(prevToRedirectPrev);
 	}
 
     //printf("after redirect of %p(%llu) to %p(%llu)\n", oldRef, oldRef->count, newRef, newRef->count);
+
+    return true;
 }
 
 InsideReference* Reference_FollowRedirects(InsideReference* pRef) {
@@ -370,8 +342,7 @@ InsideReference* Reference_FollowRedirects(InsideReference* pRef) {
         }
         if(IsInsideRefCorrupt(pRef)) return pRef;
         if(IsInsideRefCorrupt(next)) return pRef;
-        LONG64 decrementResult = InterlockedDecrement64((LONG64*)&pRef->countFullValue);
-        ASSERT_DECREMENT_SAFE(decrementResult);
+        releaseInsideReference(pRef);
         pRef = next;
     }
     return pRef;
@@ -425,6 +396,89 @@ void DestroyUniqueOutsideRefInner(OutsideReference* ref, OutsideReference nullVa
 void DestroyUniqueOutsideRef(OutsideReference* ref) {
     DestroyUniqueOutsideRefInner(ref, emptyReference);
 }
+
+// On success leaves destructStarted
+void detachFromLinkList(InsideReference* insideRef) {
+    //todonext
+    // The goal is to make the prevRedirectValue no longer point to us.
+    //  A nextRedirectValue MAY point to us. If we have our own nextRedirectValue it may not, but it is possible,
+    //  because redirect may hang after setting up the redirect, but before setting all nextRedirectValue values...
+    //  (new redirects will fix this though, so it isn't that big a deal)
+
+
+    if(!setDestructValue(insideRef)) {
+        printf("abort detach of %p\n", insideRef);
+        return;
+    }
+    
+    // We find our next node and swap it from pointing to us, to pointing to our previous node.
+    //  If the next removed itself we have nothing to point to, so that can't happen.
+    //  And, what if the previous node removed itself, then we need to change the new prev node.
+
+    InsideReference* prevNode = nullptr;
+    {
+        prevNode = Reference_AcquireInside(&insideRef->prevRedirectValue);
+        if(prevNode) {
+            if(!setDestructValue(prevNode)) {
+                printf("abort detach of %p due to prev already destructing\n", insideRef);
+                unsetDestructValue(insideRef);
+                return;
+            }
+        }
+    }
+
+    InsideReference* nextNode = nullptr;
+    {
+        // Get the actual next most node, which may require following a few nodes, as we always want to point to the next most node
+        InsideReference* searchNode = Reference_FollowRedirects(Reference_AcquireInside(&insideRef->nextRedirectValue));
+        while(searchNode) {
+            if(FAST_CHECK_POINTER(searchNode->prevRedirectValue, insideRef)) {
+                nextNode = searchNode;
+                if(!setDestructValue(nextNode)) {
+                    printf("abort detach of %p due to next already destructing\n", insideRef);
+                    unsetDestructValue(insideRef);
+                    if(prevNode) unsetDestructValue(prevNode);
+                    return;
+                }
+                break;
+            }
+            
+            InsideReference* prevSearchNode = searchNode;
+            searchNode = Reference_AcquireInside(&searchNode->prevRedirectValue);
+            releaseInsideReference(prevSearchNode);
+        }
+    }
+
+    if(!FAST_CHECK_POINTER(nextNode->prevRedirectValue, insideRef)
+    || !FAST_CHECK_POINTER(insideRef->prevRedirectValue, prevNode)) {
+        printf("abort detach of %p due to state change \n", insideRef);
+        unsetDestructValue(insideRef);
+        if(prevNode) unsetDestructValue(prevNode);
+        unsetDestructValue(nextNode);
+        return;
+    }
+
+    OutsideReference newPrevRef = { 0 };
+    if(prevNode) {
+        newPrevRef = Reference_CreateOutsideReference(prevNode);
+    }
+    if(!Reference_ReplaceOutside(
+        &nextNode->prevRedirectValue,
+        insideRef,
+        newPrevRef
+    )) {
+        printf("abort detach of %p due to nextNode->prevRedirectValue change \n", insideRef);
+        if(prevNode) {
+            Reference_DestroyOutside(&newPrevRef, prevNode);
+        }
+    }
+    // leave the destruct value on success
+    unsetDestructValue(insideRef);
+    if(prevNode) unsetDestructValue(prevNode);
+    unsetDestructValue(nextNode);
+    return;
+}
+
 bool releaseInsideReference(InsideReference* insideRef) {
     if(IsInsideRefCorrupt(insideRef)) return false;
 
@@ -432,154 +486,67 @@ bool releaseInsideReference(InsideReference* insideRef) {
 
     DebugLog(file, line, "releaseInsideReference (BEFORE)", insideRef);
 
-    //todonext
-    // So... it looks like our redirect handling code is destroying references incorrectly... which is causing references
-    //  to lose all references at points that should be impossible.
+    // Will we ever race to go from 1 to 0 while something else is trying to redirect us?
+    //  - No, because if we have 1, then we are already unique, and won't be redirected
+    // So, if we see we have been redirected, we will always be redirected, and so
+    //  we just have to look for the 3 to 2 (which means if we get the destruct state,
+    //  we are then unique).
 
-    // Consider if we are only alive because of prevRedirectValue references to us.
+    
     while(true) {
-        // If we don't have a next value, then we are the most recent, and so there are no prevRedirectValues to find and remove.
-        //  Hmm... is it possible for our previous to not be able to destruct because we are referencing to it,
-        //  and for some reason the only time it lost it's real reference it couldn't remove our prevRedirectValue
-        //  to it? Hmm... maybe...
-        if(insideRef->nextRedirectValue.valueForSet == 0) break;
-        
-        if(insideRef->count != 2) break;
-        // 2 references, meaning the one we are about to remove, and 1 from a prevRedirectValue pointing to us.
-
-        if(!setDestructValue(insideRef)) {
-            break;
-        }
-        
-        // We find our next node and swap it from pointing to us, to pointing to our previous node.
-        //  If the next removed itself we have nothing to point to, so that can't happen.
-        //  And, what if the previous node removed itself, then we need to change the new prev node.
-
-        InsideReference* prevNode = nullptr;
-        {
-            prevNode = Reference_AcquireInside(&insideRef->prevRedirectValue);
-            if(prevNode) {
-                if(!setDestructValue(prevNode)) {
-                    unsetDestructValue(prevNode);
-                    break;
-                }
-            }
+        InsideReferenceCountDebug count;
+        count.countFullValue = insideRef->countFullValue;
+        InsideReferenceCountDebug newCount = count;
+        // If ever nextRedirectValue, and we see count == 2 and !count.destructStarted,
+        //  it means there is definitely a prevRedirectedValue, and as insideRef is 1 ref,
+        //  prevRedirectedValue is the other, so we can remove the predRedirectedValue,
+        //  and know it won't come back.
+        if(count.count == 2 && insideRef->nextRedirectValue.valueForSet) {
+            // In this case, while count might increase because of our siblings moving around redirect values,
+            //  we won't get any real new references, and we only need to worry about detachFromLinkList
+            //  suffering from the classic linked list remove problem (A->B->C, remove B, but C was removed, so setting A.next = C is invalid)
+            // Set destructStarted first
+            detachFromLinkList(insideRef);
         }
 
-        InsideReference* nextNode = nullptr;
-        {
-            // Get the actual next most node, which may require following a few nodes, as we always want to point to the
-            //  next most node
-            InsideReference* searchNode = Reference_FollowRedirects(Reference_AcquireInside(&insideRef->nextRedirectValue));
-            while(searchNode) {
-                if(FAST_CHECK_POINTER(searchNode->prevRedirectValue, insideRef)) {
-                    nextNode = searchNode;
-                    break;
-                }
-                
-                InsideReference* prevSearchNode = searchNode;
-                searchNode = Reference_AcquireInside(&searchNode->prevRedirectValue);
-                releaseInsideReference(prevSearchNode);
-            }
+        newCount.count--;
+        if(newCount.outsideCount > newCount.count && newCount.outsideCount < 1024) {
+            // A big problem, you released a reference you obtained for an outside reference without that outside reference,
+            //  which leaks a reference and will cause leaks or double frees.
+            OnError(3);
         }
 
-        bool stateChanged = false;
-        bool retry = false;
-        if(!nextNode) {
-            stateChanged = true;
-            retry = true;
-        } else {
-            if(!FAST_CHECK_POINTER(nextNode->prevRedirectValue, insideRef)) {
-                stateChanged = true;
-                retry = true;
-			}
-			else {
-				if (!setDestructValue(nextNode)) {
-					stateChanged = true;
-				}
-			}
-        }
-        
-        if(!FAST_CHECK_POINTER(insideRef->prevRedirectValue, prevNode)) {
-            stateChanged = true;
-            retry = true;
-        }
-
-        if(!stateChanged) {
-            OutsideReference newPrevRef = { 0 };
-            if(prevNode) {
-                newPrevRef = Reference_CreateOutsideReference(prevNode);
-            }
-            if(!Reference_ReplaceOutside(
-                &nextNode->prevRedirectValue,
-                insideRef,
-                newPrevRef
-            )) {
-                retry = true;
-                if(prevNode) {
-                    Reference_DestroyOutside(&newPrevRef, prevNode);
-                }
-            }
-        }
-        
-        if(nextNode) {
-            unsetDestructValue(nextNode);
-            releaseInsideReference(nextNode);
-        }
-        if(prevNode) {
-            unsetDestructValue(prevNode);
-            releaseInsideReference(prevNode);
-        }
-        unsetDestructValue(insideRef);
-        if(retry) {
+        IsInsideRefCorrupt(insideRef);
+        if(InterlockedCompareExchange64(
+            (LONG64*)&insideRef->countFullValue,
+            newCount.countFullValue,
+            count.countFullValue
+        ) != count.countFullValue) {
             continue;
         }
-        break;
-    }
 
-    IsInsideRefCorrupt(insideRef);
-
-    DebugLog(file, line, "releaseInsideReference (BEFORE, but after redirect stuff)", insideRef);
-
-	LONG64 decrementResult = InterlockedDecrement64((LONG64*)&insideRef->countFullValue);
-    ASSERT_DECREMENT_SAFE(decrementResult);
-
-    // UNSAFE, but I kind of need it for debugging...
-    DebugLog(file, line, "releaseInsideReference (AFTER)", insideRef);
-
-    //printf("released inside reference %p, has %llu refs\n", insideRef, insideRef->count);
-    // This is dangerous, but... I really want to know who is releasing the outside reference prematurely...
-    // decrementResult
-    InsideReferenceCountDebug countDebug;
-    countDebug.countFullValue = decrementResult;
-    if(countDebug.outsideCount > countDebug.count && countDebug.outsideCount < 1024) {
-        // A big problem, you released a reference you obtained for an outside reference without that outside reference,
-        //  which leaks a reference and will cause leaks or double frees.
-        OnError(3);
-    }
-    
-    // 0 means count is 0, outsideCount is 0 and destructStarted is not set.
-	if (decrementResult == 0) {
-        //printf("freeing reference memory %p\n", insideRef);
-        if(IsInsideRefCorruptInner(insideRef, true)) {
+        if(newCount.count == 0) {
+            //printf("freeing reference memory %p\n", insideRef);
+            if(IsInsideRefCorruptInner(insideRef, true)) {
+                return true;
+            }
+            if (HAS_NON_POINTER_PATTERN(insideRef->pool)) {
+                // Double free
+                breakpoint();
+            }
+            DestroyUniqueOutsideRef(&insideRef->nextRedirectValue);
+            DestroyUniqueOutsideRef(&insideRef->prevRedirectValue);
+            //printf("freed reference memory redirects %p\n", insideRef);
+            // No more references, and no more outside references so there will never be more references, so we can exclusively free now.
+            MemPool* pool = insideRef->pool;
+            bool workedBefore = HAS_NON_POINTER_PATTERN(insideRef->pool);
+            insideRef->pool = (void*)SET_NON_POINTER_PATTERN(insideRef->pool);
+            bool worked = HAS_NON_POINTER_PATTERN(insideRef->pool);
+            pool->Free(pool, insideRef);
             return true;
         }
-		if (HAS_NON_POINTER_PATTERN(insideRef->pool)) {
-			// Double free
-			breakpoint();
-		}
-		DestroyUniqueOutsideRefInner(&insideRef->nextRedirectValue, BASE_NULL);
-        DestroyUniqueOutsideRefInner(&insideRef->prevRedirectValue, BASE_NULL);
-        //printf("freed reference memory redirects %p\n", insideRef);
-		// No more references, and no more outside references so there will never be more references, so we can exclusively free now.
-        MemPool* pool = insideRef->pool;
-        bool workedBefore = HAS_NON_POINTER_PATTERN(insideRef->pool);
-        insideRef->pool = (void*)SET_NON_POINTER_PATTERN(insideRef->pool);
-        bool worked = HAS_NON_POINTER_PATTERN(insideRef->pool);
-		pool->Free(pool, insideRef);
-		return true;
-	}
-	return false;
+        return false;
+    }
 }
 
 InsideReference* Reference_Acquire(OutsideReference* pRef) {
@@ -659,7 +626,7 @@ InsideReference* Reference_AcquireIfNull(OutsideReference* pRef) {
 	}
 
 	// If we get here, it means our ref got moved to the inside, so we have to remove it from the inside
-    ASSERT_DECREMENT_SAFE(InterlockedDecrement64((LONG64*)&ref->countFullValue));
+    releaseInsideReference(ref);
 
     DebugLog(file, line, "Reference_AcquireIfNull interrupted (AFTER)", ref);
 
@@ -667,22 +634,28 @@ InsideReference* Reference_AcquireIfNull(OutsideReference* pRef) {
 
     return ref;
 }
-void Reference_DestroyThroughNull(OutsideReference* outsideRef, OutsideReference newNullValue) {
+bool Reference_DestroyThroughNull(OutsideReference* outsideRef, OutsideReference newNullValue) {
     OutsideReference ref = *outsideRef;
-    if(IsOutsideRefCorrupt(ref)) return;
+    if(IsOutsideRefCorrupt(ref)) return false;
     if(ref.valueForSet == newNullValue.valueForSet) {
-        return;
+        return false;
     }
     if(!ref.isNull) {
-        return;
+        return false;
     }
 
     InsideReference* insideRef = Reference_AcquireIfNull(outsideRef);
-    if(!insideRef) return;
+    if(!insideRef) return false;
     DebugLog(__FILE__, __LINE__, "DestroyThroughNull (BEFORE)", insideRef);
-    Reference_ReplaceOutsideInner(outsideRef, insideRef, newNullValue, true, true);
+    bool destroyed = Reference_ReplaceOutsideInner(outsideRef, insideRef, newNullValue, true, true);
     IsInsideRefCorrupt(insideRef);
+    if(destroyed) {
+        //insideRef->file = "replaced";
+    } else {
+        //insideRef->file = "failed to replace";
+    }
 	Reference_Release(&emptyReference, insideRef);
+    return destroyed;
 }
 
 
@@ -876,9 +849,6 @@ bool Reference_ReplaceOutsideInner(OutsideReference* pOutsideRef, InsideReferenc
 bool Reference_ReplaceOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef) {
     return Reference_ReplaceOutsideInner(pOutsideRef, pInsideRef, newOutsideRef, true, false);
 }
-bool Reference_ReplaceOutsideStealOutside(OutsideReference* pOutsideRef, InsideReference* pInsideRef, OutsideReference newOutsideRef) {
-    return Reference_ReplaceOutsideInner(pOutsideRef, pInsideRef, newOutsideRef, false, false);
-}
 
 bool Reference_ReduceToZeroRefsAndSetIsNull(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
     return Reference_ReplaceOutsideInner(pOutsideRef, pInsideRef, emptyReference, false, false);
@@ -891,8 +861,11 @@ bool Reference_DestroyOutside(OutsideReference* pOutsideRef, InsideReference* pI
 bool Reference_DestroyOutsideMakeNull(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
     return Reference_ReplaceOutside(pOutsideRef, pInsideRef, BASE_NULL);
 }
+bool Reference_DestroyOutsideMakeNull1(OutsideReference* pOutsideRef, InsideReference* pInsideRef) {
+    return Reference_ReplaceOutside(pOutsideRef, pInsideRef, BASE_NULL1);
+}
 
-OutsideReference Reference_CreateOutsideReference(InsideReference* pInsideRef) {
+OutsideReference Reference_CreateOutsideReferenceX(InsideReference* pInsideRef, const char* file, uint64_t line) {
     if(IsInsideRefCorrupt(pInsideRef)) return emptyReference;
 
     DebugLog(file, line, "CreateOutsideReference (BEFORE)", pInsideRef);
@@ -905,6 +878,9 @@ OutsideReference Reference_CreateOutsideReference(InsideReference* pInsideRef) {
     OutsideReference newOutsideRef = { 0 };
     newOutsideRef.count = 0;
     newOutsideRef.pointerClipped = (uint64_t)pInsideRef;
+
+    pInsideRef->file = file;
+    pInsideRef->line = line;
 
     return newOutsideRef;
 }

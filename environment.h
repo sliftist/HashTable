@@ -14,8 +14,8 @@
 #define breakpoint() asm("int $3")
 #endif
 #else
-//#define breakpoint() ;
-#define breakpoint() __debugbreak()
+#define breakpoint() ;
+//#define breakpoint() __debugbreak()
 #endif
 
 
@@ -72,4 +72,4 @@ void OnErrorInner(int code, const char* name, unsigned long long line);
 }
 #endif
 
-#define ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+//#define ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING

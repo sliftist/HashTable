@@ -371,6 +371,13 @@ void testTableMultiThreads(
 		WaitForSingleObject(threads[i].thread, INFINITE);
 		printf("Finished thread %d\n", i);
 	}
+
+	printf("Final allocation count %llu\n", SystemAllocationCount);
+	AtomicHashTable2_dtor(&table);
+	if (SystemAllocationCount > 0) {
+		OnError(3);
+	}
+	printf("Allocation count after dtor %llu\n", SystemAllocationCount);
 }
 
 uint64_t groupSum;
@@ -574,7 +581,7 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 					context.item.b = j + itemCount;
 
 					uint64_t hash = hashes[j];
-					// This call takes around 31 instructions, With setting up context, the asserts and for loop around this taking around 15 instructions
+					// This call takes around 26 instructions, With setting up context, the asserts and for loop around this taking around 14 instructions
 					int result = AtomicHashTable2_find(&table, hash, &context, [](void* contextAny, void* value) {
 						Context* context = (Context*)contextAny;
 						Item* item = (Item*)value;
@@ -1171,7 +1178,9 @@ void runRefCountTests() {
 
 
 void runAtomicHashTableTest() {
-	/*
+	//*
+	testSizingVar(1);
+
 	// TODO: Add a debug wrapper for malloc and free, so we can track the number of allocations, and run tests to make sure we don't leak allocations.
 	#ifdef DEBUG
 	IsSingleThreadedTest = true;
@@ -1184,7 +1193,12 @@ void runAtomicHashTableTest() {
 	IsSingleThreadedTest = false;
 	#endif
 	//*/
+	
+	testTableMultiThreads(2, 4, threadedSizing);
+
+	//*
 	printf("ran single threaded tests\n");
+	breakpoint();
 	//testTableMultiThreads(4, 0, 1, threadedChurn);
 	//testTableMultiThreads(4, 1, 1, threadedChurn);
 	//testHashChurn2Var(2);
@@ -1209,6 +1223,8 @@ void runAtomicHashTableTest() {
 	testTableMultiThreads(1, 1, threadedChurn);
 	testTableMultiThreads(2, 1, threadedChurn);
 	testTableMultiThreads(16, 1, threadedChurn);
+	//*/
+
 
 	// many operations speed
 	//testSizingVar(2);

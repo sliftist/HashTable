@@ -16,12 +16,12 @@ void* MemPoolSystem_Allocate(MemPoolSystem* pool, uint64_t size, uint64_t hash) 
     }
 	//_CrtCheckMemory();
 	//time = GetTime() - time;
-	//printf("Allocation size %llu, %p\n", size, allocation);
+	printf("Allocation size %llu, %p\n", size, allocation);
 	return allocation;
 }
 void MemPoolSystem_Free(MemPoolSystem* pool, void* value) {
     if(!value) return;
-	//printf("Freeing %p\n", value);
+	printf("Freeing %p\n", value);
 	//_CrtCheckMemory();
     free(value);
     InterlockedDecrement64((LONG64*)&SystemAllocationCount);
@@ -185,6 +185,7 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
                     }
                     break;
                 }
+                //printf("Added alloc to allocation %p\n", pool->holderRef);
                 byte* allocation = allocatedBits + (pool->VALUE_COUNT + 7) / 8 + index * (pool->VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD);
                 return allocation;
             }

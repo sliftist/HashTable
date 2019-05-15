@@ -112,6 +112,7 @@
       <Optimization>Disabled</Optimization>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -155,6 +156,7 @@
       <PreprocessKeepComments>false</PreprocessKeepComments>
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -173,6 +175,7 @@
       <PreprocessSuppressLineNumbers>true</PreprocessSuppressLineNumbers>
       <PreprocessKeepComments>true</PreprocessKeepComments>
       <IgnoreStandardIncludePath>false</IgnoreStandardIncludePath>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -183,7 +186,9 @@
     <ClCompile Include="AtomicHashTable2.c" />
     <ClCompile Include="AtomicHelpers.c" />
     <ClCompile Include="bittricks.c" />
+    <ClCompile Include="BulkAlloc.c" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="MemLog.c" />
     <ClCompile Include="MemPool.c" />
     <ClCompile Include="mersenne-twister.c" />
     <ClCompile Include="RefCount.c" />
@@ -194,6 +199,8 @@
     <ClInclude Include="AtomicHashTable2.h" />
     <ClInclude Include="AtomicHelpers.h" />
     <ClInclude Include="bittricks.h" />
+    <ClInclude Include="BulkAlloc.h" />
+    <ClInclude Include="MemLog.h" />
     <ClInclude Include="MemPool.h" />
     <ClInclude Include="MemPoolImpls.h" />
     <ClInclude Include="mersenne-twister.h" />

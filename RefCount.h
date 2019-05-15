@@ -166,7 +166,7 @@ bool Reference_CopyIntoZero(OutsideReference* target, InsideReference* newRef);
 //  destroying it (returning the InsideReference* of the reference that was destroyed, or nullptr
 //  if there was no reference to destroy).
 // Returns true if it destroyed an outside reference.
-bool Reference_FinishMove(OutsideReference* outsideRef);
+bool Reference_FinishMove(OutsideReference* outsideRef, InsideReference* ref);
 
 
 

@@ -212,12 +212,15 @@ InsideReference* Reference_AcquireCheckIsMoved(OutsideReference* pRef, bool* out
             newRef.valueForSet,
             ref.valueForSet
         ) == ref.valueForSet) {
-            return (void*)PACKED_POINTER_GET_POINTER(ref);
+            InsideReference* insideRef = (void*)PACKED_POINTER_GET_POINTER(ref);
+            DebugLog("Reference_AcquireCheckIsMoved (ACQUIRED)", insideRef);
+            return insideRef;
         }
     }
 }
 
-InsideReference* Reference_AcquireIfNull(OutsideReference* pRef) {
+#define Reference_AcquireIfNull(ref) Reference_AcquireIfNullX(ref, __FILE__, __LINE__)
+InsideReference* Reference_AcquireIfNullX(OutsideReference* pRef, const char* file, uint64_t line) {
     // Get outside reference
     InsideReference* ref = nullptr;
     while(true) {
@@ -236,6 +239,7 @@ InsideReference* Reference_AcquireIfNull(OutsideReference* pRef) {
             newRef.isNull = 0;
             ref = (void*)PACKED_POINTER_GET_POINTER(newRef);
             if(IsInsideRefCorrupt(ref)) return nullptr;
+            DebugLog2("Reference_AcquireIfNull (ACQUIRED)", ref, file, line);
             break;
         }
     }
@@ -274,6 +278,10 @@ InsideReference* Reference_AcquireIfNull(OutsideReference* pRef) {
 }
 
 int Reference_AcquireStartMove(OutsideReference* pRef, MemPool* newPool, uint64_t size, InsideReference** outNewRef) {
+    todonext
+    // Wait, if it is zero here... shouldn't we just immediately convert it to BASE_NULL2, and then skip the rest of the move code?
+    //  I think this would fix a bug we have, and simplify the code considerably...
+
     OutsideReference outRef = *pRef;
     if(outRef.valueForSet == 0) {
         return 0;
@@ -342,6 +350,8 @@ int Reference_AcquireStartMove(OutsideReference* pRef, MemPool* newPool, uint64_
     newRef->count++;
     newOutRef.isNull = 1;
 
+    DebugLog("Reference_AcquireStartMove, ref still private", newRef);
+
     if(!Reference_ReplaceOutside(
         pRef,
         oldRef,
@@ -353,11 +363,15 @@ int Reference_AcquireStartMove(OutsideReference* pRef, MemPool* newPool, uint64_
             // Impossible
             OnError(3);
         }
+        // Mark it as moved, as it did not become the new primary location, so it is essentially moved
+        newRef->isCommittedToMove = 1;
         Reference_Release(&emptyReference, newRef);
         // Retry, we should get the new allocatin right away this time.
         return Reference_AcquireStartMove(pRef, newPool, size, outNewRef);
     }
+    DebugLog("Reference_AcquireStartMove moving from", oldRef);
 	Reference_Release(pRef, oldRef);
+
     *outNewRef = newRef;
 
     DebugLog("Reference_AcquireStartMove did move", *outNewRef);
@@ -383,30 +397,35 @@ bool Reference_CopyIntoZero(OutsideReference* target, InsideReference* newRef) {
     return FAST_CHECK_POINTER(prevRef, newRef);
 }
 
-bool Reference_FinishMove(OutsideReference* pRef) {
+bool Reference_FinishMove(OutsideReference* pRef, InsideReference* insideRef) {
     // TODO: Maybe consider only using isCommittedToMove, and not even setting isNull. Of course
     //  Although... it would mean accessed would need accesses would need to check hash and isCommittedToMove...
     //  but we could probably move isCommittedToMove to be beside hash, which might help.
     //  - And we would still need to use a BASE_NULL value for empty slots, and fully moved slots.
     //  - And also, putting the new value in the outside reference slot... wouldn't work? Idk... so nevermind... maybe don't.
 
-    InsideReference* insideRef = Reference_AcquireIfNull(pRef);
-    if(!insideRef) {
-        return false;
-    }
-
-    DebugLog("FinishMove", insideRef);
 
     while(true) {
         OutsideReference ref = *pRef;
         if(ref.valueForSet == BASE_NULL2.valueForSet || ref.valueForSet == BASE_NULL1.valueForSet) {
             return false;
         }
-        // Move the ref count to the inside
-        if(ref.count) {
-            InterlockedExchangeAdd64((LONG64*)&insideRef->valueForSet, ref.count);
-        }
         if(ref.pointerClipped) {
+            DebugLog("FinishMove", insideRef);
+            if(ref.pointerClipped && !ref.isNull) {
+                // Move never started?
+                OnError(3);
+            }
+            OutsideReference refFortest = ref;
+            refFortest.isNull = 0;
+            if(!FAST_CHECK_POINTER(refFortest, insideRef)) {
+                DebugLog("FinishMove, but the ref is different (probably because it was already finished)", insideRef);
+                continue;
+            }
+
+            // Move the ref count to the inside
+            InterlockedExchangeAdd64((LONG64*)&insideRef->valueForSet, ref.count);
+
             if(InterlockedCompareExchange64(
                 (LONG64*)pRef,
                 BASE_NULL1.valueForSet,
@@ -416,10 +435,18 @@ bool Reference_FinishMove(OutsideReference* pRef) {
                 // Release once for ourself, and once to destroy the outside ref
                 BitFieldSubtract(&insideRef->valueForSet, 1, OUTSIDE_COUNT_BIT_INDEX);
                 BitFieldSubtract(&insideRef->valueForSet, 1, 0);
-                releaseInsideReference(insideRef);
+                DebugLog("FinishMove, success", insideRef);
                 return true;
+            } else {
+                // Undo the move of the ref count and try again
+                BitFieldSubtract(&insideRef->valueForSet, ref.count, 0);
+                DebugLog("FinishMove, value changed (probably already moved)", insideRef);
             }
         } else { // 0, and BASE_NULL, and really all nulls, but any nulls we use we checked before swapping
+            if(ref.count) {
+                // ref count to something without a pointer?
+                OnError(3);
+            }
             if(InterlockedCompareExchange64(
                 (LONG64*)pRef,
                 BASE_NULL2.valueForSet,
@@ -427,10 +454,6 @@ bool Reference_FinishMove(OutsideReference* pRef) {
             ) == ref.valueForSet) {
                 return false;
             }
-        }
-
-        if(ref.count) {
-            BitFieldSubtract(&insideRef->valueForSet, ref.count, 0);
         }
     }
     

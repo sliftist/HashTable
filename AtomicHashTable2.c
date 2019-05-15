@@ -5,6 +5,8 @@
 #include "AtomicHelpers.h"
 #include "RefCount.h"
 
+#include "MemLog.h"
+
 #define RETURN_ON_ERROR(x) { int returnOnErrorResult = x; if(returnOnErrorResult != 0) return returnOnErrorResult; }
 
 // (sizeof(InsideReference) because our tracked allocations are this much smaller)
@@ -224,7 +226,6 @@ int atomicHashTable2_updateReserved(
     if(pNewAlloc == &this->currentAllocation) {
         // The first allocation started moved into (because there are no values)
         newTable->finishedMovingInto = true;
-        printf("Is first allocation\n");
     }
 
     InsideReference* newTableRef = Reference_AcquireInside(&newAllocation);
@@ -269,13 +270,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
 ) {
     uint64_t VALUE_SIZE = this->VALUE_SIZE;
 
-
-    // Okay, inserts...
-
-    //todonext
-    // Alright... how could moving, skip over a value that definitely exists? Because that is what happening, a value not deleted,
-    //  doesn't get moved, it just completely gets skipped over. Maybe... print all cases we skip over, and why?
-
     // Hash block checking doesn't work because of wrap around (at least, it can't be efficient because of wrap around).
     //  So instead we just move A block, and if we ran into a moved element in a block, then either
     //  that block was already moved, or we just moved it... so this works...
@@ -291,6 +285,9 @@ int atomicHashTable2_applyMoveTableOperationInner(
 
     MoveStateInner moveState = { 0 };
     while(true) {
+        #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+        InterlockedIncrement64((LONG64*)&this->searchLoops);
+        #endif
         loops++;
         if(loops > curAlloc->slotsCount * 10) {
             OnError(9);
@@ -301,6 +298,15 @@ int atomicHashTable2_applyMoveTableOperationInner(
         moveState = *pMoveState;
 
         if(moveState.sourceIndex >= curAlloc->slotsCount) {
+            #ifdef DEBUG
+            for(uint64_t i = 0; i < curAlloc->slotsCount; i++) {
+                OutsideReference value = curAlloc->slots[i].value;
+                if(value.valueForSet != BASE_NULL1.valueForSet && value.valueForSet != BASE_NULL2.valueForSet) {
+                    // curAlloc wasn't left in a good state, this is bad, it means hanging inserts may insert into an old allocation
+                    OnError(3);
+                }
+            }
+            #endif
             InsideReference* newAllocRef = (void*)((byte*)newAlloc - InsideReferenceSize);
             newAlloc->finishedMovingInto = true;
 
@@ -347,8 +353,10 @@ int atomicHashTable2_applyMoveTableOperationInner(
         // This means, that once we find a destIndex, if we try to insert it and find the dest slot is already being used,
         //  and not by our value, if we find sourceIndex is the same, we can atomically rollback destIndex.
 
+        bool alreadyInserted = !newRef;
         // Find a destination for the source, reserving it (now that the source is frozen, the hash won't change)
         if(newRef && moveState.destIndex == UINT32_MAX) {
+            alreadyInserted = false;
             
             uint64_t hash = Reference_GetHash(newRef);
 
@@ -359,10 +367,9 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 OutsideReference* pDest = &newAlloc->slots[index].value;
                 OutsideReference dest = *pDest;
                 if(FAST_CHECK_POINTER(dest, newRef)) {
-                    DebugLog2("found at index", newRef, __FILE__, index);
+                    DebugLog2("apply move, found at index, before release", newRef, __FILE__, index);
                     moveState.destIndex = (uint32_t)index;
-                    Reference_Release(&emptyReference, newRef);
-                    newRef = nullptr;
+                    alreadyInserted = true;
                     break;
                 }
                 if(dest.valueForSet == 0) {
@@ -396,21 +403,15 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 }
             }
             if(couldNotFindSpot) {
+                DebugLog2("applyMove, saw moved table, before release", newRef, __FILE__, index);
                 Reference_Release(&emptyReference, newRef);
                 continue;
             }
         }
 
-        if(newRef) {
+        if(!alreadyInserted) {
             // Now moveState.destIndex will have a value
             OutsideReference* pDest = &newAlloc->slots[moveState.destIndex].value;
-            
-            OutsideReference newSource = *pSource;
-            // Already wiped out source, so sourceIndex must have been incremented too
-            if(!newSource.pointerClipped) {
-                Reference_Release(&emptyReference, newRef);
-                continue;
-            }
 
             OutsideReference newDest = Reference_CreateOutsideReference(newRef);
 
@@ -422,21 +423,23 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 newDest.valueForSet,
                 0
             );
-            // If it isn't newRef, either someone took or spot, or we inserted, increased sourceIndex, and removed the original source
+            if(prevDest.valueForSet == 0) {
+                MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "moved in", newRef->hash);
+            }
+            // If we could isn't, either someone took our spot, or we inserted, increased sourceIndex, and removed the original source
             //  (in which case the rollback code will just fail and we will continue).
-            if(prevDest.valueForSet != 0) {
+            else if(prevDest.valueForSet != 0) {
                 if(!Reference_DestroyOutside(&newDest, newRef)) {
                     OnError(3);
                 }
                 IsInsideRefCorrupt(newRef);
-                if(FAST_CHECK_POINTER(prevDest, newRef)) {
-                    // Just retry, so we can catch it in the destIndex search loop
-                    Reference_Release(&emptyReference, newRef);
-                    continue;
-                }
-                else {
 
+                // If our spot has been taken by our value... then we don't need to retry
+                if(FAST_CHECK_POINTER(prevDest, newRef)) {
+                    MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "saw that already moved in", newRef->hash);
+                } else {
                     // The value must have been used up by an insert
+                    MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "spot taken by insert", newRef->hash);
 
                     InterlockedDecrement64(&newAlloc->slotsReserved);
                     InterlockedDecrement64(&newAlloc->slotsReservedWithNulls);
@@ -451,19 +454,24 @@ int atomicHashTable2_applyMoveTableOperationInner(
                     if(curMoveState.sourceIndex == moveState.sourceIndex) {
                         MoveStateInner newMoveState = moveState;
                         newMoveState.destIndex = UINT32_MAX;
-                        InterlockedCompareExchange64(
+                        if(InterlockedCompareExchange64(
                             (LONG64*)pMoveState,
                             newMoveState.valueForSet,
                             moveState.valueForSet
-                        );
+                        ) == moveState.valueForSet) {
+                            MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "reverted destIndex", newRef->hash);
+                        } else {
+                            MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "failed to revert destIndex", newRef->hash);
+                        }
+                    } else {
+                        MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "source index behind anyway", newRef->hash);
                     }
 
+                    DebugLog2("applyMove, reverter, before release", newRef, __FILE__, 0);
                     Reference_Release(&emptyReference, newRef);
-
                     continue;
                 }
             }
-            Reference_Release(&emptyReference, newRef);
         }
 
 
@@ -475,15 +483,25 @@ int atomicHashTable2_applyMoveTableOperationInner(
             newMoveState.valueForSet,
             moveState.valueForSet
         ) == moveState.valueForSet) {
-            if(Reference_FinishMove(pSource)) {   
+            if(Reference_FinishMove(pSource, newRef)) {   
                 InterlockedDecrement64((LONG64*)&curAlloc->slotsReserved);
             }
+            
+            MemLog_AddImpl((void*)curAlloc, moveState.sourceIndex, "moved out", newRef ? newRef->hash : 0);
+
+            DebugLog2("applyMove, incrementor, before release", newRef, __FILE__, 0);
+            Reference_Release(&emptyReference, newRef);
             countApplied++;
             if(countApplied > minApplyCount) {
                 // Not only is it the endOfBlock, but... because we replace it with BASE_NULL1, the original block in curAlloc will never
                 //  grow, so we will never move anything from this block to newAlloc again.
                 return 0;
             }
+        } else {
+            MemLog_AddImpl((void*)curAlloc, moveState.sourceIndex, "already moved out", newRef ? newRef->hash : 0);
+
+            DebugLog2("applyMove, failed incrementor, before release", newRef, __FILE__, 0);
+            Reference_Release(&emptyReference, newRef);
         }
     }
 
@@ -542,7 +560,8 @@ int atomicHashTable2_removeInner2(
                     }
                     else {
                         atomicHashTable2_updateReserved(this, table, &table->newAllocation, -1, 0);
-                        //printf("Removed %llu for %llu\n", index, hash);
+                        MemLog_AddImpl((void*)table, index, "remove", hash);
+                        MemLog_AddImpl((void*)table, ref, "hash ref", hash);
                     }
                 }
             }
@@ -956,6 +975,7 @@ int AtomicHashTable2_insertInner2(
                 DestroyUniqueOutsideRef(&valueOutsideRef);
                 continue;
             }
+            MemLog_AddImpl((void*)table, index, "insert", hash);
 			//printf("Inserted %llu (base %llu) for %llu\n", index, startIndex, hash);
 
 

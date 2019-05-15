@@ -1,0 +1,18 @@
+table=0000022C04FE8D28	hash=6C00000000000000	operation=insert	index=216
+table=0000022C04FE8D28	hash=6C00000000000000	operation=insert	index=217
+table=0000022C05193D28	hash=6C00000000000000	operation=moved in	index=432
+table=0000022C04FE8D28	hash=6C00000000000000	operation=moved out	index=216
+table=0000022C05193D28	hash=6C00000000000000	operation=moved in	index=433
+table=0000022C04FE8D28	hash=6C00000000000000	operation=moved out	index=217
+table=0000022C054D3D28	hash=6C00000000000000	operation=moved in	index=864
+table=0000022C05193D28	hash=6C00000000000000	operation=moved out	index=432
+table=0000022C054D3D28	hash=6C00000000000000	operation=moved in	index=865
+table=0000022C05193D28	hash=6C00000000000000	operation=moved out	index=433
+table=0000022C05B5BD28	hash=6C00000000000000	operation=moved in	index=1728
+table=0000022C054D3D28	hash=6C00000000000000	operation=moved out	index=864
+table=0000022C05B5BD28	hash=6C00000000000000	operation=moved in	index=1729
+table=0000022C054D3D28	hash=6C00000000000000	operation=moved out	index=865
+table=0000022C05B5BD28	hash=6C00000000000000	operation=moved out	index=1728
+table=0000022C06847D28	hash=6C00000000000000	operation=moved in	index=3456
+table=0000022C05B5BD28	hash=6C00000000000000	operation=moved out	index=1729
+table=0000022C06847D28	hash=6C00000000000000	operation=spot taken by insert	index=3456

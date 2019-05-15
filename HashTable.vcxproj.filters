@@ -42,6 +42,12 @@
     <ClCompile Include="MemPool.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="MemLog.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="BulkAlloc.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="mersenne-twister.h">
@@ -69,6 +75,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="MemPoolImpls.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MemLog.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="BulkAlloc.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

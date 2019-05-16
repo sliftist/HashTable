@@ -913,7 +913,8 @@ void WaitForAllThreads() {
 
 
 void runAtomicHashTableTest() {
-	//testTableMultiThreads(16, 2, threadedSizing);
+	// Speed test
+	testTableMultiThreads(1, 1, threadedSizing);
 
 	for (int i = 0; i < 100; i++) {
 		//testTableMultiThreads(16, 2, threadedChurn);

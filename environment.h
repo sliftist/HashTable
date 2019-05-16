@@ -14,8 +14,11 @@
 #define breakpoint() asm("int $3")
 #endif
 #else
-//#define breakpoint() ;
+#ifdef TESTS
+#define breakpoint() printf("hit breakpoint in release\n"); __debugbreak()
+#else
 #define breakpoint() __debugbreak()
+#endif
 #endif
 
 

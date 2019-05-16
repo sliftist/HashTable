@@ -222,8 +222,6 @@ void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
         return;
     }
 
-    pool->FreeCallback(pool->freeCallbackContext, value);
-
     while(true) {
         uint32_t prevValue = *pAllocated;
         uint32_t newValue = prevValue & ~(1 << (index % 8));

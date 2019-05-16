@@ -125,14 +125,9 @@ void* Reference_GetValue(InsideReference* ref);
 // Assumes ref isn't NULL
 #define Reference_GetValueFast(ref) ((void*)((byte*)(ref) + InsideReferenceSize))
 
-// Only really relevant in the free mempool callback. Returns true if the reference has been moved
-//  with Reference_AcquireStartMove, etc.
-// OH! And Find also wants this, so it can see if any values it stored may be moved, and so may be duplicates...
-//  - Delete doesn't need this though, as if it can remove a value before it becomes frozen, that value is gone
-//  - And insert doesn't, as if it can insert before a freeze, the value is there, and will be moved in necessary
+// True if it is moving, or has been moved (when it is moving it may be duplicated), or sometimes if it has
+//  been deleted while moving (so this is only good enough to detect duplicates with some false positives, not to handle memory management)
 bool Reference_HasBeenMoved(InsideReference* ref);
-
-
 
 // Of course the memory OutsideReference is stored in must be guaranteed to exist, and the reuse of the memory for other
 //  OutsideReferences is allowed, but you better not store arbitrary other memory there.
@@ -144,7 +139,9 @@ void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPoint
 uint64_t Reference_GetHash(InsideReference* ref);
 
 
-InsideReference* Reference_AcquireCheckIsMoved(OutsideReference* ref, bool* outIsMoved, bool* outIsFrozen);
+//InsideReference* Reference_AcquireCheckIsMoved(OutsideReference* ref, bool* outIsMoved, bool* outIsFrozen);
+#define Reference_AcquireCheckIsMoved(ref, outIsMoved, outIsFrozen)  Reference_AcquireCheckIsMovedProof(ref, outIsMoved, outIsFrozen, nullptr)
+InsideReference* Reference_AcquireCheckIsMovedProof(OutsideReference* ref, bool* outIsMoved, bool* outIsFrozen, OutsideReference* refSeen);
 
 // Freezes ref, so future Reference_AcquireCheckIsMoved calls will return nullptr, but true for outIsMoved
 //  (and so future Reference_Acquire calls will throw, as anything that is moved shouldn't be called with Reference_Acquire),
@@ -316,8 +313,6 @@ struct InsideReference {
             #define OUTSIDE_COUNT_BIT_INDEX (43)
             #define OUTSIDE_COUNT_1 (1ull << OUTSIDE_COUNT_BIT_INDEX)
             uint64_t outsideCount: 20;
-            // Means the value has been moved, which is something the destructor
-            //  callbacks likely want to know...
             uint64_t isCommittedToMove: 1;
         };
         uint64_t valueForSet;

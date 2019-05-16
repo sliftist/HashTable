@@ -153,7 +153,6 @@ bool IsOutsideRefCorruptInner(OutsideReference ref) {
 }
 
 
-
 bool Reference_HasBeenMoved(InsideReference* ref) {
     return !!ref->isCommittedToMove;
 }
@@ -191,9 +190,12 @@ InsideReference* Reference_AcquireInside(OutsideReference* pRef) {
 bool releaseInsideReferenceX(InsideReference* insideRef, const char* file, uint64_t line);
 #define releaseInsideReference(insideRef) releaseInsideReferenceX(insideRef, __FILE__, __LINE__)
 
-InsideReference* Reference_AcquireCheckIsMoved(OutsideReference* pRef, bool* outIsMoved, bool* outIsFrozen) {
+InsideReference* Reference_AcquireCheckIsMovedProof(OutsideReference* pRef, bool* outIsMoved, bool* outIsFrozen, OutsideReference* refSeen) {
     while(true) {
         OutsideReference ref = *pRef;
+        if(refSeen) {
+            *refSeen = ref;
+        }
         if(!ref.pointerAndCount) {
             // So 0, or BASE_NULL
             return nullptr;
@@ -277,29 +279,62 @@ InsideReference* Reference_AcquireIfNullX(OutsideReference* pRef, const char* fi
     return ref;
 }
 
+void setCommittedToMove(InsideReference* ref) {
+    while(true) {
+        InsideReferenceCount count;
+        count.valueForSet = ref->valueForSet;
+        InsideReferenceCount newCount = count;
+        newCount.isCommittedToMove = 1;
+        if(InterlockedCompareExchange64(
+            (LONG64*)&ref->valueForSet,
+            newCount.valueForSet,
+            count.valueForSet
+        ) == count.valueForSet) {
+            break;
+        }
+    }
+}
+
 int Reference_AcquireStartMove(OutsideReference* pRef, MemPool* newPool, uint64_t size, InsideReference** outNewRef) {
-    todonext
+    //todonext
     // Wait, if it is zero here... shouldn't we just immediately convert it to BASE_NULL2, and then skip the rest of the move code?
     //  I think this would fix a bug we have, and simplify the code considerably...
 
     OutsideReference outRef = *pRef;
     if(outRef.valueForSet == 0) {
+        if(InterlockedCompareExchange64(
+            (LONG64*)pRef,
+            BASE_NULL2.valueForSet,
+            0
+        ) != outRef.valueForSet) {
+            // Changed since we first read it
+            return Reference_AcquireStartMove(pRef, newPool, size, outNewRef);
+        }
+        return 0;
+    }
+    if(outRef.valueForSet == BASE_NULL.valueForSet) {
+        // We can't make BASE_NULL into a block end, because it still isn't a block end, just because it moved...
+        if(InterlockedCompareExchange64(
+            (LONG64*)pRef,
+            BASE_NULL1.valueForSet,
+            BASE_NULL.valueForSet
+        ) != outRef.valueForSet) {
+            // Changed since we first read it
+            return Reference_AcquireStartMove(pRef, newPool, size, outNewRef);
+        }
         return 0;
     }
 
-    if(outRef.isNull) {
-        if(outRef.pointerClipped) {
-            // Already frozen and copied, so acquire the reference, and then return
-            *outNewRef = Reference_AcquireIfNull(pRef);
-            DebugLog("Reference_AcquireStartMove already moved", *outNewRef);
-            return 0;
-        } else {
-            // A BASE_NULL value, either already moved, or never had a value to begin with
-            return 0;
-        }
-    } else {
-        // As valueForSet is not 0, it must have a value, and !isNull, it must have a real pointer
-        
+    if(outRef.isNull && outRef.pointerClipped) {
+        // Already frozen and copied, so acquire the reference, and then return
+        *outNewRef = Reference_AcquireIfNull(pRef);
+        DebugLog("Reference_AcquireStartMove already moved", *outNewRef);
+        return 0;
+    }
+
+    if(outRef.valueForSet == BASE_NULL2.valueForSet || outRef.valueForSet == BASE_NULL1.valueForSet) {
+        DebugLog("Reference_AcquireStartMove already finished moving", *outNewRef);
+        return 0;
     }
 
 	
@@ -312,19 +347,6 @@ int Reference_AcquireStartMove(OutsideReference* pRef, MemPool* newPool, uint64_
     }
 
 
-    while(true) {
-        InsideReferenceCount count;
-        count.valueForSet = oldRef->valueForSet;
-        InsideReferenceCount newCount = count;
-        newCount.isCommittedToMove = 1;
-        if(InterlockedCompareExchange64(
-            (LONG64*)&oldRef->valueForSet,
-            newCount.valueForSet,
-            count.valueForSet
-        ) == count.valueForSet) {
-            break;
-        }
-    }
 
 
     OutsideReference newOutRef;
@@ -340,6 +362,7 @@ int Reference_AcquireStartMove(OutsideReference* pRef, MemPool* newPool, uint64_
 
 
     InsideReference* newRef = (void*)PACKED_POINTER_GET_POINTER(newOutRef);
+
     
     #ifdef DEBUG_INSIDE_REFERENCES
     newRef->unsafeSource = oldRef;
@@ -352,6 +375,9 @@ int Reference_AcquireStartMove(OutsideReference* pRef, MemPool* newPool, uint64_
 
     DebugLog("Reference_AcquireStartMove, ref still private", newRef);
 
+    // Must be set before we have the changes of duplicates
+    setCommittedToMove(oldRef);
+
     if(!Reference_ReplaceOutside(
         pRef,
         oldRef,
@@ -363,12 +389,13 @@ int Reference_AcquireStartMove(OutsideReference* pRef, MemPool* newPool, uint64_
             // Impossible
             OnError(3);
         }
-        // Mark it as moved, as it did not become the new primary location, so it is essentially moved
-        newRef->isCommittedToMove = 1;
+        //MemLog_Add((void*)0, newRef, "not using alloc anyway", newRef->hash);
+
         Reference_Release(&emptyReference, newRef);
         // Retry, we should get the new allocatin right away this time.
         return Reference_AcquireStartMove(pRef, newPool, size, outNewRef);
     }
+
     DebugLog("Reference_AcquireStartMove moving from", oldRef);
 	Reference_Release(pRef, oldRef);
 
@@ -407,53 +434,48 @@ bool Reference_FinishMove(OutsideReference* pRef, InsideReference* insideRef) {
 
     while(true) {
         OutsideReference ref = *pRef;
-        if(ref.valueForSet == BASE_NULL2.valueForSet || ref.valueForSet == BASE_NULL1.valueForSet) {
+        if(ref.valueForSet == BASE_NULL2.valueForSet || !ref.pointerClipped) {
+            // Impossible, how did they get a ref from it, if it has been marked as previous empty (or has no value)?
+            //  Even if it is finished it should become BASE_NULL1...
+            OnError(3);
             return false;
         }
-        if(ref.pointerClipped) {
-            DebugLog("FinishMove", insideRef);
-            if(ref.pointerClipped && !ref.isNull) {
-                // Move never started?
-                OnError(3);
-            }
-            OutsideReference refFortest = ref;
-            refFortest.isNull = 0;
-            if(!FAST_CHECK_POINTER(refFortest, insideRef)) {
-                DebugLog("FinishMove, but the ref is different (probably because it was already finished)", insideRef);
-                continue;
-            }
 
-            // Move the ref count to the inside
-            InterlockedExchangeAdd64((LONG64*)&insideRef->valueForSet, ref.count);
+        if(ref.valueForSet == BASE_NULL1.valueForSet) {
+            return false;
+        }
 
-            if(InterlockedCompareExchange64(
-                (LONG64*)pRef,
-                BASE_NULL1.valueForSet,
-                ref.valueForSet
-            ) == ref.valueForSet) {
-                ref.isNull = 0;
-                // Release once for ourself, and once to destroy the outside ref
-                BitFieldSubtract(&insideRef->valueForSet, 1, OUTSIDE_COUNT_BIT_INDEX);
-                BitFieldSubtract(&insideRef->valueForSet, 1, 0);
-                DebugLog("FinishMove, success", insideRef);
-                return true;
-            } else {
-                // Undo the move of the ref count and try again
-                BitFieldSubtract(&insideRef->valueForSet, ref.count, 0);
-                DebugLog("FinishMove, value changed (probably already moved)", insideRef);
-            }
-        } else { // 0, and BASE_NULL, and really all nulls, but any nulls we use we checked before swapping
-            if(ref.count) {
-                // ref count to something without a pointer?
-                OnError(3);
-            }
-            if(InterlockedCompareExchange64(
-                (LONG64*)pRef,
-                BASE_NULL2.valueForSet,
-                ref.valueForSet
-            ) == ref.valueForSet) {
-                return false;
-            }
+
+        DebugLog("FinishMove", insideRef);
+        if(ref.pointerClipped && !ref.isNull) {
+            // Move never started?
+            OnError(3);
+        }
+        OutsideReference refFortest = ref;
+        refFortest.isNull = 0;
+        if(!FAST_CHECK_POINTER(refFortest, insideRef)) {
+            DebugLog("FinishMove, but the ref is different (probably because it was already finished)", insideRef);
+            continue;
+        }
+
+        // Move the ref count to the inside
+        InterlockedExchangeAdd64((LONG64*)&insideRef->valueForSet, ref.count);
+
+        if(InterlockedCompareExchange64(
+            (LONG64*)pRef,
+            BASE_NULL1.valueForSet,
+            ref.valueForSet
+        ) == ref.valueForSet) {
+            ref.isNull = 0;
+            // Release once for ourself, and once to destroy the outside ref
+            BitFieldSubtract(&insideRef->valueForSet, 1, OUTSIDE_COUNT_BIT_INDEX);
+            BitFieldSubtract(&insideRef->valueForSet, 1, 0);
+            DebugLog("FinishMove, success", insideRef);
+            return true;
+        } else {
+            // Undo the move of the ref count and try again
+            BitFieldSubtract(&insideRef->valueForSet, ref.count, 0);
+            DebugLog("FinishMove, value changed (probably already moved)", insideRef);
         }
     }
     
@@ -506,6 +528,9 @@ bool releaseInsideReferenceX(InsideReference* insideRef, const char* file, uint6
 			// Double free
 			breakpoint();
 		}
+
+        //MemLog_Add((void*)0, insideRef, "freeing inside ref", insideRef->hash);
+
         //printf("freed reference memory redirects %p\n", insideRef);
 		// No more references, and no more outside references so there will never be more references, so we can exclusively free now.
         MemPool* pool = insideRef->pool;
@@ -513,6 +538,7 @@ bool releaseInsideReferenceX(InsideReference* insideRef, const char* file, uint6
         insideRef->pool = (void*)SET_NON_POINTER_PATTERN(insideRef->pool);
         bool worked = HAS_NON_POINTER_PATTERN(insideRef->pool);
 		pool->Free(pool, insideRef);
+        
 		return true;
 	}
 	return false;
@@ -559,6 +585,8 @@ void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPoint
     }
     memset(ref, 0, sizeof(InsideReference));
     //printf("allocated ref %p\n", ref);
+
+    //MemLog_Add(size, ref, "alloc inside ref", hash);
 
 	outRef->valueForSet = 0;
     outRef->pointerClipped = (uint64_t)ref;
@@ -669,9 +697,9 @@ bool Reference_ReplaceOutsideX(OutsideReference* pOutsideRef, InsideReference* p
 
         BitFieldSubtract(&pInsideRef->valueForSet, 1, OUTSIDE_COUNT_BIT_INDEX);
 
-        if (IsInsideRefCorrupt(pInsideRef)) return true;
+        if (IsInsideRefCorrupt(pInsideRef)) return false;
         //printf("destroying outside reference for %p\n", pInsideRef);
-        if (IsInsideRefCorrupt(pInsideRef)) return true;
+        if (IsInsideRefCorrupt(pInsideRef)) return false;
         
         if(releaseInsideReference(pInsideRef)) {
             // If our reference's own reference was the last reference, that means the caller lied about

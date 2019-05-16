@@ -44,7 +44,7 @@ void MemPoolFixed_Free(MemPoolRecycle* pool, void* value);
 // VALUE_SIZE must already include MemPoolHashed_VALUE_OVERHEAD, (as you need to include it when making our allocation anyway...),
 //  also either zero out our memory, or call MemPoolHashed_Initialize(pool).
 //  holderRef must have incremented the inside reference count, not an outside count.
-#define MemPoolHashedDefault(VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderRef, freeCallbackContext, freeCallback) { (Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, freeCallbackContext, freeCallback, VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderRef, 0, 0 }
+#define MemPoolHashedDefault(VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderRef) { (Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderRef, 0, 0 }
 
 #pragma pack(push, 1)
 typedef struct {
@@ -62,10 +62,6 @@ typedef struct {
 typedef struct {
     void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
     void (*Free)(MemPool* pool, void* value);
-
-    void* freeCallbackContext;
-    // We call this with the avlue passed to our free, before we actually free the memory (or do whatever we do with it).
-    void (*FreeCallback)(void* freeCallbackContext, void* value);
 
     uint64_t VALUE_SIZE;
     uint64_t VALUE_COUNT;

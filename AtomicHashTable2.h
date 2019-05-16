@@ -12,13 +12,12 @@ extern "C" {
 //  be possible in the future.
 // TODO: Change resizing behavior, so if we get stuck at a larger size we... recover somehow?
 // TODO: Add support for greater table capacities when memory usage becomes very high. Or maybe just allow changing the capacity target per table?
+// TODO: Add first try sizing/shrinking, which is just resizing earlier, but exclusively, so only one thread does it, getting rid
+//      of the malloc contention problems (every thread allocates, because the first thread takes so long to allocate the others think
+//      it isn't happening, which results in way too much allocated, which either causes an allocation failure, or at the very least wastes time and has to be freed).
 
 // TODO: We need to add support for a dedicated malloc thread, so we can have a malloc prepared ahead of time,
 //  which lets us greatly reduce our worst case behavior.
-
-// TODO: High value sizes allow low slot count, and whenever the core count is much higher than the slot count it is
-//  much more likely for our retry loops to hit their limits. So... we should add some kind of minimum slot count?
-//  Or... something...
 
 
 #pragma pack(push, 1)
@@ -68,6 +67,8 @@ typedef __declspec(align(16)) struct {
     
     //AtomicHashTableBase*
     OutsideReference newAllocation;
+
+    uint64_t mallocId;
     
     uint64_t slotsReserved;
     uint64_t slotsReservedWithNulls;
@@ -123,6 +124,24 @@ typedef struct {
 // Returns 0 on success, and > 0 on failure
 int AtomicHashTable2_insert(AtomicHashTable2* self, uint64_t hash, void* value);
 
+
+//#define ATOMIC_PROOF
+
+typedef struct {
+    void* table;
+    uint64_t mallocId;
+} TableProof;
+typedef struct {
+    TableProof curTable;
+    TableProof newTable;
+
+    uint64_t removeCountCur;
+    uint64_t removeCountNew;
+
+    uint64_t extraLoops;
+    uint64_t removeCountInExtraLoops;
+} AtomicProof;
+
 // This function may have removed some of the values when an error is returned, or non of the values may have been removed.
 int AtomicHashTable2_remove(
 	AtomicHashTable2* self,
@@ -131,6 +150,9 @@ int AtomicHashTable2_remove(
 	// On true, removes the value from the table
     //  May be called multiple times for the value for one call.
 	bool(*callback)(void* callbackContext, void* value)
+    #ifdef ATOMIC_PROOF
+    ,AtomicProof *outProof
+    #endif
 );
 
 

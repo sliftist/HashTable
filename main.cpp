@@ -152,7 +152,20 @@ typedef struct {
 
 // TODO: Oh, pass Item** in, so we will actually be simulating dynamic allocation and memory management.
 void deleteItem(void* itemVoid) {
+	//todonext
+	// This is getting called multiple times, but... I have no idea how the first call is happening? There isn't a freeing inside ref call at all...
+	//	it just... gets called...? On move out?
+
 	Item* item = (Item*)itemVoid;
+
+	if(item->item->a != item->itemInline.a
+	|| item->item->b != item->itemInline.b
+	|| item->item->c != item->itemInline.c) {
+		// Item is corrupted
+		OnError(3);
+	}
+
+	MemLog_Add(nullptr, (uint64_t)item->item, "free", getHash(item->item->a, item->item->b));
 	BulkAlloc_free(&itemAllocator, item->item);
 }
 
@@ -168,12 +181,18 @@ void testAdd2(AtomicHashTable2& table, uint64_t a, uint64_t b, uint64_t c) {
 
 	item.item = (ItemInner*)BulkAlloc_alloc(&itemAllocator);
 	*item.item = itemInner;
-	
+
 	uint64_t hash = getHash(a, b);
+
+	MemLog_Add((const char*)(void*)&table, (uint64_t)item.item, "alloc", hash);
 
 	ErrorTop(AtomicHashTable2_insert(&table, hash, &item));
 }
-uint64_t testRemove2(AtomicHashTable2& table, ItemInner& item) {
+uint64_t testRemove2(AtomicHashTable2& table, ItemInner& item
+#ifdef ATOMIC_PROOF
+,AtomicProof* proof = nullptr
+#endif
+) {
 	uint64_t hash = getHash(item.a, item.b);
 	uint64_t count = 0;
 
@@ -186,7 +205,11 @@ uint64_t testRemove2(AtomicHashTable2& table, ItemInner& item) {
 		return shouldRemove;
 	});
 	
-	int result = AtomicHashTable2_remove(&table, hash, removeCallback.getContext(), removeCallback.callbackFnc);
+	int result = AtomicHashTable2_remove(&table, hash, removeCallback.getContext(), removeCallback.callbackFnc
+		#ifdef ATOMIC_PROOF
+		,proof
+		#endif
+	);
 	ErrorTop(result);
 	return count;
 }
@@ -244,8 +267,8 @@ uint64_t testGetCount2(AtomicHashTable2& table, uint64_t a, uint64_t b) {
 void checkForLeaks(
 	std::function<void(AtomicHashTable2&)> const& run
 ) {
-	MemLog_Reset();
-	BulkAlloc_ctor(&itemAllocator, sizeof(ItemInner));
+	MemLog_Init();
+	BulkAlloc_ctor(&itemAllocator, sizeof(Item));
 	AtomicHashTable2 table = AtomicHashTableDefault(sizeof(Item), deleteItem);
 
 
@@ -260,6 +283,10 @@ void checkForLeaks(
 	}
 	printf("Allocation count after dtor %llu\n", SystemAllocationCount);
 	MemLog_Reset();
+
+	#ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+		printf("\t%f search pressure (1 means there were no hash collisions)\n", (double)table.searchLoops / (double)table.searchStarts);
+	#endif
 }
 
 typedef struct {
@@ -298,6 +325,7 @@ void testTableMultiThreads(
 			WaitForSingleObject(threads[i].thread, INFINITE);
 			printf("Finished thread %d\n", i);
 		}
+		delete[] threads;
 	});
 }
 
@@ -374,16 +402,12 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 
 	uint64_t repeatCount = 1;
 	if(variation == 4) {
-		#ifdef DEBUG
 		repeatCount = 100;
-		#else 
-		repeatCount = 1000 * 100;
-		#endif
 	} else if(variation == 2) {
 		#ifdef DEBUG
 		repeatCount = 1;
 		#else 
-		repeatCount = 100;
+		repeatCount = 1;
 		#endif
 	}
 	else if(variation == 0) {
@@ -409,11 +433,11 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 	else if(variation == 2) {
 		//itemCount = (1ll << 23);
 		// Requires 64GB of memory to work, but after struggling at lot at 64GB, it will free ~20GB, then the remaining ~60GB when it finishes
-		//	EDIT: Changed to use less memory?
+		//	EDIT: Changed to use less memory? Because we allocate these put thread, which can be upto 16 threads...
 		#ifdef DEBUG
 		itemCount = (1ll << 18);
 		#else
-		itemCount = (1ll << 23);
+		itemCount = (1ll << 21);
 		#endif
 	}
 	else if(variation == 3) {
@@ -517,7 +541,7 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 					context.item.b = j + itemCount;
 
 					uint64_t hash = hashes[j];
-					// This call takes around 26 instructions, With setting up context, the asserts and for loop around this taking around 14 instructions
+					// This call takes around 27 instructions, With setting up context, the asserts and for loop around this taking around 14 instructions
 					int result = AtomicHashTable2_find(&table, hash, &context, [](void* contextAny, void* value) {
 						Context* context = (Context*)contextAny;
 						Item* pItem = (Item*)value;
@@ -564,13 +588,63 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 			item.b = i;
 			item.c = i;
 
+			#ifdef ATOMIC_PROOF
+			AtomicProof proof = { 0 };
+			#endif
 			tickStart();
-			uint64_t removeCount = testRemove2(table, item);
+			uint64_t removeCount = testRemove2(table, item
+				#ifdef ATOMIC_PROOF
+				,&proof
+				#endif
+			);
 			tickEnd();
 			// It can be more than 2, due as we might have gotten it, decided to delete it, and then found it was moved, which will
 			//	mean we will have to find it in the new allocation and check if we want to delete it again, resulting in many calls
 			//	to the remove test function. We need at least 2 calls though, or else it clearly isn't deleting 2 entries.
 			if (removeCount < 2) {
+				uint64_t countLeft = testGetCount2(table, i, i);
+				if (countLeft > 0) {
+
+					//printf("found error\n");
+					//todonext
+					// Add an uninitialized id which we autoincrement on malloc, so we can track versions of a table an filter them out across mallocs.
+					//	Then pass that id (for the current and new allocation) back as proof from testRemove2, and then only print info on those
+					//	ids (and the one before and after, to catch some recurrent allocation bugs).
+					//	Also, start logging every index we check, and the values we saw at the indexes, and during inserts also log the inside references
+					//		we inserted (and saw?).
+					// OH! And also, have a fixed size array to record indexes we wrote to, and then also log every change of those indexes in those tables...
+					// Then... that should be sufficient to completely know the relevant state, which should make debugging it trivial...
+
+					//todonext
+					// Or... maybe... pass a debug param to testRemove2, saying the number of removes we expect, and keep track of the current removes,
+					//	and if we finish the newTable check, and are less than that, AND find the new table doesn't have another table after that...
+					//	then breakpoint()?
+
+					//todonext
+					// Get the new allocation uint64_t before we call testRemove, and/or after it? Because we just really need the pointer value
+					//	to get logsTableNew to write correctly, so we can see why the search didn't find the values in the curTable, even though they
+					//	weren't in the newTable yet...
+					// Yeah, the problem is probably that we couldn't find the value in curTable. The values were being moved while we were moving,
+					//	but... that should be fine...
+					#ifdef ATOMIC_PROOF
+				
+
+					uint64_t countLeft2 = testGetCount2(table, i, i);
+					printf("left=%d, remove%d\n", countLeft2, removeCount);
+
+					MemLog_SaveValuesTable("./logsTable.txt", proof.curTable.table, proof.curTable.mallocId, getHash(i, i));
+					if(proof.newTable.table) {
+						MemLog_SaveValuesTable("./logsTableNew.txt", proof.newTable.table, proof.newTable.mallocId, getHash(i, i));
+					}
+
+					uint64_t countLeft3 = testGetCount2(table, i, i);
+					printf("left2=%d, remove%d\n", countLeft3, removeCount);
+
+					#endif
+
+					OnError(3);
+					
+				}
 				OnError(3);
 			}
 
@@ -593,10 +667,6 @@ void testSizingVarInner(AtomicHashTable2& table, int variation, int threadIndex)
 	if (variation != 0 && variation != 1) {
 		Timing_EndRootPrint(&rootTimer, itemCount * factor * repeatCount);
 	}
-	
-#ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
-	printf("\t%f search pressure (1 means there were no hash collisions)\n", (double)table.searchLoops / (double)table.searchStarts);
-#endif
 }
 
 void testSizingVar(int variation) {
@@ -609,7 +679,9 @@ void testSizing() {
 	checkForLeaks([](AtomicHashTable2& table){ testSizingVarInner(table, 0, 0); });
 	
 	// Get speed tests
+	// find operations
 	checkForLeaks([](AtomicHashTable2& table){ testSizingVarInner(table, 1, 0); });
+	// many operations
 	checkForLeaks([](AtomicHashTable2& table){ testSizingVarInner(table, 3, 0); });
 
 	// Test to make sure we can scale large
@@ -659,9 +731,6 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 		randomBytesSecure((unsigned char*)randomIndexes, (int)(iterationCount * sizeof(int64_t)));
 		randomBytesSecure((unsigned char*)items, (int)(itemCount * sizeof(ItemInner)));
 	}
-
-
-	
 
 
 	std::vector<ItemInner> itemsNotAdded(items, items + itemCount);
@@ -717,6 +786,7 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 
 			// Count could be higher than 1, it just means we had to try a few times to remove it
 			if (count < 1) {
+				breakpoint();
 				uint64_t count2 = testRemove2(table, item);
 				AssertEqual(true, false);
 			}
@@ -767,7 +837,9 @@ void testHashChurn2VarInner(AtomicHashTable2& table, int variation, int threadIn
 		}
 	}
 
-	
+	free(randomChoices);
+	free(randomIndexes);
+	free(items);
 }
 
 void testHashChurn2Var(int variation) {
@@ -841,9 +913,17 @@ void WaitForAllThreads() {
 
 
 void runAtomicHashTableTest() {
-	testTableMultiThreads(16, 0, threadedSizing);
+	//testTableMultiThreads(16, 2, threadedSizing);
 
 	for (int i = 0; i < 100; i++) {
+		//testTableMultiThreads(16, 2, threadedChurn);
+	}
+	//checkForLeaks([](AtomicHashTable2& table) { testSizingVarInner(table, 0, 0); });
+	//checkForLeaks([](AtomicHashTable2& table){ testSizingVarInner(table, 1, 0); });
+
+	for (int i = 0; i < 100; i++) {
+		//testTableMultiThreads(2, 4, threadedSizing);
+		//testTableMultiThreads(16, 2, threadedChurn);
 		//testTableMultiThreads(2, 4, threadedSizing);
 		//testTableMultiThreads(2, 4, threadedSizing);
 		//testTableMultiThreads(2, 4, threadedSizing);
@@ -855,48 +935,55 @@ void runAtomicHashTableTest() {
 	//testSizingVar(1);
 
 	// TODO: Add a debug wrapper for malloc and free, so we can track the number of allocations, and run tests to make sure we don't leak allocations.
-	#ifdef DEBUG
-	IsSingleThreadedTest = true;
-	#endif
-
-	testSizing();
-	testHashChurn2();
-
-	#ifdef DEBUG
-	IsSingleThreadedTest = false;
-	#endif
+	
 	//*/
 	
 	//testTableMultiThreads(2, 4, threadedSizing);
 
-	//*
-	printf("ran single threaded tests\n");
+		//*
+	for(uint64_t i = 0; i < 100; i++) {
+		printf("start test look %d\n", i);
+		#ifdef DEBUG
+		IsSingleThreadedTest = true;
+		#endif
 
-	printf("0 to N with a lot of verification, a few times\n");
-	testTableMultiThreads(1, 0, threadedSizing);
-	testTableMultiThreads(2, 0, threadedSizing);
-	testTableMultiThreads(16, 0, threadedSizing);
+		testSizing();
+		testHashChurn2();
 
-	printf("0 to N, many times\n");
-	testTableMultiThreads(1, 4, threadedSizing);
-	testTableMultiThreads(2, 4, threadedSizing);
-	testTableMultiThreads(16, 4, threadedSizing);
+		#ifdef DEBUG
+		IsSingleThreadedTest = false;
+		#endif
 
-	printf("0 to large N, many times\n");
-	testTableMultiThreads(1, 4, threadedSizing);
-	testTableMultiThreads(2, 4, threadedSizing);
-	testTableMultiThreads(16, 4, threadedSizing);
+		printf("ran single threaded tests\n");
 
-	printf("churn medium amount of random items, many times\n");
-	testTableMultiThreads(1, 2, threadedChurn);
-	testTableMultiThreads(2, 2, threadedChurn);
-	testTableMultiThreads(16, 2, threadedChurn);
+		printf("0 to N with a lot of verification, a few times\n");
+		testTableMultiThreads(1, 0, threadedSizing);
+		testTableMultiThreads(2, 0, threadedSizing);
+		testTableMultiThreads(16, 0, threadedSizing);
 
-	printf("churn medium amount of random items, more random, many times\n");
-	testTableMultiThreads(1, 1, threadedChurn);
-	testTableMultiThreads(2, 1, threadedChurn);
-	testTableMultiThreads(16, 1, threadedChurn);
-	//*/
+		printf("churn medium amount of random items, many times\n");
+		testTableMultiThreads(1, 2, threadedChurn);
+		testTableMultiThreads(2, 2, threadedChurn);
+		testTableMultiThreads(16, 2, threadedChurn);
+
+		printf("churn medium amount of random items, more random, many times\n");
+		testTableMultiThreads(1, 1, threadedChurn);
+		testTableMultiThreads(2, 1, threadedChurn);
+		testTableMultiThreads(16, 1, threadedChurn);
+
+		printf("0 to N, many times\n");
+		testTableMultiThreads(1, 3, threadedSizing);
+		testTableMultiThreads(2, 3, threadedSizing);
+		testTableMultiThreads(16, 3, threadedSizing);
+
+		for(uint64_t i = 0; i < 10; i++) {
+			printf("0 to large N, many times\n");
+			testTableMultiThreads(1, 4, threadedSizing);
+			testTableMultiThreads(2, 4, threadedSizing);
+			testTableMultiThreads(16, 4, threadedSizing);
+		}
+	}
+		//*/
 
 
 	// many operations speed

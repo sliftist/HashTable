@@ -30,21 +30,25 @@ void* BulkAlloc_alloc(BulkAlloc* this) {
 
     {
         BulkAlloc_Alloc* firstAlloc = &this->allocations[0].data;
-        BulkAlloc_Alloc alloc = { 0 };
-        alloc.count = 128;
-        alloc.allocation = malloc(alloc.count * this->size);
-        if(!alloc.allocation) {
-            // Out of memory
-            OnError(3);
-            return nullptr;
+        if(!firstAlloc->allocation) {
+            BulkAlloc_Alloc alloc = { 0 };
+            alloc.count = 128;
+            alloc.allocation = malloc(alloc.count * this->size);
+            if(!alloc.allocation) {
+                // Out of memory
+                OnError(3);
+                return nullptr;
+            }
+            memset(alloc.allocation, 0, alloc.count * this->size);
+            BulkAlloc_Alloc zeroAlloc = { 0 };
+            if(!InterlockedCompareExchangeStruct128(
+                firstAlloc,
+                &zeroAlloc,
+                &alloc
+            )) {
+                free(alloc.allocation);
+            }
         }
-        memset(alloc.allocation, 0, alloc.count * this->size);
-        BulkAlloc_Alloc zeroAlloc = { 0 };
-        InterlockedCompareExchangeStruct128(
-            firstAlloc,
-            &zeroAlloc,
-            &alloc
-        );
     }
 
     for(uint64_t offset = 0; offset < BulkAlloc_AllocationCount; offset++) {
@@ -123,6 +127,11 @@ void* BulkAlloc_alloc(BulkAlloc* this) {
             }
             void* newAllocation = malloc(size * allocCount);
             if(!newAllocation) {
+                if(pNextAlloc->allocation) {
+                    // Many threads probably raced to allocate this, which is why we failed to allocate, but someone
+                    //  allocated and shared the allocation, so... we can just continue
+                    continue;
+                }
                 // Just out of memory...
                 OnError(3);
                 return nullptr;

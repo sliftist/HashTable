@@ -19,14 +19,12 @@ uint64_t log2RoundDown(uint64_t v) {
 	return log2(v * 2) - 1;
 }
 
-// 3 64 bits for indirection, 1 for pool, 1 for ref count, 1 for hash and 1 BIT to know if the allocation is free.
+// 1+1/4 64 bits for counting references, 1+3/4 for dealing with internal memory management, 1 for the hash
 //  Way to save space:
-//  - The indirection could be on offset, as every value in each table redirects to the same thing, so that would work. It would also make moving a lot faster,
-//      and we could potentially use that to redesign our redirection, maybe not even having to call redirect on every value. But... it is nice to have
-//      redirect be abstract, and changing it now is too much work.
-//  - The pool could be passed in everywhere, but that is a massive headache, and although that might use less memory, it will almost certainly slow down the code.
-//  - The ref count could be less, but it's holding structure has to be 64 bit aligned anyway.
-//  - The hash could be less than 64 bits, but... the downside by increasing hash collisions isn't worth it. If anything we should make hashing use 128 bits.
+//  - 1 uint64_t is used to store the pool per inside reference. Each reference in a table will either use that tables
+//      MemPool, or the next tables, so we could get this to only use 1 bit...
+//  - The inside count could probably be merged with something else
+//  - The hash should use more bits if anything, as hash bits pay off in reducing the number of deep comparisons needed.
 #define SIZE_PER_VALUE_ALLOC(table) (table->VALUE_SIZE + InsideReferenceSize + MemPoolHashed_VALUE_OVERHEAD)
 #define SIZE_PER_COUNT(table) (SIZE_PER_VALUE_ALLOC(table) + sizeof(AtomicSlot))
 
@@ -39,12 +37,17 @@ uint64_t minSlotCount(AtomicHashTable2* this) {
     #define TARGET_PAGES 1
     #endif
 
+    /*
     uint64_t minCount = (PAGE_SIZE * TARGET_PAGES - sizeof(AtomicHashTableBase) - InsideReferenceSize - sizeof(MemPoolHashed)) / sizePerCount;
 
     // Must be a power of 2, for getSlotBaseIndex
     minCount = 1ll << log2RoundDown(minCount);
 
     return minCount;
+    */
+
+    // 64 is good enough, we can't go much smaller or else we can have contention issues, no matter how many pages 64 entries takes up...
+    return 64;
 }
 uint64_t getTableSize(AtomicHashTable2* this, uint64_t slotCount) {
     uint64_t tableSize = SIZE_PER_COUNT(this) * slotCount + sizeof(AtomicHashTableBase) + sizeof(MemPoolHashed);
@@ -71,14 +74,6 @@ uint64_t newGrowSize(AtomicHashTable2* this, uint64_t slotCount, uint64_t fillCo
 }
 
 
-void atomicHashTable2_memPoolFreeCallback(AtomicHashTable2* this, InsideReference* ref) {
-    if(!Reference_HasBeenMoved(ref)) {
-        // And if it hasn't, it never will be, as the free callback is only called when all outside and inside references are gone...
-        void* userValue = (byte*)ref + InsideReferenceSize;
-        this->deleteValue(userValue);
-    }
-}
-
 //todonext
 // Wait... when we attempt to get a reference, we might temporarily turn a tombstone into having a count, which will make it look like it is moved?
 //  Crap...
@@ -104,6 +99,8 @@ void atomicHashTable2_updateReservedUndo(
     //printf("Add (undo) %lld to slotsReserved\n", slotsReservedDelta);
     InterlockedAdd64((LONG64*)&curAlloc->slotsReserved, (LONG64)slotsReservedDelta);
     InterlockedAdd64((LONG64*)&curAlloc->slotsReservedWithNulls, (LONG64)slotsReservedWithNullsDelta);
+
+    //MemLog_Add((void*)curAlloc, curAlloc->slotsReserved, "updatedReservedUndo", 3);
 }
 // Doesn't apply any moves.
 // Returns 1 when it hasn't updated the reserved count
@@ -122,6 +119,7 @@ int atomicHashTable2_updateReserved(
         if(curAlloc->newAllocation.valueForSet != 0) {
             if(curAlloc->slotsReservedWithNulls >= curAlloc->slotsCount) {
                 if(curAlloc->newAllocation.isNull) {
+                    //MemLog_Add((void*)curAlloc, curAlloc->slotsReserved, "updatedReserved[slotsReservedNulls], finished moving", 3);
                     return 1;
                 }
                 // This means that we used up all existing entries before we could finish our move,
@@ -132,6 +130,7 @@ int atomicHashTable2_updateReserved(
                 OnError(5);
                 return 5;
             }
+            //MemLog_Add((void*)curAlloc, curAlloc->slotsReserved, "updatedReserved[slotsReservedNulls], but already moving", 3);
             // If we are already moving don't both checking if we should move again... because we can't...
             return 0;
         }
@@ -145,6 +144,7 @@ int atomicHashTable2_updateReserved(
     uint64_t curSlotCount = curAlloc ? curAlloc->slotsCount : 0;
     uint64_t slotsReservedNulls = curAlloc ? curAlloc->slotsReservedWithNulls : 1;
     uint64_t slotsReservedNoNulls = curAlloc ? curAlloc->slotsReserved : 1;
+
     // If we really don't have that many nulls, then don't use the count with nulls. This makes sure
     //  we only do same size resizes when we have enough nulls, instead of when we are near a threshold and
     //  have only a few nulls (as resizing to the same size prematurely can make all operations O(N)).
@@ -167,9 +167,18 @@ int atomicHashTable2_updateReserved(
     }
 	#endif
 
+    if(curAlloc) {
+        //MemLog_Add((void*)curAlloc, slotsReservedNulls, "updatedReserved[slotsReservedNulls]", 3);
+        //MemLog_Add((void*)curAlloc, slotsReservedNoNulls, "updatedReserved[slotsReservedNoNulls]", 3);
+        //MemLog_Add((void*)curAlloc, curAlloc->slotsCount, "updatedReserved[count]", 3);
+    }
+
     newSlotCount = newShrinkSize(this, curSlotCount, slotsReservedNoNulls);
     newSlotCount = newSlotCount != 0 && newSlotCount != curSlotCount ? newSlotCount : newGrowSize(this, curSlotCount, slotsReservedNulls);
     if(!newSlotCount || newSlotCount == curSlotCount) {
+        if(curAlloc) {
+            //MemLog_Add((void*)curAlloc, 0, "updatedReserved, not resizing", 3);
+        }
         return 0;
     }
 
@@ -184,6 +193,9 @@ int atomicHashTable2_updateReserved(
         if(newSlotCount <= curSlotCount) {
             // We aren't going to shrink WHILE we are being moved into. That doesn't make any sense, obviously
             //  our count will increase as we continue moving...
+            if(curAlloc) {
+                //MemLog_Add((void*)curAlloc, 0, "updatedReserved, not resizing 2", 3);
+            }
             return 0;
         }
 
@@ -195,8 +207,14 @@ int atomicHashTable2_updateReserved(
             //  on each insert to prevent this from happening...
             OnError(9);
         }
+        if(curAlloc) {
+            //MemLog_Add((void*)curAlloc, 0, "updatedReserved, not resizing 3", 3);
+        }
         return 0;
     }
+
+    // TODO: We need to add first try resizing (and shrinking) here, and in the BulkAlloc code, to get rid of the allocation contention
+    //  that happens ever time we need to resize.
 
     // Create and prepare the new allocation
     OutsideReference newAllocation;
@@ -204,6 +222,12 @@ int atomicHashTable2_updateReserved(
     uint64_t tableSize = getTableSize(this, newSlotCount);
     Reference_Allocate((MemPool*)&memPoolSystem, &newAllocation, &newTable, tableSize, 0);
     if(!newTable) {
+        if(curAlloc->newAllocation.valueForSet != 0) {
+            // We just raced with other threads to allocate, but someone allocated, so we can just retry and this time
+            //  we won't need to resize.
+            return 1;
+        }
+        breakpoint();
         return 3;
     }
 
@@ -220,6 +244,7 @@ int atomicHashTable2_updateReserved(
     newTable->slotsReserved = 0;
     newTable->slotsReservedWithNulls = 0;
     newTable->finishedMovingInto = false;
+    InterlockedIncrement64(&newTable->mallocId);
 
     
     memset(newTable->slots, 0x00, newSlotCount * sizeof(uint64_t));
@@ -230,7 +255,7 @@ int atomicHashTable2_updateReserved(
 
     InsideReference* newTableRef = Reference_AcquireInside(&newAllocation);
 
-    MemPoolHashed pool = MemPoolHashedDefault(SIZE_PER_VALUE_ALLOC(this), newSlotCount, logSlotsCount, newTableRef, this, atomicHashTable2_memPoolFreeCallback);
+    MemPoolHashed pool = MemPoolHashedDefault(SIZE_PER_VALUE_ALLOC(this), newSlotCount, logSlotsCount, newTableRef);
     *newTable->valuePool = pool;
     MemPoolHashed_Initialize(newTable->valuePool);
 
@@ -241,19 +266,43 @@ int atomicHashTable2_updateReserved(
     }
 	*/
 
+    if(curAlloc) {
+        //MemLog_Add((void*)curAlloc, newSlotCount, "updatedReserved, resizing", 3);
+    }
+    //MemLog_Add((void*)newTable, newSlotCount, "updatedReserved, resizing, newAllocation", 3);
+
     // This could hang and create a race. Worst case it doubles the maximum fill rate by going in the wrong direction, which would create an
     //  80% fill... which is fine, we can move into a smaller allocation, and then out in the time it would take to use that 20%
+
+    MemLog_Add((void*)curAlloc, 0, "DTOR START", 0);
+    MemLog_Add((void*)newTable, 0, "NEW START", 0);
     
     if(InterlockedCompareExchange64(
         (LONG64*)pNewAlloc,
         newAllocation.valueForSet,
         0
     ) != 0) {
+        MemLog_Add((void*)newTable, 0, "NEW ABORT", 0);
+
+        #ifdef DEBUG
+        if(IsSingleThreadedTest) {
+            // Should race with self for inserting the allocation...
+            OnError(3);
+        }
+        #endif
+        if(curAlloc) {
+            //MemLog_Add((void*)curAlloc, newSlotCount, "updatedReserved, resize failed", 3);
+        }
         //printf("failed to add %p\n", newTableRef);
         MemPoolHashed_Destruct(newTable->valuePool);
         DestroyUniqueOutsideRef(&newAllocation);
         return 1;
     }
+
+    if(curAlloc) {
+        //MemLog_Add((void*)curAlloc, newSlotCount, "updatedReserved, resized", 3);
+    }
+
     //printf("starting new move size %llu to %llu, using %llu, saw using %llu\n", curAlloc ? curAlloc->slotsCount : 0, newTable->slotsCount, curAlloc ? curAlloc->slotsReserved : 0, slotsReservedNoNulls);
     return 0;
 }
@@ -268,6 +317,10 @@ int atomicHashTable2_applyMoveTableOperationInner(
     AtomicHashTableBase* curAlloc,
     AtomicHashTableBase* newAlloc
 ) {
+    //todonext
+    // So... I think recurrent addresses are causing the problems with remove.
+    // We should add logging for inserts too, so we can build a better map of what is happening with the slots
+
     uint64_t VALUE_SIZE = this->VALUE_SIZE;
 
     // Hash block checking doesn't work because of wrap around (at least, it can't be efficient because of wrap around).
@@ -275,7 +328,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
     //  that block was already moved, or we just moved it... so this works...
 
 	// This has to be a certain size above our grow/shrink thresholds or else we will try to grow before we finish moving!
-    uint64_t minApplyCount = 64;   
+    uint64_t minApplyCount = 64;
 
     uint64_t countApplied = 0;
 
@@ -286,10 +339,16 @@ int atomicHashTable2_applyMoveTableOperationInner(
     MoveStateInner moveState = { 0 };
     while(true) {
         #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
-        InterlockedIncrement64((LONG64*)&this->searchLoops);
+        InterlockedIncrement64((LONG64*)&this->searchStarts);
         #endif
         loops++;
-        if(loops > curAlloc->slotsCount * 10) {
+        if(loops > curAlloc->slotsCount * 10) {          
+            /*
+			printf("took many iterations in move, iterated %llu times, advanced %llu, slot count %llu\n", loops, countApplied, curAlloc->slotsCount);
+            #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+                printf("\t%f search pressure (1 means there were no hash collisions)\n", (double)this->searchLoops / (double)this->searchStarts);
+            #endif
+            */
             OnError(9);
             return 9;
         }
@@ -297,16 +356,34 @@ int atomicHashTable2_applyMoveTableOperationInner(
         // Move state is small enough that access are implicitly atomic (as it is 64 bits, and 64 bit aligned)
         moveState = *pMoveState;
 
-        if(moveState.sourceIndex >= curAlloc->slotsCount) {
+        
+
+        if(moveState.sourceIndex >= curAlloc->slotsCount
+        // todonext
+        // This check is good, but it shouldn't be needed, and I am getting the sneaking suspicious it might be needed...
+        //|| newAlloc->finishedMovingInto
+        ) {
+            MemLog_Add((void*)curAlloc, 0, "DTOR FINISH", 0);
+            MemLog_Add((void*)newAlloc, 0, "NEW FINISH", 0);
+
+            #ifdef DEBUG
+            if(curAlloc->slotsReserved > 30) {
+                // We can have as many entries as we have threads, as each thread could be holding a reserved slot
+				//	(which it will free when it reserves).
+                OnError(3);
+            }
+            #endif
+            /*
             #ifdef DEBUG
             for(uint64_t i = 0; i < curAlloc->slotsCount; i++) {
                 OutsideReference value = curAlloc->slots[i].value;
-                if(value.valueForSet != BASE_NULL1.valueForSet && value.valueForSet != BASE_NULL2.valueForSet) {
+                if(!value.isNull || value.valueForSet == BASE_NULL.valueForSet) {
                     // curAlloc wasn't left in a good state, this is bad, it means hanging inserts may insert into an old allocation
                     OnError(3);
                 }
             }
             #endif
+            */
             InsideReference* newAllocRef = (void*)((byte*)newAlloc - InsideReferenceSize);
             newAlloc->finishedMovingInto = true;
 
@@ -330,21 +407,36 @@ int atomicHashTable2_applyMoveTableOperationInner(
 
         InsideReference* newRef = nullptr;
         int result = Reference_AcquireStartMove(pSource, (MemPool*)newAlloc->valuePool, this->VALUE_SIZE, &newRef);
+        if(result == 1) {
+            continue;
+        }
         
         if(result > 0) {
             if(result == 3) {
                 if(newAlloc->valuePool->countForSet.destructed) {
                     return 1;
-                }            
+                }
+                breakpoint();
             }
             return result;
         }
+        // If there is nothing to move, Reference_AcquireStartMove already mark the source as moved, so just increment the sourceIndex
+        if(!newRef) {
+            MoveStateInner newMoveState = moveState;
+            newMoveState.sourceIndex++;
+            newMoveState.destIndex = UINT32_MAX;
+            InterlockedCompareExchange64(
+                (LONG64*)pMoveState,
+                newMoveState.valueForSet,
+                moveState.valueForSet
+            );
+            continue;
+        }
 
-        if(newRef) {
-            if(!MemPoolHashed_IsInPool(newAlloc->valuePool, newRef)) {
-                // What? Did start move not work?
-                breakpoint();
-            }
+
+        if(!MemPoolHashed_IsInPool(newAlloc->valuePool, newRef)) {
+            // What? Did start move not work?
+            breakpoint();
         }
 
         // Rule for finding where to put it:
@@ -353,9 +445,9 @@ int atomicHashTable2_applyMoveTableOperationInner(
         // This means, that once we find a destIndex, if we try to insert it and find the dest slot is already being used,
         //  and not by our value, if we find sourceIndex is the same, we can atomically rollback destIndex.
 
-        bool alreadyInserted = !newRef;
+        bool alreadyInserted = false;
         // Find a destination for the source, reserving it (now that the source is frozen, the hash won't change)
-        if(newRef && moveState.destIndex == UINT32_MAX) {
+        if(moveState.destIndex == UINT32_MAX) {
             alreadyInserted = false;
             
             uint64_t hash = Reference_GetHash(newRef);
@@ -424,11 +516,14 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 0
             );
             if(prevDest.valueForSet == 0) {
-                MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "moved in", newRef->hash);
+                MemLog_Add((void*)newAlloc, moveState.destIndex, "moved in", newRef->hash);
             }
             // If we could isn't, either someone took our spot, or we inserted, increased sourceIndex, and removed the original source
             //  (in which case the rollback code will just fail and we will continue).
             else if(prevDest.valueForSet != 0) {
+                InterlockedDecrement64(&newAlloc->slotsReserved);
+                InterlockedDecrement64(&newAlloc->slotsReservedWithNulls);
+
                 if(!Reference_DestroyOutside(&newDest, newRef)) {
                     OnError(3);
                 }
@@ -436,13 +531,10 @@ int atomicHashTable2_applyMoveTableOperationInner(
 
                 // If our spot has been taken by our value... then we don't need to retry
                 if(FAST_CHECK_POINTER(prevDest, newRef)) {
-                    MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "saw that already moved in", newRef->hash);
+                    MemLog_Add((void*)newAlloc, moveState.destIndex, "saw that already moved in", newRef->hash);
                 } else {
                     // The value must have been used up by an insert
-                    MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "spot taken by insert", newRef->hash);
-
-                    InterlockedDecrement64(&newAlloc->slotsReserved);
-                    InterlockedDecrement64(&newAlloc->slotsReservedWithNulls);
+                    MemLog_Add((void*)newAlloc, moveState.destIndex, "spot taken by insert", newRef->hash);
 
                     // Rollback destIndex, and try again to find a new one (if this hangs, it is fine. Worst case we rollback
                     //  when destIndex has already been set and inserted... which is fine, because the next loop will see that
@@ -459,12 +551,12 @@ int atomicHashTable2_applyMoveTableOperationInner(
                             newMoveState.valueForSet,
                             moveState.valueForSet
                         ) == moveState.valueForSet) {
-                            MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "reverted destIndex", newRef->hash);
+                            MemLog_Add((void*)newAlloc, moveState.destIndex, "reverted destIndex", newRef->hash);
                         } else {
-                            MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "failed to revert destIndex", newRef->hash);
+                            MemLog_Add((void*)newAlloc, moveState.destIndex, "failed to revert destIndex", newRef->hash);
                         }
                     } else {
-                        MemLog_AddImpl((void*)newAlloc, moveState.destIndex, "source index behind anyway", newRef->hash);
+                        MemLog_Add((void*)newAlloc, moveState.destIndex, "source index behind anyway", newRef->hash);
                     }
 
                     DebugLog2("applyMove, reverter, before release", newRef, __FILE__, 0);
@@ -483,11 +575,19 @@ int atomicHashTable2_applyMoveTableOperationInner(
             newMoveState.valueForSet,
             moveState.valueForSet
         ) == moveState.valueForSet) {
+            #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+            InterlockedIncrement64((LONG64*)&this->searchStarts);
+            #endif
+
+            MemLog_Add((void*)curAlloc, moveState.sourceIndex, "about to move out", newRef ? newRef->hash : 0);
             if(Reference_FinishMove(pSource, newRef)) {   
+                MemLog_Add((void*)curAlloc, moveState.sourceIndex, "moved out", newRef ? newRef->hash : 0);
                 InterlockedDecrement64((LONG64*)&curAlloc->slotsReserved);
+                MemLog_Add((void*)curAlloc, curAlloc->slotsReserved, "moved out", 3);
+            } else {
+                breakpoint();
+                MemLog_Add((void*)curAlloc, moveState.sourceIndex, "moved out", newRef ? newRef->hash : 0);
             }
-            
-            MemLog_AddImpl((void*)curAlloc, moveState.sourceIndex, "moved out", newRef ? newRef->hash : 0);
 
             DebugLog2("applyMove, incrementor, before release", newRef, __FILE__, 0);
             Reference_Release(&emptyReference, newRef);
@@ -498,7 +598,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
                 return 0;
             }
         } else {
-            MemLog_AddImpl((void*)curAlloc, moveState.sourceIndex, "already moved out", newRef ? newRef->hash : 0);
+            MemLog_Add((void*)curAlloc, moveState.sourceIndex, "already moved out", newRef ? newRef->hash : 0);
 
             DebugLog2("applyMove, failed incrementor, before release", newRef, __FILE__, 0);
             Reference_Release(&emptyReference, newRef);
@@ -519,8 +619,12 @@ int atomicHashTable2_removeInner2(
 	bool(*callback)(void* callbackContext, void* value),
     AtomicHashTableBase* table,
     AtomicHashTableBase* newTable
+    #ifdef ATOMIC_PROOF
+    , uint64_t* outRemoveCount
+    #endif
 ) {
     uint64_t index = getSlotBaseIndex(table, hash);
+    MemLog_Add((void*)table, index, "looking to remove", hash);
     uint64_t loopCount = 0;
     while(true) {
         #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
@@ -529,20 +633,35 @@ int atomicHashTable2_removeInner2(
         OutsideReference* pValue = &table->slots[index].value;
         OutsideReference valueRef = *pValue;
 
+        MemLog_Add2((void*)table, index, "remove pre saw", hash, valueRef.valueForSet);
+
         if (IS_BLOCK_END(valueRef)) {
+            if(IS_VALUE_MOVED(valueRef) && !newTable) {
+                MemLog_Add((void*)table, index, "found move while looking to remove", hash);
+                return 1;
+            }
+            MemLog_Add((void*)table, index, "found block end while looking to remove", hash);
 			return 0;
 		}
 
         bool moved = false;
         bool isFrozen = false;
+        #ifdef ATOMIC_PROOF
+        OutsideReference refSeen;
+        InsideReference* ref = Reference_AcquireCheckIsMovedProof(pValue, &moved, &isFrozen, &refSeen);
+        MemLog_Add2((void*)table, index, "remove saw", hash, refSeen.valueForSet);
+        #else
         InsideReference* ref = Reference_AcquireCheckIsMoved(pValue, &moved, &isFrozen);
+        #endif
         if(!ref) {
             if(moved) {
                 if(!newTable) {
+                    MemLog_Add((void*)table, index, "found move 2 while looking to remove", hash);
                     // We thought we were moving to newTable, and now newTable is moving? We must be way behind
                     return 1;
                 }
                 if(isFrozen) {
+                    MemLog_Add((void*)table, index, "helping move while looking to remove", hash);
                     // Make sure the value is moved, and then we will read it in the newTable when we check that.
                     RETURN_ON_ERROR(atomicHashTable2_applyMoveTableOperationInner(this, table, newTable));
                 }
@@ -560,8 +679,16 @@ int atomicHashTable2_removeInner2(
                     }
                     else {
                         atomicHashTable2_updateReserved(this, table, &table->newAllocation, -1, 0);
-                        MemLog_AddImpl((void*)table, index, "remove", hash);
-                        MemLog_AddImpl((void*)table, ref, "hash ref", hash);
+
+                        void* userValue = (byte*)ref + InsideReferenceSize;
+                        this->deleteValue(userValue);
+
+                        MemLog_Add((void*)table, index, "remove", hash);
+                        MemLog_Add((void*)table, ref, "hash ref", hash);
+
+                        #ifdef ATOMIC_PROOF
+                        *outRemoveCount = *outRemoveCount + 1;
+                        #endif
                     }
                 }
             }
@@ -591,11 +718,18 @@ int atomicHashTable2_removeInner(
 	bool(*callback)(void* callbackContext, void* value),
     AtomicHashTableBase* table,
     AtomicHashTableBase* newTable
+    #ifdef ATOMIC_PROOF
+    ,AtomicProof *outProof
+    #endif
 ) {
     if(newTable) {
         RETURN_ON_ERROR(atomicHashTable2_applyMoveTableOperationInner(this, table, newTable));
     }
-    int result = atomicHashTable2_removeInner2(this, hash, callbackContext, callback, table, newTable);
+    int result = atomicHashTable2_removeInner2(this, hash, callbackContext, callback, table, newTable
+        #ifdef ATOMIC_PROOF
+        ,&outProof->removeCountCur
+        #endif
+    );
     if(result > 1) {
         return result;
     }
@@ -607,7 +741,11 @@ int atomicHashTable2_removeInner(
     //      as just the presense of newTable slows down every operation).
     if(newTable) {
         // The previous removeInner only returns 1 if !newTable... so... we will never be clobbering result == 1 here.
-        result = atomicHashTable2_removeInner2(this, hash, callbackContext, callback, newTable, nullptr);
+        result = atomicHashTable2_removeInner2(this, hash, callbackContext, callback, newTable, nullptr
+        #ifdef ATOMIC_PROOF
+        ,&outProof->removeCountNew
+        #endif
+        );
     }
     return result;
 }
@@ -619,6 +757,9 @@ int AtomicHashTable2_remove(
 	// On true, removes the value from the table
     //  May be called multiple times for the value for one call.
 	bool(*callback)(void* callbackContext, void* value)
+    #ifdef ATOMIC_PROOF
+    ,AtomicProof *outProof
+    #endif
 ) {
     #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
     InterlockedIncrement64((LONG64*)&this->searchStarts);
@@ -633,14 +774,46 @@ int AtomicHashTable2_remove(
         InsideReference* newTableRef = Reference_Acquire(&table->newAllocation);
         AtomicHashTableBase* newTable = Reference_GetValue(newTableRef);
 
-        int result = atomicHashTable2_removeInner(this, hash, callbackContext, callback, table, newTable);
+        int result = atomicHashTable2_removeInner(this, hash, callbackContext, callback, table, newTable
+			#ifdef ATOMIC_PROOF
+			, outProof
+			#endif
+		);
 
+        #ifdef ATOMIC_PROOF
+        if(outProof) {
+            outProof->curTable.mallocId = table->mallocId;
+            outProof->curTable.table = table;
+			if (newTable) {
+				outProof->newTable.mallocId = newTable->mallocId;
+				outProof->newTable.table = newTable;
+			}
+        }
+        #endif
+
+		if (result != 1) {
+			MemLog_Add((void*)table, result, "done removing", hash);
+		}
         Reference_Release(&table->newAllocation, newTableRef);
         Reference_Release(&this->currentAllocation, tableRef);
 
         if(result != 1) {
             return result;
         }
+
+        #ifdef ATOMIC_PROOF
+        if(outProof) {
+            outProof->extraLoops++;
+            outProof->removeCountInExtraLoops += outProof->removeCountCur;
+            outProof->removeCountInExtraLoops += outProof->removeCountNew;
+            outProof->removeCountCur = 0;
+            outProof->removeCountNew = 0;
+
+			outProof->curTable.table = nullptr;
+			outProof->newTable.table = nullptr;
+        }
+        #endif
+
         #ifdef DEBUG
         if(IsSingleThreadedTest) {
             // We shouldn't have to retry while single threaded
@@ -671,6 +844,8 @@ int atomicHashTable2_findInner4(
     uint64_t hash,
     AtomicHashTableBase* newTable
 ) {
+    //MemLog_Add((void*)table, pValuesFoundCur, "looking to find", hash);
+
     uint64_t index = getSlotBaseIndex(table, hash);
     uint64_t baseIndex = index;
     uint64_t loopCount = 0;
@@ -683,6 +858,11 @@ int atomicHashTable2_findInner4(
         OutsideReference valueRef = *pValue;
 
         if(IS_BLOCK_END(valueRef)) {
+            if(IS_VALUE_MOVED(valueRef) && !newTable) {
+                return 1;
+            }
+            //MemLog_Add((void*)table, pValuesFoundCur, "found block end", hash);
+            //MemLog_Add((void*)index, pValuesFoundCur, "found block end (index)", hash);
             //printf("Finished found %llu proof from %llu to %llu of %llu\n", *pValuesFoundCur, baseIndex, index, hash);
             return 0;
         }
@@ -694,10 +874,14 @@ int atomicHashTable2_findInner4(
             if(moved) {
                 if(!newTable) {
                     // We thought we were moving to newTable, and now newTable is moving? We must be way behind
+                    //MemLog_Add((void*)table, pValuesFoundCur, "too far behind in find", hash);
                     return 1;
                 }
-                // Make sure the value is moved, and then we will read it in the newTable when we check that.
-                RETURN_ON_ERROR(atomicHashTable2_applyMoveTableOperationInner(this, table, newTable));
+                if(isFrozen) {
+                    //MemLog_Add((void*)table, pValuesFoundCur, "helping move", hash);
+                    // Make sure the value is moved, and then we will read it in the newTable when we check that.
+                    RETURN_ON_ERROR(atomicHashTable2_applyMoveTableOperationInner(this, table, newTable));
+                }
             }
         } else {
             uint64_t refHash = Reference_GetHash(ref);
@@ -723,6 +907,7 @@ int atomicHashTable2_findInner4(
                 }
 
                 //printf("found at %llu for %llu\n", index, hash);
+                //MemLog_Add((void*)table, index, "found", hash);
                 *pValuesFoundCur = valuesFoundCur;
                 valuesFound[valuesFoundCur - 1] = result;
             }
@@ -810,6 +995,7 @@ int atomicHashTable2_findInner2(
     uint64_t valuesFoundCur = 0;
     int result = atomicHashTable2_findInner3(this, hash, valuesFound, &valuesFoundCur, pValuesFoundLimit, callbackContext, callback, table, newTable);
     if(result == 0) {
+        //MemLog_Add((void*)table, &valuesFoundCur, "finished looking to find", hash);
         for(uint64_t i = 0; i < valuesFoundCur; i++) {
             callback(callbackContext, valuesFound[i].value);
         }
@@ -924,6 +1110,9 @@ int AtomicHashTable2_insertInner2(
     int reserveResult = atomicHashTable2_updateReserved(this, table, &table->newAllocation, 1, 1);
     if(reserveResult > 0) {
         atomicHashTable2_updateReservedUndo(this, table, -1, -1);
+        if(reserveResult == 3) {
+            breakpoint();
+        }
         return reserveResult;
     }
     
@@ -975,7 +1164,7 @@ int AtomicHashTable2_insertInner2(
                 DestroyUniqueOutsideRef(&valueOutsideRef);
                 continue;
             }
-            MemLog_AddImpl((void*)table, index, "insert", hash);
+            MemLog_Add((void*)table, index, "insert", hash);
 			//printf("Inserted %llu (base %llu) for %llu\n", index, startIndex, hash);
 
 

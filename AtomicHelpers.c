@@ -25,6 +25,7 @@ bool InterlockedCompareExchangeStruct128(
 
 
 bool EqualsStruct128(
+	// lhs should be the private value (the non shared one)
 	void* structLhs,
 	void* structRhs
 ) {

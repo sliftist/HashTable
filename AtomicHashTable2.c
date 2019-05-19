@@ -74,12 +74,58 @@ uint64_t newGrowSize(AtomicHashTable2* this, uint64_t slotCount, uint64_t fillCo
 }
 
 
-//todonext
-// Wait... when we attempt to get a reference, we might temporarily turn a tombstone into having a count, which will make it look like it is moved?
-//  Crap...
+void atomicHashTable_freeCallback(AtomicHashTableBase* table, void* value) {
+    table->holder->deleteValue(value);
+}
 
-// Has to be a value copied from shared storage, or else this will race...
-//  (which is why we don't put parentheses around value, as if using it raw fails to compile, then it probably isn't a locally copied variable...)
+
+MemPools GetAllMemPools(AtomicHashTableBase* table) {
+    MemPools pools = { 0 };
+
+    AllTables* tables = &table->holder->tables;
+
+    AtomicHashTableBase temp = { 0 };
+    uint64_t refToValuePoolOffset = InsideReferenceSize + (uint64_t)&temp.valuePool - (uint64_t)&temp;
+
+    for(uint64_t i = 0; i < MAX_MEMPOOL_HISTORY; i++) {
+        InsideReference* ref = Reference_Acquire(&tables->tables[i]);
+        if(ref) {
+            pools.pools[pools.count++] = (void*)((uint64_t)ref + refToValuePoolOffset);
+        }
+    }
+
+    return pools;
+}
+void ReleaseAllMemPools(AtomicHashTableBase* table, MemPools pools) {
+    AtomicHashTableBase temp = { 0 };
+    uint64_t refToValuePoolOffset = InsideReferenceSize + (uint64_t)&temp.valuePool - (uint64_t)&temp;
+
+    AllTables* tables = &table->holder->tables;
+
+    for(uint64_t i = 0; i < pools.count; i++) {
+        InsideReference* ref = (void*)((uint64_t)pools.pools[i] - refToValuePoolOffset);
+        Reference_Release(&tables->tables[i], ref);
+    }
+}
+bool HasEverAllocated(AtomicHashTableBase* table, uint64_t index) {
+    OutsideReference value = table->slots[index].value;
+    return !IS_BLOCK_END(value);
+}
+// Remove from the master tables list
+void OnNoMoreAllocations(AtomicHashTableBase* table) {
+    // This is uniquely called, so we will find the 
+    AllTables* tables = &table->holder->tables;
+
+    InsideReference* fakeInsideRef = (InsideReference*)((uint64_t)table - InsideReferenceSize);
+
+    for(uint64_t i = 0; i < MAX_MEMPOOL_HISTORY; i++) {
+        OutsideReference* pRef = &tables->tables[i];
+        // We have it find it at some time, and it will probably be the last release...
+        if(Reference_DestroyOutside(pRef, fakeInsideRef)) {
+            break;
+        }
+    }
+}
 
 
 // Doesn't do any moves, just makes undoing reserve updates easier, because undoing
@@ -236,6 +282,7 @@ int atomicHashTable2_updateReserved(
     newTable->slotsCount = newSlotCount;
     uint64_t logSlotsCount = log2(newSlotCount);
     newTable->logSlotsCount = logSlotsCount;
+    newTable->holder = this;
     newTable->slots = (void*)((byte*)newTable + sizeof(AtomicHashTableBase));
     newTable->valuePool = (void*)((byte*)newTable->slots + sizeof(AtomicSlot) * newSlotCount);
     newTable->moveState.destIndex = UINT32_MAX;
@@ -253,9 +300,25 @@ int atomicHashTable2_updateReserved(
         newTable->finishedMovingInto = true;
     }
 
-    InsideReference* newTableRef = Reference_AcquireInside(&newAllocation);
+    // It is safe to use newRef a bit after we release it, at least until we add it to other threads (because
+    //  the newAllocation outside ref will still exist).
+    InsideReference* newRef = Reference_AcquireInside(&newAllocation);
+    Reference_Release(&emptyReference, newRef);
 
-    MemPoolHashed pool = MemPoolHashedDefault(SIZE_PER_VALUE_ALLOC(this), newSlotCount, logSlotsCount, newTableRef);
+    // Reference_GetValueFast(newRef) to mempool should be safe... as it should never be used when the table isn't in
+    //  the master tables list... so it should be fine...
+
+    MemPoolHashed pool = MemPoolHashedDefault(
+        SIZE_PER_VALUE_ALLOC(this),
+        newSlotCount,
+        logSlotsCount,
+        Reference_GetValueFast(newRef),
+        atomicHashTable_freeCallback,
+        GetAllMemPools,
+        ReleaseAllMemPools,
+        HasEverAllocated,
+        OnNoMoreAllocations
+    );
     *newTable->valuePool = pool;
     MemPoolHashed_Initialize(newTable->valuePool);
 
@@ -276,6 +339,36 @@ int atomicHashTable2_updateReserved(
 
     MemLog_Add((void*)curAlloc, 0, "DTOR START", 0);
     MemLog_Add((void*)newTable, 0, "NEW START", 0);
+
+
+    // Add it to tables, even if we fail to make it the newAllocation, the MemPool will call OnNoMoreAllocations
+    //  regardless, removing it from tables properly.
+    {
+        OutsideReference newTableRef = Reference_CreateOutsideReference(newRef);
+        
+        AllTables* tables = &this->tables;
+        uint64_t tableIndex = InterlockedIncrement64(&tables->nextTableIndex) - 1;
+        while(true) {
+            if(InterlockedCompareExchange64(
+                (LONG64*)&tables->tables[tableIndex % MAX_MEMPOOL_HISTORY],
+                newTableRef.valueForSet,
+                0
+            ) == 0) {
+                break;
+            }
+            
+            tableIndex++;
+            if(tableIndex > MAX_MEMPOOL_HISTORY * 10) {
+                DestroyUniqueOutsideRef(&newAllocation);
+
+                // Too many iterations
+                //  We could be out of entries in tables, but...
+                OnError(41);
+                return 41;
+            }
+        }
+    }
+
     
     if(InterlockedCompareExchange64(
         (LONG64*)pNewAlloc,
@@ -317,10 +410,6 @@ int atomicHashTable2_applyMoveTableOperationInner(
     AtomicHashTableBase* curAlloc,
     AtomicHashTableBase* newAlloc
 ) {
-    //todonext
-    // So... I think recurrent addresses are causing the problems with remove.
-    // We should add logging for inserts too, so we can build a better map of what is happening with the slots
-
     uint64_t VALUE_SIZE = this->VALUE_SIZE;
 
     // Hash block checking doesn't work because of wrap around (at least, it can't be efficient because of wrap around).
@@ -339,7 +428,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
     MoveStateInner moveState = { 0 };
     while(true) {
         #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
-        InterlockedIncrement64((LONG64*)&this->searchStarts);
+        InterlockedIncrement64((LONG64*)&this->searchLoops);
         #endif
         loops++;
         if(loops > curAlloc->slotsCount * 10) {          
@@ -406,7 +495,12 @@ int atomicHashTable2_applyMoveTableOperationInner(
         // Make sure curAlloc->slots[sourceIndex] is frozen, and marked as moved
 
         InsideReference* newRef = nullptr;
-        int result = Reference_AcquireStartMove(pSource, (MemPool*)newAlloc->valuePool, this->VALUE_SIZE, &newRef);
+        int result = Reference_AcquireStartMove(pSource, (MemPool*)newAlloc->valuePool, this->VALUE_SIZE, &newRef
+        #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+        ,&this->outstandingRefsDuringMove
+        ,&this->notOutstandingRefsDuringMove
+        #endif
+        );
         if(result == 1) {
             continue;
         }
@@ -496,7 +590,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
             }
             if(couldNotFindSpot) {
                 DebugLog2("applyMove, saw moved table, before release", newRef, __FILE__, index);
-                Reference_Release(&emptyReference, newRef);
+                Reference_ReleaseNull(newRef);
                 continue;
             }
         }
@@ -560,7 +654,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
                     }
 
                     DebugLog2("applyMove, reverter, before release", newRef, __FILE__, 0);
-                    Reference_Release(&emptyReference, newRef);
+                    Reference_ReleaseNull(newRef);
                     continue;
                 }
             }
@@ -590,7 +684,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
             }
 
             DebugLog2("applyMove, incrementor, before release", newRef, __FILE__, 0);
-            Reference_Release(&emptyReference, newRef);
+            Reference_ReleaseNull(newRef);
             countApplied++;
             if(countApplied > minApplyCount) {
                 // Not only is it the endOfBlock, but... because we replace it with BASE_NULL1, the original block in curAlloc will never
@@ -601,7 +695,7 @@ int atomicHashTable2_applyMoveTableOperationInner(
             MemLog_Add((void*)curAlloc, moveState.sourceIndex, "already moved out", newRef ? newRef->hash : 0);
 
             DebugLog2("applyMove, failed incrementor, before release", newRef, __FILE__, 0);
-            Reference_Release(&emptyReference, newRef);
+            Reference_ReleaseNull(newRef);
         }
     }
 
@@ -680,8 +774,7 @@ int atomicHashTable2_removeInner2(
                     else {
                         atomicHashTable2_updateReserved(this, table, &table->newAllocation, -1, 0);
 
-                        void* userValue = (byte*)ref + InsideReferenceSize;
-                        this->deleteValue(userValue);
+                        Reference_Mark(ref);
 
                         MemLog_Add((void*)table, index, "remove", hash);
                         MemLog_Add((void*)table, ref, "hash ref", hash);
@@ -952,7 +1045,7 @@ int atomicHashTable2_findInner3(
     }
 
     int result = atomicHashTable2_findInner4(this, table, valuesFound, pValuesFoundCur, pValuesFoundLimit, hash, newTable);
-    if(result > 1) {
+    if(result > 1 || result == -1) {
         return result;
     }
 

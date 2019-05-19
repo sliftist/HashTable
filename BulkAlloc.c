@@ -159,6 +159,27 @@ void* BulkAlloc_alloc(BulkAlloc* this) {
     return nullptr;
 }
 
+bool BulkAlloc_isAllocated(BulkAlloc* this, void* pointer) {
+    for(uint64_t i = 0; i < BulkAlloc_AllocationCount; i++) {
+        // Nothing we are reading needs to be atomic, so this read is fine...
+        BulkAlloc_Alloc* pAlloc = &this->allocations[i].data;
+        if(!pAlloc->allocation) continue;
+
+        // If it becomes negative it wraps around and becomes large, which just makes it not match, so it is fine...
+        uint64_t byteOffset = (uint64_t)pointer - (uint64_t)pAlloc->allocation - sizeof(BulkAlloc_AllocHead);
+        if(byteOffset >= pAlloc->count * this->size) continue;
+
+        if(byteOffset % this->size != 0) {
+            // Pointer isn't aligned, so what is it?
+            OnError(3);
+        }
+
+        BulkAlloc_AllocHead* head = (void*)&pAlloc->allocation[byteOffset];
+        return !!head->allocated;
+    }
+    return false;
+}
+
 void BulkAlloc_free(BulkAlloc* this, void* pointer) {
     for(uint64_t i = 0; i < BulkAlloc_AllocationCount; i++) {
         // Nothing we are reading needs to be atomic, so this read is fine...

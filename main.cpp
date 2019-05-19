@@ -164,6 +164,9 @@ void deleteItem(void* itemVoid) {
 		// Item is corrupted
 		OnError(3);
 	}
+	item->item->a = 0;
+	item->item->b = 1;
+	item->item->c = 2;
 
 	MemLog_Add(nullptr, (uint64_t)item->item, "free", getHash(item->item->a, item->item->b));
 	BulkAlloc_free(&itemAllocator, item->item);
@@ -253,6 +256,16 @@ uint64_t testGetCount2(AtomicHashTable2& table, uint64_t a, uint64_t b) {
 		if (context->item.a == item.a && context->item.b == item.b) {
 			context->count++;
 		}
+		if(!BulkAlloc_isAllocated(&itemAllocator, pItem->item)) {
+			// deleteItem was called while we were running
+			OnError(3);
+		}
+		if(pItem->item->a != pItem->itemInline.a
+		|| pItem->item->b != pItem->itemInline.b
+		|| pItem->item->c != pItem->itemInline.c) {
+			// Item is corrupted
+			OnError(3);
+		}
 	});
 	ErrorTop(result);
 	return context.count;
@@ -296,7 +309,8 @@ typedef struct {
 	HANDLE thread;
 	int threadCount;
 } TableMultiThreadsContext;
-void testTableMultiThreads(
+// Return result is meaningless
+int testTableMultiThreads(
 	int count,
 	int variationStart,
 	DWORD(*runThread)(TableMultiThreadsContext*)
@@ -327,6 +341,7 @@ void testTableMultiThreads(
 		}
 		delete[] threads;
 	});
+	return 0;
 }
 
 uint64_t groupSum;
@@ -910,11 +925,60 @@ void WaitForAllThreads() {
 	}
 }
 
+DWORD threadedItemContention(TableMultiThreadsContext* context) {
+	AtomicHashTable2& table = *context->table;
+	uint64_t itemCount = 1024;
+	uint64_t iterationCount = 100;
+
+	void (*findVerifyFnc)(void* contextAny, void* valueVoid) = [](void* contextAny, void* valueVoid) {
+		Item* pItem = ((Item*)valueVoid);
+		if(!BulkAlloc_isAllocated(&itemAllocator, pItem->item)) {
+			// deleteItem was called on an item that is in use
+			OnError(3);
+		}
+		if(pItem->item->a != pItem->itemInline.a
+		|| pItem->item->b != pItem->itemInline.b
+		|| pItem->item->c != pItem->itemInline.c) {
+			// Item is corrupted
+			OnError(3);
+		}
+		if(!BulkAlloc_isAllocated(&itemAllocator, pItem->item)) {
+			// deleteItem was called on an item that is in use
+			OnError(3);
+		}
+	};
+
+	for(uint64_t k = 0; k < iterationCount; k++) {
+		for(uint64_t i = 0; i < itemCount; i++) {
+			testAdd2(table, i, i, i);
+			AtomicHashTable2_find(&table, getHash(i, i), nullptr, findVerifyFnc);
+		}
+		for(uint64_t i = 0; i < itemCount; i++) {
+			AtomicHashTable2_find(&table, getHash(i, i), nullptr, findVerifyFnc);
+		}
+		for(uint64_t i = 0; i < itemCount; i++) {
+			AtomicHashTable2_find(&table, getHash(i, i), nullptr, findVerifyFnc);
+			ItemInner item = { 0 };
+			item.a = i;
+			item.b = i;
+			item.c = i;
+			testRemove2(table, item);
+			AtomicHashTable2_find(&table, getHash(i, i), nullptr, findVerifyFnc);
+		}
+	}
+	return 0;
+}
 
 
-void runAtomicHashTableTest() {
+
+void runAtomicHashTableTest(bool ecoFriendly) {
+	for (int i = 0; i < 100; i++) {
+		testTableMultiThreads(16, 0, threadedItemContention);
+	}
+
 	// Speed test
-	testTableMultiThreads(1, 1, threadedSizing);
+	//testTableMultiThreads(1, 1, threadedSizing);
+	//testTableMultiThreads(2, 2, threadedChurn);
 
 	for (int i = 0; i < 100; i++) {
 		//testTableMultiThreads(16, 2, threadedChurn);
@@ -940,8 +1004,10 @@ void runAtomicHashTableTest() {
 	//*/
 	
 	//testTableMultiThreads(2, 4, threadedSizing);
+	//testTableMultiThreads(10, 3, threadedSizing);
 
-		//*
+	// TODO: We really need a test that ACTUALLY tests contention on items, as right now we only have table contention, not item contention...
+		/*
 	for(uint64_t i = 0; i < 100; i++) {
 		printf("start test look %d\n", i);
 		#ifdef DEBUG
@@ -960,28 +1026,28 @@ void runAtomicHashTableTest() {
 		printf("0 to N with a lot of verification, a few times\n");
 		testTableMultiThreads(1, 0, threadedSizing);
 		testTableMultiThreads(2, 0, threadedSizing);
-		testTableMultiThreads(16, 0, threadedSizing);
+		!ecoFriendly && testTableMultiThreads(16, 0, threadedSizing);
 
 		printf("churn medium amount of random items, many times\n");
 		testTableMultiThreads(1, 2, threadedChurn);
 		testTableMultiThreads(2, 2, threadedChurn);
-		testTableMultiThreads(16, 2, threadedChurn);
+		!ecoFriendly && testTableMultiThreads(16, 2, threadedChurn);
 
 		printf("churn medium amount of random items, more random, many times\n");
 		testTableMultiThreads(1, 1, threadedChurn);
 		testTableMultiThreads(2, 1, threadedChurn);
-		testTableMultiThreads(16, 1, threadedChurn);
+		!ecoFriendly && testTableMultiThreads(16, 1, threadedChurn);
 
 		printf("0 to N, many times\n");
 		testTableMultiThreads(1, 3, threadedSizing);
 		testTableMultiThreads(2, 3, threadedSizing);
-		testTableMultiThreads(16, 3, threadedSizing);
+		!ecoFriendly && testTableMultiThreads(16, 3, threadedSizing);
 
 		for(uint64_t i = 0; i < 10; i++) {
 			printf("0 to large N, many times\n");
 			testTableMultiThreads(1, 4, threadedSizing);
 			testTableMultiThreads(2, 4, threadedSizing);
-			testTableMultiThreads(16, 4, threadedSizing);
+			!ecoFriendly && testTableMultiThreads(16, 4, threadedSizing);
 		}
 	}
 		//*/
@@ -998,9 +1064,13 @@ void runAtomicHashTableTest() {
 	printf("Final allocation count %llu\n", SystemAllocationCount);
 }
 
-int main() {
+int main(int argc, char** argv) {
+	bool ecoFriendly = argc >= 2 && argv[1][0] == 'l';
+	if (ecoFriendly) {
+		printf("eco friendly\n");
+	}
 	try {
-		runAtomicHashTableTest();
+		runAtomicHashTableTest(ecoFriendly);
 		//benchmarkCompareExchanges();
 		//benchmarkObfuscatedPointers();
 		//runRefCountTests();

@@ -130,19 +130,6 @@ void MemPoolHashed_Initialize(MemPoolHashed* pool) {
     memset((byte*)pool + sizeof(MemPoolHashed), 0, (pool->VALUE_COUNT + 7) / 8);
 }
 
-void memPoolHashed_DestroyOutsideRef(MemPoolHashed* pool) {
-    InsideReference* holderRef = pool->holderRef;
-    if(!holderRef || InterlockedCompareExchange64((LONG64*)&pool->holderRef, 0, (LONG64)holderRef) != (LONG64)holderRef) {
-        // We should uniquely hold this... And if we don't it is dangerous, as this reference keeps US alive,
-		//	so at this point, our own pool memory is potentially freed (as we could only exist in a redirect chain,
-		//	and then just been released, so the allocation that holds us might not be anywhere on the stack).
-        // So... pool->holderRef could access invalid memory at this point...
-        OnError(2);
-        return;
-    }
-    Reference_Release(&emptyReference, holderRef);
-}
-
 void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) {
     if(size != pool->VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD) {
         // Invalid input, size must equal the size the pool was initialized with (- MemPoolHashed_VALUE_OVERHEAD, which we use)
@@ -204,6 +191,59 @@ void* MemPoolHashed_Allocate(MemPoolHashed* pool, uint64_t size, uint64_t hash) 
     OnError(13);
     return nullptr;
 }
+
+void TryToMoveUniqueIdInner(MemPoolHashed* pool, InsideReference* ref, uint64_t uniqueId, MemPools pools) {
+    for(uint64_t i = 0; i < pools.count; i++) {
+        MemPoolHashed* otherPool = pools.pools[i];
+        if(otherPool == pool) continue;
+
+        byte* dataStart = (byte*)otherPool + sizeof(MemPoolHashed) + (otherPool->VALUE_COUNT + 7) / 8;
+        
+        uint64_t baseIndex = ref->hash >> (64 - otherPool->VALUE_COUNT_LOG);
+        uint64_t index = baseIndex;
+        uint64_t loops = 0;
+        while(true) {
+            if(!pool->HasEverAllocated(pool->callbackContext, index)) break;
+
+            // The other allocation might be a new allocation, or not allocated, but that is fine. If it was ever allocated,
+            //  it means the unique id will always be some unique id. And if it is the newAllocation, either is has moved in,
+            //  and so we can use it, or it is moving, in which case we will find it in it's location in the previous allocation anyway!
+            InsideReference* otherRef = (void*)(dataStart + (otherPool->VALUE_SIZE * index));
+            if(Reference_GetUniqueValueId(otherRef) == uniqueId) {
+                // OH! The value can't move, because it is marked, so already deleted. Which is why the snapshot idea works.
+                //  So if we see it, either that value will be unallocated, and so not a candidate, OR still allocated,
+                //  and so not replacable. But it won't unallocate and reallocate in some other pool, or somewhere else...
+                // ALSO! It can't be in the process of moving, because it was deleted, so we don't have to worry about uniqueId not being set...
+                if(Reference_MarkIfUniqueIdEqual(otherRef, uniqueId)) {
+                    // We are single threaded here, as we are the exclusive one that is marked (and have a ref count of 0), so this is safe...
+                    // We don't have to worry about being marked back, as we have 0 references, so this is really only to communicate with
+                    //  our caller... or something...
+                    ref->isMarked = 0;
+                    return;
+                }
+            }
+
+            index = (index + 1) % otherPool->VALUE_COUNT;
+            if(index == baseIndex) {
+                loops++;
+                if(loops > 10) {
+                    // Iterated way too many times
+                    OnError(9);
+                    return;
+                }
+            }
+        }
+    }
+}
+void TryToMoveUniqueId(MemPoolHashed* pool, InsideReference* ref) {
+    uint64_t uniqueId = Reference_GetUniqueValueId(ref);
+    if(uniqueId != 0) {
+        MemPools pools = pool->GetAllMemPools(pool->callbackContext);
+        TryToMoveUniqueIdInner(pool, ref, uniqueId, pools);
+        pool->ReleaseAllMemPools(pool->callbackContext, pools);
+    }
+}
+
 void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
     if(!value) return;
     uint64_t offset = (uint64_t)value - (uint64_t)((byte*)pool + sizeof(MemPoolHashed) + (pool->VALUE_COUNT + 7) / 8);
@@ -230,6 +270,32 @@ void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
         }
     }
 
+    // TODO: We should probably add a flag to skip this code if we aren't allocating references. But then... why we would even do that?
+    InsideReference* ref = value;
+    if(Reference_IsMarked(ref)) {
+        
+        // (if we even have a uniqueValueId)
+        // foreach other MemPool
+        //  starting from hash, while allocation ever allocated
+        //      hmm... we probably need to reserve the allocation here, to prevent it from being deallocated while we use it...
+        //      if the uniqueValueId is the same as ours, as the inside reference has references, atomically
+        //          set it to marked, failing if the count went to 0 before we could,
+        //          unsetting our own uniqueValueId (first?), and then breaking upon success
+        // If we are still marked, then actually destruct, otherwise, another version of our value in another table
+        //      must have been marked, and so it will deal with this once it destructs
+
+        uint64_t uniqueId = Reference_GetUniqueValueId(ref);
+        if(uniqueId != 0) {
+            TryToMoveUniqueId(pool, ref);
+        }
+        if(Reference_IsMarked(ref)) {
+            // If we are still marked... then it means we couldn't move our mark, so... we can actually free
+            // And obviously, if we can't move it, then there are no references anywhere, so no new ones will pop up, this reference
+            //  is absolutely and completely dead.
+            pool->FreeCallback(pool->callbackContext, (byte*)value + InsideReferenceSize);
+        }
+    }
+
 
     while(true) {
         AllocCount count = pool->countForSet;
@@ -248,7 +314,7 @@ void MemPoolHashed_Free(MemPoolHashed* pool, void* value) {
             continue;
         }
         if(countNew.destructed && countNew.totalAllocationsOutstanding == 0) {
-            memPoolHashed_DestroyOutsideRef(pool);
+            pool->OnNoMoreAllocations(pool->callbackContext);
         }
         break;
     }
@@ -271,7 +337,7 @@ void MemPoolHashed_Destruct(MemPoolHashed* pool) {
             continue;
         }
         if(countNew.destructed && countNew.totalAllocationsOutstanding == 0) {
-            memPoolHashed_DestroyOutsideRef(pool);
+            pool->OnNoMoreAllocations(pool->callbackContext);
         }
         break;
     }

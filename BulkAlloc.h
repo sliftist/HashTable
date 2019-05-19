@@ -74,6 +74,8 @@ void BulkAlloc_free(BulkAlloc* self, void* pointer);
 void BulkAlloc_dtor(BulkAlloc* self);
 void BulkAlloc_dtorIgnoreLeaks(BulkAlloc* self);
 
+bool BulkAlloc_isAllocated(BulkAlloc* self, void* pointer);
+
 
 
 #ifdef __cplusplus

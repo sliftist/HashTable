@@ -47,6 +47,7 @@ typedef struct {
 CASSERT(sizeof(MoveStateInner) == 8);
 
 
+typedef struct AtomicHashTable2 AtomicHashTable2;
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
@@ -54,6 +55,8 @@ typedef __declspec(align(16)) struct {
     // TODO: Try setting these to const, and seeing if it makes the compiler optimize
     uint64_t slotsCount;
     uint64_t logSlotsCount;
+
+    AtomicHashTable2* holder;
 
     // Values and the underlying memory valuePool takes from are both taken from the rest of the allocation.
     AtomicSlot* slots;
@@ -81,6 +84,16 @@ typedef __declspec(align(16)) struct {
 
 
 
+// Needed so we know when to call the delete function. Not needed for most deletes,
+//  only needed if a value is being accessed while we are moving (and while it is still accessed).
+#pragma pack(push, 1)
+typedef struct {
+    OutsideReference tables[MAX_MEMPOOL_HISTORY];
+    uint64_t nextTableIndex;
+} AllTables;
+#pragma pack(pop)
+
+
 // Should be initialized as:
 //  AtomicHashTable2 table = AtomicHashTableDefault(VALUE_SIZE, void (*deleteValue)(void* value));
 
@@ -90,7 +103,7 @@ typedef __declspec(align(16)) struct {
     deleteValue, \
 }
 #pragma pack(push, 1)
-typedef struct {
+typedef struct AtomicHashTable2 {
     MemPoolRecycle findValuePool;
 
     // (in bytes)
@@ -102,11 +115,16 @@ typedef struct {
 
     uint64_t destructed;
 
+    AllTables tables;
+
     // Disabling this instrumentation makes our fastest case about 30% faster. But it is already basically a NOOP, and
     //  checking if our hash algorithm is bad in realtime is very useful...
     #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
     uint64_t searchStarts;
     uint64_t searchLoops;
+
+    uint64_t outstandingRefsDuringMove;
+    uint64_t notOutstandingRefsDuringMove;
     #endif
 
 } AtomicHashTable2;

@@ -40,11 +40,6 @@ void MemPoolFixed_Free(MemPoolRecycle* pool, void* value);
 
 
 // TODO: We only use 1 bit, so change the places that use this to only use 1 bit, instead of 1 byte
-#define MemPoolHashed_VALUE_OVERHEAD (1)
-// VALUE_SIZE must already include MemPoolHashed_VALUE_OVERHEAD, (as you need to include it when making our allocation anyway...),
-//  also either zero out our memory, or call MemPoolHashed_Initialize(pool).
-//  holderRef must have incremented the inside reference count, not an outside count.
-#define MemPoolHashedDefault(VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderRef) { (Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, holderRef, 0, 0 }
 
 #pragma pack(push, 1)
 typedef struct {
@@ -58,16 +53,49 @@ typedef struct {
 } AllocCount;
 #pragma pack(pop)
 
+typedef struct MemPoolHashed MemPoolHashed;
+// We only need 1 per table that has a hanging thread, so... as long as threads don't crash this just needs to be > the thread count.
+#define MAX_MEMPOOL_HISTORY 128
 #pragma pack(push, 1)
 typedef struct {
+    uint64_t count;
+    MemPoolHashed* pools[MAX_MEMPOOL_HISTORY];
+} MemPools;
+#pragma pack(pop)
+
+#define MemPoolHashed_VALUE_OVERHEAD (1)
+// VALUE_SIZE must already include MemPoolHashed_VALUE_OVERHEAD, (as you need to include it when making our allocation anyway...),
+//  also either zero out our memory, or call MemPoolHashed_Initialize(pool).
+// Only calls the freeCallback for referenced marked with Reference_Mark
+#define MemPoolHashedDefault(VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, \
+callbackContext, freeCallback, getAllMemPools, releaseAllMemPools, hasEverAllocated, onNoMoreAllocations) { \
+    (Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, \
+    callbackContext, freeCallback, getAllMemPools, releaseAllMemPools, hasEverAllocated, onNoMoreAllocations, \
+    VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, 0, 0 \
+}
+
+#pragma pack(push, 1)
+typedef struct MemPoolHashed {
     void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
     void (*Free)(MemPool* pool, void* value);
+
+    void* callbackContext;
+
+    void (*FreeCallback)(void* context, void* value);
+
+    MemPools (*GetAllMemPools)(void* context);
+    void (*ReleaseAllMemPools)(void* context, MemPools pools);
+
+    bool (*HasEverAllocated)(void* context, uint64_t index);
+
+    // Called back when we have no more allocations, and are destructed
+    void (*OnNoMoreAllocations)(void* context);
+
 
     uint64_t VALUE_SIZE;
     uint64_t VALUE_COUNT;
 
     uint64_t VALUE_COUNT_LOG;
-    InsideReference* holderRef;
 
     AllocCount countForSet;
 

@@ -957,7 +957,7 @@ DWORD threadedItemContention(TableMultiThreadsContext* context) {
 			// deleteItem was called on an item that is in use
 			//OnError(3);
 		}
-		/*
+		//*
 		if(pItem->item->a != pItem->itemInline.a
 		|| pItem->item->b != pItem->itemInline.b
 		|| pItem->item->c != pItem->itemInline.c) {
@@ -965,7 +965,7 @@ DWORD threadedItemContention(TableMultiThreadsContext* context) {
 			// Item is corrupted
 			//OnError(3);
 		}
-		*/
+		//*/
 		if(!BulkAlloc_isAllocated(&itemAllocator, pItem->item)) {
 			failPrint(contextAny);
 			// deleteItem was called on an item that is in use

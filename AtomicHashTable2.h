@@ -50,7 +50,7 @@ CASSERT(sizeof(MoveStateInner) == 8);
 typedef struct AtomicHashTable2 AtomicHashTable2;
 
 #pragma pack(push, 1)
-typedef __declspec(align(16)) struct {
+typedef struct {
     // slotsCount is immutable (obviously)
     // TODO: Try setting these to const, and seeing if it makes the compiler optimize
     uint64_t slotsCount;
@@ -67,7 +67,7 @@ typedef __declspec(align(16)) struct {
 
     // Initialized to 0
     MoveStateInner moveState;
-    
+
     //AtomicHashTableBase*
     OutsideReference newAllocation;
 
@@ -76,10 +76,13 @@ typedef __declspec(align(16)) struct {
     uint64_t slotsReserved;
     uint64_t slotsReservedWithNulls;
 
-    bool finishedMovingInto;
+    uint64_t finishedMovingInto;
 
 } AtomicHashTableBase;
 #pragma pack(pop)
+
+// Better if it is 8 byte aligned
+CASSERT(sizeof(AtomicHashTableBase) % 8 == 0);
 
 
 
@@ -99,7 +102,7 @@ typedef struct {
 
 #define AtomicHashTableDefault(VALUE_SIZE, deleteValue) { \
     MemPoolFixedDefault(), \
-    VALUE_SIZE,\
+    VALUE_SIZE, \
     deleteValue, \
 }
 #pragma pack(push, 1)

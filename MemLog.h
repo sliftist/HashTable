@@ -25,7 +25,10 @@ void MemLog_Reset();
 void MemLog_AddImpl(const char* file, uint64_t line, const char* operation, uint64_t val1, uint64_t val2);
 
 void MemLog_SaveValues(const char* fileName, uint64_t hash);
-void MemLog_SaveValuesTable(const char* fileName, void* table, uint64_t mallocId, uint64_t hash);
+void MemLog_SaveValuesIndex(const char* fileName, uint64_t index);
+void MemLog_SaveValuesIndexMulti(const char* fileName, uint64_t index, ...);
+void MemLog_SaveValuesTable(const char* fileName, void* table);
+void MemLog_SaveValuesOperation(const char* fileName, void* operation);
 
 #ifdef __cplusplus
 }

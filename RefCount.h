@@ -134,8 +134,13 @@ bool Reference_IsMarked(InsideReference* ref);
 
 // Marks it, if it is still allocated, and the unique id is equal to uniqueId
 //  Does this atomically, and returns true if it did mark it.
+//  Requires the ref to be never moved again after this is called (or to not match uniqueId)
 bool Reference_MarkIfUniqueIdEqual(InsideReference* ref, uint64_t uniqueId);
 uint64_t Reference_GetUniqueValueId(InsideReference* ref);
+
+// Ugh... has to be done somewhere, only to be done if ref is non-shared, which begs the question of why it is
+//  being cloned, but it happens once...
+InsideReference* Reference_unsafeClone(InsideReference* ref);
 
 // Of course the memory OutsideReference is stored in must be guaranteed to exist, and the reuse of the memory for other
 //  OutsideReferences is allowed, but you better not store arbitrary other memory there.
@@ -149,6 +154,7 @@ uint64_t Reference_GetHash(InsideReference* ref);
 
 //InsideReference* Reference_AcquireCheckIsMoved(OutsideReference* ref, bool* outIsMoved, bool* outIsFrozen);
 #define Reference_AcquireCheckIsMoved(ref, outIsMoved, outIsFrozen)  Reference_AcquireCheckIsMovedProof(ref, outIsMoved, outIsFrozen, nullptr)
+// Returns a reference that must be freed with Reference_ReleaseOutsidesInside
 InsideReference* Reference_AcquireCheckIsMovedProof(OutsideReference* ref, bool* outIsMoved, bool* outIsFrozen, OutsideReference* refSeen);
 
 // Freezes ref, so future Reference_AcquireCheckIsMoved calls will return nullptr, but true for outIsMoved
@@ -158,7 +164,7 @@ InsideReference* Reference_AcquireCheckIsMovedProof(OutsideReference* ref, bool*
 // - Sets isCommittedToMove inside the newRef, as this is the only way a frozen outside
 //      reference can be destroyed (or should be), and so isCommittedToMove should matter before
 //      this, but after this it may be destructed, so knowing if it moved is important.
-// Reference must be freed with Reference_ReleaseNull
+// Reference must be freed with Reference_ReleaseOutsidesInside
 int Reference_AcquireStartMove(
     OutsideReference* ref,
     MemPool* newPool,
@@ -170,7 +176,10 @@ int Reference_AcquireStartMove(
 #endif
 );
 
-void Reference_ReleaseNull(InsideReference* ref);
+// Releases the inside ref an outside ref was holding (basically Reference_Release(&emptyReference, ref), but with
+//  some extra changes that make debugging easier, and that are now actually used for how we handle the delete callback)
+//  (returns true if it was the final reference)
+bool Reference_ReleaseOutsidesInside(InsideReference* ref);
 
 // Called after Reference_AcquireStartMove and Reference_CopyIntoZero on the original ref,
 //  destroying it (returning the InsideReference* of the reference that was destroyed, or nullptr
@@ -294,12 +303,13 @@ void DebugLog2(const char* operation, InsideReference* ref, const char* file, ui
 #define DebugLog2(operation, ref, file, line) false
 #endif
 
-
+#pragma pack(push, 1)
 typedef struct {
     union {
         struct {
             // Persists across
-            uint64_t uniqueValueId: 62;
+            uint64_t uniqueValueId: 61;
+            uint64_t hasUniqueValueId: 1;
             uint64_t isCommittedToMove: 1;
             // Must be set to true, allowing outside references and unique values to be distinguished...
             uint64_t isNull: 1;
@@ -308,34 +318,29 @@ typedef struct {
         uint64_t valueForSet;
     };
 } MoveId;
+#pragma pack(pop)
 CASSERT(sizeof(MoveId) == 8);
 
-
+#pragma pack(push, 1)
 typedef struct { union {
     struct {
-        uint64_t count: 41;
-        #define OUTSIDE_COUNT_BIT_INDEX (41)
-        #define OUTSIDE_COUNT_1 (1ull << OUTSIDE_COUNT_BIT_INDEX)
+        uint64_t count: 40;
         uint64_t outsideCount: 20;
         uint64_t isMarked: 1;
     };
     uint64_t valueForSet;
 }; } InsideReferenceCount;
+#pragma pack(pop)
 CASSERT(sizeof(InsideReferenceCount) == 8);
+#pragma pack(push, 1)
 typedef struct {
 	InsideReferenceCount state;
 	const char* operation;
 	uint64_t line;
 	const char* file;
 } DebugLineInfo;
-
-
-#pragma pack(push, 1)
-typedef struct {
-    InsideReferenceCount count;
-    MoveId moveId;
-} InsideReferenceStart;
 #pragma pack(pop)
+
 
 // struct InsideReference really be inside RefCount.c, so it is hidden, but for debugging it was a lot easier to bring it out...
 
@@ -345,18 +350,15 @@ typedef struct {
 typedef struct InsideReference {
     union {
         struct {
-            uint64_t count: 41;
-            #define OUTSIDE_COUNT_BIT_INDEX (41)
-            #define OUTSIDE_COUNT_1 (1ull << OUTSIDE_COUNT_BIT_INDEX)
+            uint64_t count: 40;
             uint64_t outsideCount: 20;
             uint64_t isMarked: 1;
         };
         uint64_t valueForSet;
     };
-    // new --> 0
-    // moved or moved into --> isNull = 1, uniqueValueId set if outstanding refs
-    // moving, haven't checked if old ref has outstanding refs --> isNull = 0, tempOldRef set
-    // moving IF (isNull && isCommittedToMove) OR (!isNull && valueForSet)
+    
+    // Starts at 0, is used to store the old ref as an outside reference, then gains a unique value, possibly with hasUniqueValueId
+    //  set to true, but definitely with isNull set to true.
     MoveId moveId;
 
     MemPool* pool;

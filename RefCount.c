@@ -1,6 +1,7 @@
 #include "RefCount.h"
 #include "AtomicHelpers.h"
 #include "MemPool.h"
+#include "MemLog.h"
 
 #define IS_NULL_POINTER IS_FROZEN_POINTER
 
@@ -70,6 +71,7 @@ void BitFieldSubtract(uint64_t* pValue, uint64_t valueToSubtract, uint64_t bitIn
     }
 }
 
+uint64_t first = false;
 bool IsInsideRefCorruptInner(InsideReference* pRef, bool allowFreed) {
     if(!pRef) {
         // You should have had a reference to this, preventing it from becoming null...
@@ -89,9 +91,17 @@ bool IsInsideRefCorruptInner(InsideReference* pRef, bool allowFreed) {
         return true;
     }
     if(ref.outsideCount > ref.count && ref.outsideCount < 1024) {
+		if (InterlockedCompareExchange64(
+			(LONG64*)&first,
+			true,
+			false
+		) == false) {
+			MemLog_SaveValuesIndex("./logs.txt", (uint64_t)pRef);
+			breakpoint();
+		}
         // This means there are outstanding outside references with references that have been orphaned. This is bad...
-        OnError(3);
-        return true;
+        //OnError(3);
+        //return true;
     }
 	if (!allowFreed && ref.count <= 0) {
 		//todonext
@@ -117,6 +127,13 @@ bool IsInsideRefCorruptInner(InsideReference* pRef, bool allowFreed) {
 			breakpoint();
 		}
 	}
+    if(ref.outsideCount > 200) {
+        // Probably corruption
+        if (pRef->pool != (void*)&memPoolSystem) {
+			MemLog_SaveValuesIndex("./logs2.txt", (uint64_t)pRef);
+			breakpoint();
+		}
+    }
     if(ref.count > (1ull << (64 - BITS_IN_ADDRESS_SPACE - 4))) {
         // Getting close to running out of references...
         OnError(1);
@@ -169,16 +186,86 @@ void Reference_Mark(InsideReference* ref) {
     }
 }
 bool Reference_IsMarked(InsideReference* ref) {
-    //IsInsideRefCorruptInner(ref);
+    IsInsideRefCorruptInner(ref, true);
     return !!ref->isMarked;
 }
 
-bool Reference_MarkIfUniqueIdEqual(InsideReference* refFull, uint64_t uniqueId) {
+bool Reference_MarkIfUniqueIdEqual(InsideReference* ref, uint64_t uniqueId) {
+    //*
+    //todonext
+    // TODO: Wait, we can definitely get rid of the 128 bit state. If we add a reference (which we can definitely do),
+    //  then moveId won't change, so we can read it first. And if we mess up destruction by adding the ref,
+    //  it will just trigger again when we free the reference, so that is fine too...
+    //  - And because the caller knows the ref won't move again, as it calls this after a remove was successfull...
+    //      we don't even have to worry about moveId being oldRef, and then changing to something else (and having that
+    //      match, but have us miss it, or whatever)...
+
+    // Test moveId before we try to get a reference, as an optimization
+    MoveId firstTest = ref->moveId;
+    bool isMatch = firstTest.isNull && firstTest.hasUniqueValueId && firstTest.uniqueValueId == uniqueId;
+    if(!isMatch) {
+        return false;
+    }
+
+    // Get a reference, returning false if it has a count of 0
+    while(true) {
+        InsideReferenceCount count;
+        count.valueForSet = ref->valueForSet;
+        if(count.count == 0) {
+            return false;
+        }
+        InsideReferenceCount newCount = count;
+        newCount.count++;
+        // Make it an outside reference, as we use outsideCount as a flag to indicate we won't dereference any pointers inside of it.
+        newCount.outsideCount++;
+        if(InterlockedCompareExchange64(
+            (LONG64*)&ref->valueForSet,
+            newCount.valueForSet,
+            count.valueForSet
+        ) == count.valueForSet) {
+            MemLog_Add((void*)0, ref, "acquired for MarkIfUniqueIdEqual", ref->valueForSet);
+            break;
+        }
+    }
+
+    MoveId test = ref->moveId;
+    isMatch = test.isNull && test.hasUniqueValueId && test.uniqueValueId == uniqueId;
+    if(isMatch) {
+        // Set it as marked
+        while(true) {
+            InsideReferenceCount count;
+            count.valueForSet = ref->valueForSet;
+            if(count.count == 0) {
+                // Impossible, we added a reference
+                OnError(3);
+                return false;
+            }
+            InsideReferenceCount newCount = count;
+            newCount.isMarked = 1;
+            if(InterlockedCompareExchange64(
+                (LONG64*)&ref->valueForSet,
+                newCount.valueForSet,
+                count.valueForSet
+            ) == count.valueForSet) {
+                break;
+            }
+        }
+    }
+
+    Reference_ReleaseOutsidesInside(ref);
+
+    return isMatch;
+    //*/
+
+
+    // Now that we have a reference, moveId will be frozen
+
+    /*
     InsideReferenceStart* pRef = (void*)refFull;
     while(true) {
         InsideReferenceStart ref = *pRef;
         if(!EqualsStruct128(&ref, pRef)) continue;
-        if(ref.count.count == 0 || !ref.moveId.isNull || ref.moveId.uniqueValueId != uniqueId) {
+        if(ref.count.count == 0 || !(ref.moveId.isNull && ref.moveId.hasUniqueValueId) || ref.moveId.uniqueValueId != uniqueId) {
             return false;
         }
         if(ref.count.isMarked) {
@@ -195,10 +282,16 @@ bool Reference_MarkIfUniqueIdEqual(InsideReference* refFull, uint64_t uniqueId) 
             return true;
         }
     }
+    //*/
 }
 uint64_t Reference_GetUniqueValueId(InsideReference* ref) {
     MoveId moveId = ref->moveId;
-    return moveId.isNull ? moveId.uniqueValueId : 0;
+    return moveId.isNull && moveId.hasUniqueValueId ? moveId.uniqueValueId : 0;
+}
+
+InsideReference* Reference_unsafeClone(InsideReference* ref) {
+    InterlockedIncrement64(&ref->valueForSet);
+    return ref;
 }
 
 bool Reference_HasBeenMoved(InsideReference* ref) {
@@ -279,9 +372,9 @@ void referenceAddOutsideRef(InsideReference* ref) {
         newCount.outsideCount++;
         if(InterlockedCompareExchange64(
             (LONG64*)&ref->valueForSet,
-            count.valueForSet,
-            newCount.valueForSet
-        ) == newCount.valueForSet) {
+            newCount.valueForSet,
+            count.valueForSet
+        ) == count.valueForSet) {
             break;
         }
     }
@@ -355,7 +448,7 @@ bool referenceCheckAndRunDtorAfterDecrement(InsideReferenceCount count, InsideRe
 			breakpoint();
 		}
 
-        //MemLog_Add((void*)0, insideRef, "freeing inside ref", insideRef->hash);
+        MemLog_Add((void*)0, insideRef, "freeing inside ref", insideRef->moveId.uniqueValueId);
 
         //printf("freed reference memory redirects %p\n", insideRef);
 		// No more references, and no more outside references so there will never be more references, so we can exclusively free now.
@@ -370,12 +463,23 @@ bool referenceCheckAndRunDtorAfterDecrement(InsideReferenceCount count, InsideRe
     return false;
 }
 
-void Reference_ReleaseNull(InsideReference* ref) {
+bool Reference_ReleaseOutsidesInside(InsideReference* ref) {
     while(true) {
         IsInsideRefCorrupt(ref);
         InsideReferenceCount count;
         count.valueForSet = ref->valueForSet;
         InsideReferenceCount newCount = count;
+
+        if(newCount.valueForSet != count.valueForSet) {
+            breakpoint();
+        }
+
+        if(newCount.outsideCount == 0) {
+			MemLog_SaveValuesIndex("./logs2.txt", (uint64_t)ref);
+            // Not enough outside references to remove
+            OnError(3);
+            return false;
+        }
 
         newCount.count--;
         newCount.outsideCount--;
@@ -385,10 +489,12 @@ void Reference_ReleaseNull(InsideReference* ref) {
             newCount.valueForSet,
             count.valueForSet
         ) == count.valueForSet) {
-            referenceCheckAndRunDtorAfterDecrement(count, ref);
-            break;
+            return referenceCheckAndRunDtorAfterDecrement(newCount, ref);
         }
     }
+    // Unreachable
+    OnError(9);
+    return false;
 }
 
 
@@ -409,13 +515,15 @@ void afterConfirmedMove(InsideReference* newRef,
     // If we previous had a unique id, or have already finished the move, isNull will be set
     if(newRef->moveId.isNull) {
         if(oldRef) {
-            Reference_ReleaseNull(oldRef);
+            Reference_ReleaseOutsidesInside(oldRef);
         }
         return;
     }
 
     if(!oldRef) {
-        oldRef = Reference_Acquire(&newRef->moveId.tempOldRef);
+        bool nothing1;
+        bool nothing2;
+        oldRef = Reference_AcquireCheckIsMoved(&newRef->moveId.tempOldRef, &nothing1, &nothing2);
         if(!oldRef) {
             // Must have already been destroyed
             return;
@@ -425,26 +533,82 @@ void afterConfirmedMove(InsideReference* newRef,
         Reference_Release(&newRef->moveId.tempOldRef, oldRef);
     }
 
+
     // We have no previous unique id at this point, so if we have no outstanding count here, we just leave uniqueValueId to 0...
     MoveId newMoveId = { 0 };
     newMoveId.isNull = 1;
-
+    
     InsideReferenceCount count;
-    count.valueForSet = newRef->valueForSet;
+    count.valueForSet = oldRef->valueForSet;
     if(count.count > count.outsideCount) {
+        //todonext
+        // Okay, starting from here, we need to trace exactly where the unique value goes.
+        //  So... add the uniqueId to this log, and then using our inside reference trace
+        //  when our value moves, and verify the uniqueId is still there... and if it is, then it will probably
+        //  continue to be there.
+        // And we should be able to trace it with the uniqueId through all the different inside references until
+        //  the place it frees, and then call free on the pItem->item we first complained about. Once we can
+        //  connect this all the way to that, the bug will be obvious...
+
+        #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
         InterlockedIncrement64((LONG64*)pOutstandingRefsDuringMove);
-        newMoveId.uniqueValueId = InterlockedIncrement64(&nextUniqueValueId);
+        #endif
+
+         
+        
+        // TODO: Oh... we can initialize the uniqueValueId in Reference_Allocate, as the initial see will never have to use it
+        //  to store the "oldRef", so... there's that. And it is really simpler if we initialize it there, and it also gives us a nice unique id we
+        //  can use to trace a value through movement through multiple inside references.
+        //  - Actually... only do this if we encounter more issues and want to simplify things to debug it. For now, this is a lot faster for certain use cases
+        //      (it doing it here gets rid of an InterlockedIncrement64 that would be needed in every allocate).
+
+        // Make sure the old ref has a uniqueValueId.
+        //  We can do this this late, as the old value won't be gone until at least we call Reference_ReplaceOutside on tempOldRef.
+        while(true) {
+            MoveId oldMoveId = oldRef->moveId;
+            if(!oldMoveId.isNull) {
+                // Should be impossible, if we are moving out of it, hasn't it long been moved into?
+                OnError(3);
+            }
+            if(oldMoveId.hasUniqueValueId) break;
+            MoveId oldMoveIdNew = oldMoveId;
+            oldMoveIdNew.hasUniqueValueId = 1;
+            oldMoveIdNew.uniqueValueId = InterlockedIncrement64(&nextUniqueValueId);
+            InterlockedCompareExchange64(
+                (LONG64*)&oldRef->moveId.valueForSet,
+                oldMoveIdNew.valueForSet,
+                oldMoveId.valueForSet
+            );
+        }
+
+        newMoveId.hasUniqueValueId = 1;
+        newMoveId.uniqueValueId = oldRef->moveId.uniqueValueId;
+
+        MemLog_Add((void*)0, (uint64_t)oldRef, "trailing ref", oldRef->hash);
+        MemLog_Add2((void*)0, (uint64_t)oldRef, "trailing ref unique id new ref + uniqueValueId", newRef, newMoveId.uniqueValueId);
+        MemLog_Add((void*)0, (uint64_t)oldRef, "trailing ref unique id pool", oldRef->pool);
+
     } else {
+		MemLog_Add((void*)0, (uint64_t)oldRef, "no trail ref", newMoveId.uniqueValueId);
+
+        #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
         InterlockedIncrement64((LONG64*)pNotOutstandingRefsDuringMove);
+        #endif
     }
 
-    Reference_ReplaceOutside(
+
+    if(!Reference_ReplaceOutside(
         &newRef->moveId.tempOldRef,
         oldRef,
         newMoveId.tempOldRef
-    );
+    )) {
+        MemLog_Add((void*)0, (uint64_t)oldRef, "was not first unique id replace", newMoveId.uniqueValueId);
+    } else {
+        MemLog_Add((void*)0, (uint64_t)oldRef, "was first unique id replace", newMoveId.uniqueValueId);
+    }
 
-    Reference_ReleaseNull(oldRef);
+
+    Reference_ReleaseOutsidesInside(oldRef);
 }
 
 int Reference_AcquireStartMove(
@@ -457,10 +621,6 @@ int Reference_AcquireStartMove(
 ,uint64_t* pNotOutstandingRefsDuringMove
 #endif
 ) {
-    //todonext
-    // Wait, if it is zero here... shouldn't we just immediately convert it to BASE_NULL2, and then skip the rest of the move code?
-    //  I think this would fix a bug we have, and simplify the code considerably...
-
     OutsideReference outRef = *pRef;
     if(outRef.valueForSet == 0) {
         if(InterlockedCompareExchange64(
@@ -499,13 +659,16 @@ int Reference_AcquireStartMove(
     if(outRef.isNull && outRef.pointerClipped) {
         // Already frozen and copied, so acquire the reference, and then return
         InsideReference* newRef = Reference_AcquireIfNull(pRef);
-        afterConfirmedMove(newRef,
-        nullptr
-        #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
-        , pOutstandingRefsDuringMove
-        , pNotOutstandingRefsDuringMove
-        #endif
-        );
+		// (and of course, it might have completely finished moving, in which case just return null).
+		if(newRef) {
+			afterConfirmedMove(newRef,
+				nullptr
+				#ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
+				, pOutstandingRefsDuringMove
+				, pNotOutstandingRefsDuringMove
+				#endif
+			);
+		}
         *outNewRef = newRef;
         DebugLog("Reference_AcquireStartMove already moved", *outNewRef);
         return 0;
@@ -519,6 +682,7 @@ int Reference_AcquireStartMove(
 	
 	bool isMoved = false;
 	bool isFrozen = false;
+    // oldRef comes out as an inside reference
     InsideReference* oldRef = Reference_AcquireCheckIsMoved(pRef, &isMoved, &isFrozen);
     if(!oldRef) {
         // Changed since we first read it
@@ -529,46 +693,51 @@ int Reference_AcquireStartMove(
         #endif
         );
     }
-
-    // Make oldRef both inside, and appear like it is it's own an outside ref, so it won't look like a real access
+    // Make oldRef an outside ref
     referenceAddOutsideRef(oldRef);
     Reference_Release(pRef, oldRef);
-
 
 
     OutsideReference newOutRef;
     byte* newValue = nullptr;
     Reference_Allocate(newPool, &newOutRef, &newValue, size, oldRef->hash);
     if(!newValue) {
-        Reference_Release(pRef, oldRef);
+        Reference_ReleaseOutsidesInside(oldRef);
         return 3;
     }
     byte* oldValue = Reference_GetValueFast(oldRef);
     memcpy(newValue, oldValue, size);
 
 
-
+    // Makes an outside reference for it, kind of cheating because we know newRef is still private
     InsideReference* newRef = (void*)PACKED_POINTER_GET_POINTER(newOutRef);
+    referenceAddOutsideRef(newRef);
 
     
     #ifdef DEBUG_INSIDE_REFERENCES
     newRef->unsafeSource = oldRef;
     #endif
 
-    // The ref is still uniquely held, so this is fine!
-    //  (+ 1 for the outside ref, and make it count as an outsideCount, so it doesn't look like a real access)
-    referenceAddOutsideRef(newRef);
+    
 
     // At this point oldRef->moveId will definitely no longer be a tempOldref, as afterConfirmedMove will have been called on every ref that has been moved.
-    if(oldRef->moveId.uniqueValueId) {
+    if(oldRef->moveId.hasUniqueValueId) {
         newRef->moveId = oldRef->moveId;
+        // Don't inherit isCommittedToMove...
+        newRef->moveId.isCommittedToMove = 0;
+        MemLog_Add((void*)0, oldRef, "gave inherited trailing ref", newRef->moveId.uniqueValueId);
+        MemLog_Add((void*)0, newRef, "inherited trailing ref", newRef->moveId.uniqueValueId);
     } else {
         newRef->moveId.tempOldRef = Reference_CreateOutsideReference(oldRef);
+        MemLog_Add((void*)0, oldRef, "gave did not inherit trailing ref", newRef->moveId.uniqueValueId);
+        MemLog_Add((void*)0, newRef, "did not inherit trailing ref", newRef->moveId.uniqueValueId);
     }
     while(true) {
         MoveId id = oldRef->moveId;
         MoveId newId = id;
         newId.isCommittedToMove = 1;
+        // In case it was never moved before, its moveId would be 0.
+        newId.isNull = 1;
         if(InterlockedCompareExchange64(
             (LONG64*)&oldRef->moveId,
             newId.valueForSet,
@@ -584,17 +753,18 @@ int Reference_AcquireStartMove(
         oldRef,
         newOutRef
     )) {
+
         newOutRef.isNull = 0;
         
         Reference_DestroyOutside(&newRef->moveId.tempOldRef, oldRef);
-        Reference_ReleaseNull(oldRef);
+        Reference_ReleaseOutsidesInside(oldRef);
 
         if(!Reference_DestroyOutside(&newOutRef, newRef)) {
             // Impossible
             OnError(3);
         }
 
-        Reference_Release(&emptyReference, newRef);
+		Reference_ReleaseOutsidesInside(newRef);
 
         // Retry, we should get the new allocation right away this time.
         return Reference_AcquireStartMove(pRef, newPool, size, outNewRef
@@ -604,6 +774,9 @@ int Reference_AcquireStartMove(
         #endif
         );
     }
+
+    MemLog_Add2((void*)0, (uint64_t)oldRef, "after froze in table", oldRef->moveId.uniqueValueId, newRef);
+
 
     afterConfirmedMove(newRef,
         oldRef
@@ -659,9 +832,7 @@ bool Reference_FinishMove(OutsideReference* pRef, InsideReference* insideRef) {
             ref.valueForSet
         ) == ref.valueForSet) {
             ref.isNull = 0;
-            // Release once for ourself, and once to destroy the outside ref
-            BitFieldSubtract(&insideRef->valueForSet, 1, OUTSIDE_COUNT_BIT_INDEX);
-            BitFieldSubtract(&insideRef->valueForSet, 1, 0);
+            Reference_ReleaseOutsidesInside(insideRef);
             DebugLog("FinishMove, success", insideRef);
             return true;
         } else {
@@ -695,7 +866,7 @@ void DestroyUniqueOutsideRef(OutsideReference* ref) {
 bool releaseInsideReferenceX(InsideReference* insideRef, const char* file, uint64_t line) {
     if(IsInsideRefCorrupt(insideRef)) return false;
 
-    DebugLog2("releaseInsideReference (BEFORE)", insideRef, file, line);
+    MemLog_Add((void*)0, insideRef, "releaseInsideReference (BEFORE)", insideRef->valueForSet);
 
     LONG64 decrementResult = InterlockedDecrement64((LONG64*)&insideRef->valueForSet);
 
@@ -747,15 +918,18 @@ InsideReference* Reference_Acquire(OutsideReference* pRef) {
 
 void Reference_Allocate(MemPool* pool, OutsideReference* outRef, void** outPointer, uint64_t size, uint64_t hash) {
     InsideReference* ref = pool->Allocate(pool, size + InsideReferenceSize, hash);
+    if((uint64_t)ref % 8 != 0) {
+        // Pool must 8 byte aligned
+        OnError(3);
+    }
     if(!ref) {
         outRef->valueForSet = 0;
         *outPointer = nullptr;
         return;
     }
     memset(ref, 0, sizeof(InsideReference));
-    //printf("allocated ref %p\n", ref);
 
-    //MemLog_Add(size, ref, "alloc inside ref", hash);
+    MemLog_Add((void*)0, ref, "alloc inside ref", hash);
 
 	outRef->valueForSet = 0;
     outRef->pointerClipped = (uint64_t)ref;
@@ -774,21 +948,11 @@ bool IsSingleThreadedTest = false;
 #endif
 
 void Reference_ReleaseX(OutsideReference* outsideRef, InsideReference* insideRef, const char* file, uint64_t line) {
-    {
-        MoveId checkMoveId = insideRef->moveId;
-        if(checkMoveId.isNull && !checkMoveId.uniqueValueId) {
-            // If there are no outstanding references this must be a move reference, which must be released with Reference_ReleaseNull
-            OnError(3);
-        }
-    }
-    //printf("releasing reference %p\n", insideRef);
-
     if(!insideRef) {
         // This saves our cleanup code constantly null checking insideRef. Instead it can just unconditional
         //  release it, we we can null check it.
         return;
     }
-    DebugLog2("Reference_Release (BEFORE)", insideRef, file, line);
 
     if(IsOutsideRefCorrupt(*outsideRef)) return;
 
@@ -811,6 +975,8 @@ void Reference_ReleaseX(OutsideReference* outsideRef, InsideReference* insideRef
             // If there is nothing to decrement in the outer reference, our reference must have been moved to the inner,
             //  so... go release it there
             if(ref.count == 0) break;
+
+            IsInsideRefCorrupt(insideRef);
 
             DebugLog2("Reference_Release (releasing outside)", insideRef, file, line);
             
@@ -845,8 +1011,6 @@ bool Reference_ReplaceOutsideX(OutsideReference* pOutsideRef, InsideReference* p
         return false;
     }
 
-    DebugLog2("ReplaceOutsideInner", pInsideRef, file, line);
-
     // First move the references from outside ref to inside ref (causing them to be duplicated for a bit)
     //  (and which if removing from the outside ref fails may require removing from the inside ref)
     // Then try to make the outside ref wiped out
@@ -863,6 +1027,9 @@ bool Reference_ReplaceOutsideX(OutsideReference* pOutsideRef, InsideReference* p
         IsInsideRefCorrupt(pInsideRef);
         // Now try to remove from outside ref. If we fail... we have to go fix insideRef before we retry again
 		if (!XchgOutsideReference(pOutsideRef, &outsideRef, &newOutsideRef)) {           
+
+            //MemLog_Add((void*)0, pInsideRef, "oldRefBefore5 failed", pInsideRef->valueForSet);
+
 			// Subtract outsideRefOriginal.count from insideRef, but don't worry about it destructing the inside ref, the caller has a reference to it anyway
             BitFieldSubtract(&pInsideRef->valueForSet, outsideRef.count, 0);
 
@@ -871,17 +1038,19 @@ bool Reference_ReplaceOutsideX(OutsideReference* pOutsideRef, InsideReference* p
 			continue;
 		}
 
-        BitFieldSubtract(&pInsideRef->valueForSet, 1, OUTSIDE_COUNT_BIT_INDEX);
-
         if (IsInsideRefCorrupt(pInsideRef)) return false;
         //printf("destroying outside reference for %p\n", pInsideRef);
         if (IsInsideRefCorrupt(pInsideRef)) return false;
+
+        //MemLog_Add((void*)0, pInsideRef, "oldRefBefore5 success", pInsideRef->valueForSet);
         
-        if(releaseInsideReference(pInsideRef)) {
+        if(Reference_ReleaseOutsidesInside(pInsideRef)) {
             // If our reference's own reference was the last reference, that means the caller lied about
             //  having a reference, and bad stuff is going to happen...
             OnError(3);
         }
+
+        //MemLog_Add((void*)0, pInsideRef, "oldRefBefore5 done", pInsideRef->valueForSet);
         // We can't use pInsideRef after releaseInsideReference, as... sometimes the caller doesn't own pInsideRef, in certain cases... so...
         return true;
     }

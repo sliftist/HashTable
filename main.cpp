@@ -143,6 +143,7 @@ typedef struct {
 	uint64_t a;
 	uint64_t b;
 	uint64_t c;
+	void* pointer;
 } ItemInner;
 
 typedef struct {
@@ -164,9 +165,11 @@ void deleteItem(void* itemVoid) {
 		// Item is corrupted
 		OnError(3);
 	}
+	/*
 	item->item->a = 0;
 	item->item->b = 1;
 	item->item->c = 2;
+	*/
 
 	MemLog_Add(nullptr, (uint64_t)item->item, "free", getHash(item->item->a, item->item->b));
 	BulkAlloc_free(&itemAllocator, item->item);
@@ -184,6 +187,8 @@ void testAdd2(AtomicHashTable2& table, uint64_t a, uint64_t b, uint64_t c) {
 
 	item.item = (ItemInner*)BulkAlloc_alloc(&itemAllocator);
 	*item.item = itemInner;
+
+	item.itemInline.pointer = (void*)item.item;
 
 	uint64_t hash = getHash(a, b);
 
@@ -299,6 +304,7 @@ void checkForLeaks(
 
 	#ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
 		printf("\t%f search pressure (1 means there were no hash collisions)\n", (double)table.searchLoops / (double)table.searchStarts);
+		printf("\t%f trailing refs pressure (this is expensive, hopefully it is 0)\n", (double)table.outstandingRefsDuringMove / (double)table.notOutstandingRefsDuringMove);
 	#endif
 }
 
@@ -925,26 +931,59 @@ void WaitForAllThreads() {
 	}
 }
 
+uint32_t failed = false;
+void failPrint(void* contextAny) {
+	if (InterlockedCompareExchange(&failed, true, false) == false) {
+		MemLog_SaveValuesIndex("./logs.txt", (uint64_t)contextAny);
+		breakpoint();
+	}
+}
+
 DWORD threadedItemContention(TableMultiThreadsContext* context) {
 	AtomicHashTable2& table = *context->table;
-	uint64_t itemCount = 1024;
-	uint64_t iterationCount = 100;
+	uint64_t itemCount = 100;
+	uint64_t iterationCount = 1000;
 
 	void (*findVerifyFnc)(void* contextAny, void* valueVoid) = [](void* contextAny, void* valueVoid) {
 		Item* pItem = ((Item*)valueVoid);
+		//todonext
+		// Okay so... our inside reference is marked as "trailing ref", and then never deallocated,
+		//	BUT it is never consulted (either to give it the mark, or fail to give it the mark), before
+		//	the mark destroys the value. So... let's see if our table is ever consulted?
+		//MemLog_SaveValuesIndexMulti("./logs.txt", 1, 2, 3, 4, 0);
+
 		if(!BulkAlloc_isAllocated(&itemAllocator, pItem->item)) {
+			failPrint(contextAny);
 			// deleteItem was called on an item that is in use
-			OnError(3);
+			//OnError(3);
 		}
+		/*
 		if(pItem->item->a != pItem->itemInline.a
 		|| pItem->item->b != pItem->itemInline.b
 		|| pItem->item->c != pItem->itemInline.c) {
+			failPrint(contextAny);
 			// Item is corrupted
-			OnError(3);
+			//OnError(3);
 		}
+		*/
 		if(!BulkAlloc_isAllocated(&itemAllocator, pItem->item)) {
+			failPrint(contextAny);
 			// deleteItem was called on an item that is in use
-			OnError(3);
+			//OnError(3);
+		}
+		{
+			ItemInner item = *pItem->item;
+			if(item.a != item.b || item.b != item.c) {
+				// Corrupted item
+				OnError(3);
+			}
+		}
+		{
+			ItemInner item = pItem->itemInline;
+			if(item.a != item.b || item.b != item.c) {
+				// Corrupted item
+				OnError(3);
+			}
 		}
 	};
 
@@ -972,8 +1011,10 @@ DWORD threadedItemContention(TableMultiThreadsContext* context) {
 
 
 void runAtomicHashTableTest(bool ecoFriendly) {
+	//testTableMultiThreads(1, 0, threadedItemContention);
 	for (int i = 0; i < 100; i++) {
-		testTableMultiThreads(16, 0, threadedItemContention);
+		//testTableMultiThreads(16, 0, threadedItemContention);
+		//testTableMultiThreads(2, 0, threadedItemContention);
 	}
 
 	// Speed test
@@ -996,6 +1037,8 @@ void runAtomicHashTableTest(bool ecoFriendly) {
 
 	//testHashChurn2Var(2);
 
+	//breakpoint();
+
 	//*
 	//testSizingVar(1);
 
@@ -1007,9 +1050,12 @@ void runAtomicHashTableTest(bool ecoFriendly) {
 	//testTableMultiThreads(10, 3, threadedSizing);
 
 	// TODO: We really need a test that ACTUALLY tests contention on items, as right now we only have table contention, not item contention...
-		/*
+		//*
 	for(uint64_t i = 0; i < 100; i++) {
 		printf("start test look %d\n", i);
+		// Speed test
+		testTableMultiThreads(1, 1, threadedSizing);
+
 		#ifdef DEBUG
 		IsSingleThreadedTest = true;
 		#endif
@@ -1017,11 +1063,18 @@ void runAtomicHashTableTest(bool ecoFriendly) {
 		testSizing();
 		testHashChurn2();
 
+		testTableMultiThreads(1, 0, threadedItemContention);
+
 		#ifdef DEBUG
 		IsSingleThreadedTest = false;
 		#endif
 
 		printf("ran single threaded tests\n");
+
+		printf("item contention\n");
+		testTableMultiThreads(1, 0, threadedItemContention);
+		testTableMultiThreads(2, 0, threadedItemContention);
+		!ecoFriendly && testTableMultiThreads(16, 0, threadedItemContention);
 
 		printf("0 to N with a lot of verification, a few times\n");
 		testTableMultiThreads(1, 0, threadedSizing);

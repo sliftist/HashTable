@@ -55,7 +55,8 @@ typedef struct {
 
 typedef struct MemPoolHashed MemPoolHashed;
 // We only need 1 per table that has a hanging thread, so... as long as threads don't crash this just needs to be > the thread count.
-#define MAX_MEMPOOL_HISTORY 128
+//  An odd number here is important, so our iteration can increment by 2 and eventually reach every element
+#define MAX_MEMPOOL_HISTORY 129
 #pragma pack(push, 1)
 typedef struct {
     uint64_t count;
@@ -71,7 +72,7 @@ typedef struct {
 callbackContext, freeCallback, getAllMemPools, releaseAllMemPools, hasEverAllocated, onNoMoreAllocations) { \
     (Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, \
     callbackContext, freeCallback, getAllMemPools, releaseAllMemPools, hasEverAllocated, onNoMoreAllocations, \
-    VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, 0, 0 \
+    (VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD), VALUE_COUNT, VALUE_COUNT_LOG, 0, 0 \
 }
 
 #pragma pack(push, 1)
@@ -86,7 +87,7 @@ typedef struct MemPoolHashed {
     MemPools (*GetAllMemPools)(void* context);
     void (*ReleaseAllMemPools)(void* context, MemPools pools);
 
-    bool (*HasEverAllocated)(void* context, uint64_t index);
+    bool (*HasEverAllocated)(MemPoolHashed* pool, uint64_t index);
 
     // Called back when we have no more allocations, and are destructed
     void (*OnNoMoreAllocations)(void* context);
@@ -100,8 +101,8 @@ typedef struct MemPoolHashed {
     AllocCount countForSet;
 
     // The memory after the end of the struct is...
-    //  size of (VALUE_COUNT + 7) / 8, parallel bits which indicate if values are in use
     //  an array of values, of count VALUE_COUNT and size VALUE_SIZE
+    //  size of (VALUE_COUNT + 7) / 8, parallel bits which indicate if values are in use
 } MemPoolHashed;
 #pragma pack(pop)
 

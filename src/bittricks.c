@@ -8,7 +8,7 @@ static const char LogTable256[256] =
 	LT(4), LT(5), LT(5), LT(6), LT(6), LT(6), LT(6),
 	LT(7), LT(7), LT(7), LT(7), LT(7), LT(7), LT(7), LT(7)
 };
-uint64_t log2(uint64_t v) {
+uint64_t log2_64(uint64_t v) {
 	unsigned r;
 	uint64_t t, tt, ttt;
 

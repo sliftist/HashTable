@@ -15,19 +15,19 @@ typedef void(*Free)(MemPool* pool, void* value);
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
-    uint64_t size: 63;
-    uint64_t free: 1;
-    void* allocation;
+	uint64_t size: 63;
+	uint64_t free: 1;
+	void* allocation;
 } MemPoolRecycle_Entry;
 #pragma pack(pop)
 
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
-    void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
-    void (*Free)(MemPool* pool, void* value);
+	void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
+	void (*Free)(MemPool* pool, void* value);
 
-    MemPoolRecycle_Entry allocations[MemPoolFixed_Allocations];
+	MemPoolRecycle_Entry allocations[MemPoolFixed_Allocations];
 } MemPoolRecycle;
 #pragma pack(pop)
 
@@ -43,13 +43,13 @@ void MemPoolFixed_Free(MemPoolRecycle* pool, void* value);
 
 #pragma pack(push, 1)
 typedef struct {
-    union {
-        struct {
-            uint64_t totalAllocationsOutstanding: 63;
-            uint64_t destructed: 1;
-        };
-        uint64_t valueForSet;
-    };
+	union {
+		struct {
+			uint64_t totalAllocationsOutstanding: 63;
+			uint64_t destructed: 1;
+		};
+		uint64_t valueForSet;
+	};
 } AllocCount;
 #pragma pack(pop)
 
@@ -59,8 +59,8 @@ typedef struct MemPoolHashed MemPoolHashed;
 #define MAX_MEMPOOL_HISTORY 129
 #pragma pack(push, 1)
 typedef struct {
-    uint64_t count;
-    MemPoolHashed* pools[MAX_MEMPOOL_HISTORY];
+	uint64_t count;
+	MemPoolHashed* pools[MAX_MEMPOOL_HISTORY];
 } MemPools;
 #pragma pack(pop)
 
@@ -70,39 +70,39 @@ typedef struct {
 // Only calls the freeCallback for referenced marked with Reference_Mark
 #define MemPoolHashedDefault(VALUE_SIZE, VALUE_COUNT, VALUE_COUNT_LOG, \
 callbackContext, freeCallback, getAllMemPools, releaseAllMemPools, hasEverAllocated, onNoMoreAllocations) { \
-    (Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, \
-    callbackContext, freeCallback, getAllMemPools, releaseAllMemPools, hasEverAllocated, onNoMoreAllocations, \
-    (VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD), VALUE_COUNT, VALUE_COUNT_LOG, 0, 0 \
+	(Allocate)MemPoolHashed_Allocate, (Free)MemPoolHashed_Free, \
+	callbackContext, freeCallback, getAllMemPools, releaseAllMemPools, hasEverAllocated, onNoMoreAllocations, \
+	(VALUE_SIZE - MemPoolHashed_VALUE_OVERHEAD), VALUE_COUNT, VALUE_COUNT_LOG, 0, 0 \
 }
 
 #pragma pack(push, 1)
 typedef struct MemPoolHashed {
-    void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
-    void (*Free)(MemPool* pool, void* value);
+	void* (*Allocate)(MemPool* pool, uint64_t size, uint64_t hash);
+	void (*Free)(MemPool* pool, void* value);
 
-    void* callbackContext;
+	void* callbackContext;
 
-    void (*FreeCallback)(void* context, void* value);
+	void (*FreeCallback)(void* context, void* value);
 
-    MemPools (*GetAllMemPools)(void* context);
-    void (*ReleaseAllMemPools)(void* context, MemPools pools);
+	MemPools (*GetAllMemPools)(void* context);
+	void (*ReleaseAllMemPools)(void* context, MemPools pools);
 
-    bool (*HasEverAllocated)(MemPoolHashed* pool, uint64_t index);
+	bool (*HasEverAllocated)(MemPoolHashed* pool, uint64_t index);
 
-    // Called back when we have no more allocations, and are destructed
-    void (*OnNoMoreAllocations)(void* context);
+	// Called back when we have no more allocations, and are destructed
+	void (*OnNoMoreAllocations)(void* context);
 
 
-    uint64_t VALUE_SIZE;
-    uint64_t VALUE_COUNT;
+	uint64_t VALUE_SIZE;
+	uint64_t VALUE_COUNT;
 
-    uint64_t VALUE_COUNT_LOG;
+	uint64_t VALUE_COUNT_LOG;
 
-    AllocCount countForSet;
+	AllocCount countForSet;
 
-    // The memory after the end of the struct is...
-    //  an array of values, of count VALUE_COUNT and size VALUE_SIZE
-    //  size of (VALUE_COUNT + 7) / 8, parallel bits which indicate if values are in use
+	// The memory after the end of the struct is...
+	//  an array of values, of count VALUE_COUNT and size VALUE_SIZE
+	//  size of (VALUE_COUNT + 7) / 8, parallel bits which indicate if values are in use
 } MemPoolHashed;
 #pragma pack(pop)
 

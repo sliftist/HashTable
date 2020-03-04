@@ -6,8 +6,3 @@ bool InterlockedCompareExchangeStruct128(
 	void* structOriginal,
 	void* structNew
 );
-
-bool EqualsStruct128(
-	void* structLhs,
-	void* structRhs
-);

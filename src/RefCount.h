@@ -21,19 +21,12 @@ extern "C" {
 //  in the extra data. This allows us to do 64 bit compare and swaps, which eliminates all need for
 //  128 bit (16 byte) alignment, and should be a lot faster, as on my machine
 //  - Furthermore, using half the bytes allows us to store double the data before blowing a cache,
-//      which should give us a huge performance advantage.
+//	  which should give us a huge performance advantage.
 //  - There is a cost to having to modify a pointer before using it though, but I don't think the extra
-//      few operations should matter compared to the cost of a 128 CAS vs a 64 CAS (which surely is at
-//      least one operation more).
-//      (My benchmarks showed 7ns for a 64 bit CAS, and 10ns for a 128 bit CAS, while messing with the pointer
-//          took a dereference from 0.9ns to 1.8ns.)
-
-
-// TODO:
-//  - Change the OuterReference to move its references to the InsideReference inside of rolling over.
-//      - ALTHOUGH! Trying to move the bottom bits from the outside reference to the inside reference is actually quite dangerous.
-//          While we are doing it we don't have any references to the inside reference, but we have to go into its memory to
-//          increment inside references, and during this time, we could be freed, and then crash... So... maybe don't use the bottom bits...
+//	  few operations should matter compared to the cost of a 128 CAS vs a 64 CAS (which surely is at
+//	  least one operation more).
+//	  (My benchmarks showed 7ns for a 64 bit CAS, and 10ns for a 128 bit CAS, while messing with the pointer
+//		  took a dereference from 0.9ns to 1.8ns.)
 
 
 #define BITS_IN_ADDRESS_SPACE 48
@@ -85,25 +78,25 @@ extern bool IsSingleThreadedTest;
 //  go decrement 
 #pragma pack(push, 1)
 typedef struct {
-    union {
-        struct {
-            uint64_t pointerClipped : BITS_IN_ADDRESS_SPACE;
-            uint64_t count : 64 - BITS_IN_ADDRESS_SPACE - 1;
-            uint64_t isNull : 1;
-        };
-        struct {
-            uint64_t spacerForFastCount : BITS_IN_ADDRESS_SPACE;
-            // Presumably it is faster to set fastCount than count, in the very rare cases we are constructing an OutsideReference
-            //  an explicitly setting the count (faster because setting count has to wipe out the high bit to not intersect with null,
-            //  but most of the time we KNOW the count won't be that high, so we should be able to just set fastCount and not
-            //  worry about the highest bit setting isNull to 1).
-            uint64_t fastCount : 64 - BITS_IN_ADDRESS_SPACE;
-        };
-        struct {
-            uint64_t pointerAndCount: 63;
-        };
-        uint64_t valueForSet;
-    };
+	union {
+		struct {
+			uint64_t pointerClipped : BITS_IN_ADDRESS_SPACE;
+			uint64_t count : 64 - BITS_IN_ADDRESS_SPACE - 1;
+			uint64_t isNull : 1;
+		};
+		struct {
+			uint64_t spacerForFastCount : BITS_IN_ADDRESS_SPACE;
+			// Presumably it is SLIGHTLY faster to set fastCount than count, in the very rare cases we are constructing an OutsideReference
+			//  and explicitly setting the count (faster because setting count has to wipe out the high bit to not intersect with null,
+			//  but most of the time we KNOW the count won't be that high, so we should be able to just set fastCount and not
+			//  worry about the highest bit setting isNull to 1).
+			uint64_t fastCount : 64 - BITS_IN_ADDRESS_SPACE;
+		};
+		struct {
+			uint64_t pointerAndCount: 63;
+		};
+		uint64_t valueForSet;
+	};
 } OutsideReference;
 #pragma pack(pop)
 CASSERT(sizeof(OutsideReference) == sizeof(uint64_t));
@@ -162,14 +155,14 @@ InsideReference* Reference_AcquireCheckIsMovedProof(OutsideReference* ref, bool*
 //  and returns a value that is allocated in newPool, and suitable for Reference_CopyIntoZero.
 // (and of course, returns nullptr if ref didn't have a value to begin with, but still freezes it).
 // - Sets isCommittedToMove inside the newRef, as this is the only way a frozen outside
-//      reference can be destroyed (or should be), and so isCommittedToMove should matter before
-//      this, but after this it may be destructed, so knowing if it moved is important.
+//	  reference can be destroyed (or should be), and so isCommittedToMove should matter before
+//	  this, but after this it may be destructed, so knowing if it moved is important.
 // Reference must be freed with Reference_ReleaseOutsidesInside
 int Reference_AcquireStartMove(
-    OutsideReference* ref,
-    MemPool* newPool,
-    uint64_t size,
-    InsideReference** outNewRef
+	OutsideReference* ref,
+	MemPool* newPool,
+	uint64_t size,
+	InsideReference** outNewRef
 #ifndef ATOMIC_HASH_TABLE_DISABLE_HASH_INSTRUMENTING
 ,uint64_t* pOutstandingRefsDuringMove
 ,uint64_t* pNotOutstandingRefsDuringMove
@@ -202,21 +195,21 @@ InsideReference* Reference_Acquire(OutsideReference* pRef);
 
 // pRef must be guaranteed to have a value, as we might mess up null values, or create bad pointers
 __forceinline InsideReference* Reference_AcquireFast(OutsideReference* pRef) {
-    // Assume there were no refs before
-    OutsideReference prevRef = *pRef;
-    prevRef.fastCount = 0;
-    OutsideReference newRef = prevRef;
-    newRef.fastCount = 1;
-    
-    if(InterlockedCompareExchange64(
-        (LONG64*)pRef,
-        newRef.valueForSet,
-        prevRef.valueForSet
-    ) == prevRef.valueForSet) {
-        return (InsideReference*)newRef.pointerClipped;
-    }
+	// Assume there were no refs before
+	OutsideReference prevRef = *pRef;
+	prevRef.fastCount = 0;
+	OutsideReference newRef = prevRef;
+	newRef.fastCount = 1;
+	
+	if(InterlockedCompareExchange64(
+		(LONG64*)pRef,
+		newRef.valueForSet,
+		prevRef.valueForSet
+	) == prevRef.valueForSet) {
+		return (InsideReference*)newRef.pointerClipped;
+	}
 
-    return Reference_Acquire(pRef);
+	return Reference_Acquire(pRef);
 }
 
 InsideReference* Reference_AcquireInside(OutsideReference* pRef);
@@ -225,7 +218,7 @@ InsideReference* Reference_AcquireInside(OutsideReference* pRef);
 
 
 // Must be passed if a Reference_Release call is freeing a reference count it knows has been moved to the inside reference.
-extern const OutsideReference emptyReference;
+extern OutsideReference emptyReference;
 
 // Outside reference may be knowingly wiped out, we will just ignore it and then release the inside reference.
 //  Always pass an outsideRef, even if you know it has been wiped out.
@@ -234,24 +227,24 @@ void Reference_ReleaseX(OutsideReference* outsideRef, InsideReference* insideRef
 
 // InsideRef must not be null
 __forceinline void Reference_ReleaseFast(OutsideReference* outsideRef, InsideReference* insideRef) {
-    // Assume we had 1 outside ref. If not, just bail to Reference_Release (but most of the time
-    //  we have 1 outside ref, so this is good)
-    OutsideReference prevRef;
-    prevRef.pointerClipped = (uint64_t)insideRef;
-    prevRef.fastCount = 1;
-    OutsideReference newRef;
+	// Assume we had 1 outside ref. If not, just bail to Reference_Release (but most of the time
+	//  we have 1 outside ref, so this is good)
+	OutsideReference prevRef;
+	prevRef.pointerClipped = (uint64_t)insideRef;
+	prevRef.fastCount = 1;
+	OutsideReference newRef;
 	newRef.valueForSet = 0;
 	newRef.pointerClipped = (uint64_t)insideRef;
-    
-    if(InterlockedCompareExchange64(
-        (LONG64*)outsideRef,
-        newRef.valueForSet,
-        prevRef.valueForSet
-    ) == prevRef.valueForSet) {
-        return;
-    }
+	
+	if(InterlockedCompareExchange64(
+		(LONG64*)outsideRef,
+		newRef.valueForSet,
+		prevRef.valueForSet
+	) == prevRef.valueForSet) {
+		return;
+	}
 
-    Reference_Release(outsideRef, insideRef);
+	Reference_Release(outsideRef, insideRef);
 }
 
 
@@ -305,30 +298,30 @@ void DebugLog2(const char* operation, InsideReference* ref, const char* file, ui
 
 #pragma pack(push, 1)
 typedef struct {
-    union {
-        struct {
-            // Persists across
-            uint64_t uniqueValueId: 61;
-            uint64_t hasUniqueValueId: 1;
-            uint64_t isCommittedToMove: 1;
-            // Must be set to true, allowing outside references and unique values to be distinguished...
-            uint64_t isNull: 1;
-        };
-        OutsideReference tempOldRef;
-        uint64_t valueForSet;
-    };
+	union {
+		struct {
+			// Persists across
+			uint64_t uniqueValueId: 61;
+			uint64_t hasUniqueValueId: 1;
+			uint64_t isCommittedToMove: 1;
+			// Must be set to true, allowing outside references and unique values to be distinguished...
+			uint64_t isNull: 1;
+		};
+		OutsideReference tempOldRef;
+		uint64_t valueForSet;
+	};
 } MoveId;
 #pragma pack(pop)
 CASSERT(sizeof(MoveId) == 8);
 
 #pragma pack(push, 1)
 typedef struct { union {
-    struct {
-        uint64_t count: 40;
-        uint64_t outsideCount: 20;
-        uint64_t isMarked: 1;
-    };
-    uint64_t valueForSet;
+	struct {
+		uint64_t count: 40;
+		uint64_t outsideCount: 20;
+		uint64_t isMarked: 1;
+	};
+	uint64_t valueForSet;
 }; } InsideReferenceCount;
 #pragma pack(pop)
 CASSERT(sizeof(InsideReferenceCount) == 8);
@@ -342,40 +335,40 @@ typedef struct {
 #pragma pack(pop)
 
 
-// struct InsideReference really be inside RefCount.c, so it is hidden, but for debugging it was a lot easier to bring it out...
+// struct InsideReference should really be inside RefCount.c, so it is hidden, but for debugging it was a lot easier to bring it out...
 
 // When InsideReference reaches a count of 0, it should be freed (as this means nothing knows about it,
 //  and so if we don't free it now it will leak).
 #pragma pack(push, 1)
 typedef struct InsideReference {
-    union {
-        struct {
-            uint64_t count: 40;
-            uint64_t outsideCount: 20;
-            uint64_t isMarked: 1;
-        };
-        uint64_t valueForSet;
-    };
-    
-    // Starts at 0, is used to store the old ref as an outside reference, then gains a unique value, possibly with hasUniqueValueId
-    //  set to true, but definitely with isNull set to true.
-    MoveId moveId;
+	union {
+		struct {
+			uint64_t count: 40;
+			uint64_t outsideCount: 20;
+			uint64_t isMarked: 1;
+		};
+		uint64_t valueForSet;
+	};
+	
+	// Starts at 0, is used to store the old ref as an outside reference, then gains a unique value, possibly with hasUniqueValueId
+	//  set to true, but definitely with isNull set to true.
+	MoveId moveId;
 
-    MemPool* pool;
+	MemPool* pool;
 
-    uint64_t hash;
+	uint64_t hash;
 
 
-    #ifdef DEBUG_INSIDE_REFERENCES
-    const char* file;
-    uint64_t line;
+	#ifdef DEBUG_INSIDE_REFERENCES
+	const char* file;
+	uint64_t line;
 
-    #define EVENT_ID_COUNT 100
-    uint64_t nextEventIndex;
-    DebugLineInfo events[EVENT_ID_COUNT];
+	#define EVENT_ID_COUNT 100
+	uint64_t nextEventIndex;
+	DebugLineInfo events[EVENT_ID_COUNT];
 
-    InsideReference* unsafeSource;
-    #endif
+	InsideReference* unsafeSource;
+	#endif
 
 } InsideReference;
 #pragma pack(pop)

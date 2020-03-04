@@ -924,7 +924,7 @@ void WaitForAllThreads() {
 		//printf("Waiting for thread %lld\n", threadIndex);
 		DWORD error = WaitForSingleObject(threads[threadIndex], INFINITE);
 		if (error) {
-			printf("Wait error %d\n", GetLastError());
+			printf("Wait error %d\n", (int)GetLastError());
 		}
 		//printf("Finished thread %lld\n", threadIndex);
 		threadIndex++;
@@ -1052,7 +1052,7 @@ void runAtomicHashTableTest(bool ecoFriendly) {
 	// TODO: We really need a test that ACTUALLY tests contention on items, as right now we only have table contention, not item contention...
 		//*
 	for(uint64_t i = 0; i < 100; i++) {
-		printf("start test look %d\n", i);
+		printf("start test look %llu\n", i);
 		// Speed test
 		testTableMultiThreads(1, 1, threadedSizing);
 

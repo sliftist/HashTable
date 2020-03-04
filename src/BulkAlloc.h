@@ -24,7 +24,7 @@ Supports multi-threading (of course) (but ctor and dtor aren't).
 ~128GB (allocation count) limit (can be increased in size relatively easily though), which includes our overhead per allocation (4 bytes).
 
 Becomes O(N) where N is the amount of previous allocations when allocations become highly fragmented (but still dense).
-    So, it is required that most allocations outlive allocations allocated before them to maintain O(1) complexity.
+	So, it is required that most allocations outlive allocations allocated before them to maintain O(1) complexity.
 
 Oh, and every alloc must be the same size...
 
@@ -32,24 +32,27 @@ Oh, and every alloc must be the same size...
 
 #pragma pack(push, 1)
 typedef struct {
-    uint32_t allocated;
+	uint32_t allocated;
 } BulkAlloc_AllocHead;
 #pragma pack(pop)
 
+#ifndef __x86_64__
+#error must be 64 bit
+#endif
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
-    uint32_t count;
-    uint32_t countUsed;
-    byte* allocation;
+	uint32_t count;
+	uint32_t countUsed;
+	byte* allocation;
 } BulkAlloc_Alloc;
 #pragma pack(pop)
 CASSERT(sizeof(BulkAlloc_Alloc) == 16);
 
 #pragma pack(push, 1)
 typedef struct {
-    BulkAlloc_Alloc data;
-    uint64_t searchIndex;
+	BulkAlloc_Alloc data;
+	uint64_t searchIndex;
 } BulkAlloc_AllocFull;
 #pragma pack(pop)
 
@@ -59,12 +62,12 @@ typedef struct {
 
 #pragma pack(push, 1)
 typedef __declspec(align(16)) struct {
-    // Allocations grow in size until they hit 2^32, at which point they level off. This is required because BulkAlloc_Alloc has to be
-    //  128 bits. However... it is fine, because we have enough entries that this should provide 32*4GB, so... more than enough.
-    BulkAlloc_AllocFull allocations[BulkAlloc_AllocationCount];
-    uint64_t allocSearchIndex;
-    uint64_t size;
-    bool initialized;
+	// Allocations grow in size until they hit 2^32, at which point they level off. This is required because BulkAlloc_Alloc has to be
+	//  128 bits. However... it is fine, because we have enough entries that this should provide 32*4GB, so... more than enough.
+	BulkAlloc_AllocFull allocations[BulkAlloc_AllocationCount];
+	uint64_t allocSearchIndex;
+	uint64_t size;
+	bool initialized;
 } BulkAlloc;
 #pragma pack(pop)
 

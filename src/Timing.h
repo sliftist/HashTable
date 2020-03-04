@@ -9,18 +9,18 @@ extern "C" {
 #define TimeTrackerRoot_trackers_count 20
 
 typedef struct {
-    bool inRoot;
+	bool inRoot;
 	uint64_t totalTime;
 	uint64_t totalCount;
 	uint64_t currentStartTime;
-    const char* name;
+	const char* name;
 } TimeTracker;
 
 typedef struct {
-    uint64_t startTimeNanoSeconds;
-    uint64_t startTime;
-    TimeTracker* trackers[TimeTrackerRoot_trackers_count];
-    uint64_t nextTrackerIndex;
+	uint64_t startTimeNanoSeconds;
+	uint64_t startTime;
+	TimeTracker* trackers[TimeTrackerRoot_trackers_count];
+	uint64_t nextTrackerIndex;
 } TimeTrackerRoot;
 
 extern TimeTrackerRoot rootTimer;
